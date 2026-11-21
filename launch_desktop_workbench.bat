@@ -5,7 +5,7 @@ set "PROJ_DIR=%~dp0"
 set "SERVER_PY=%PROJ_DIR%agy_mobile_server.py"
 set "PORT_NUM=18795"
 if defined AGY_MOBILE_PORT set "PORT_NUM=%AGY_MOBILE_PORT%"
-set "TARGET_URL=http://127.0.0.1:%PORT_NUM%/"
+set "TARGET_URL=http://127.0.0.1:%PORT_NUM%/%~1"
 
 powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:%PORT_NUM%/health' -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
 if %errorlevel% neq 0 (

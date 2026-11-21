@@ -1,36 +1,31 @@
-﻿# Create Desktop shortcuts for Antigravity Desktop Workbench & Mobile Pairing
+﻿# Create a single unified Desktop shortcut for Antigravity Workbench (built-in Phone QR Pairing + auto-starts backend & tunnel)
 $ErrorActionPreference = "Stop"
 
 $projDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $desktop = [Environment]::GetFolderPath("Desktop")
 $icoPath = Join-Path $projDir "assets\antigravity_mobile.ico"
 
-$wsh = New-Object -ComObject WScript.Shell
-
-$shortcuts = @(
-    @{
-        Name = "Antigravity 同步工作台.lnk"
-        Target = Join-Path $projDir "launch_desktop_workbench.bat"
-        Desc = "双击秒开 Antigravity 电脑宽屏同步工作台（免配对、与手机实时双向同步）"
-    },
-    @{
-        Name = "Antigravity 手机配对.lnk"
-        Target = Join-Path $projDir "launch_desktop_pair.bat"
-        Desc = "打开 Antigravity 手机扫码配对与公网免VPN隧道页面"
-    }
-)
-
-foreach ($sc in $shortcuts) {
-    if (-not (Test-Path $sc.Target)) { continue }
-    $lnkPath = Join-Path $desktop $sc.Name
-    $shortcut = $wsh.CreateShortcut($lnkPath)
-    $shortcut.TargetPath = $sc.Target
-    $shortcut.WorkingDirectory = $projDir
-    $shortcut.WindowStyle = 7
-    $shortcut.Description = $sc.Desc
-    if (Test-Path $icoPath) {
-        $shortcut.IconLocation = "$icoPath,0"
-    }
-    $shortcut.Save()
-    Write-Output "Created: $lnkPath"
+# Remove legacy duplicate pairing shortcut if present (now integrated directly inside the Workbench)
+$legacyPairLnk = Join-Path $desktop "Antigravity 手机配对.lnk"
+if (Test-Path $legacyPairLnk) {
+    Remove-Item -Force $legacyPairLnk
+    Write-Output "Removed redundant shortcut: $legacyPairLnk"
 }
+
+$wsh = New-Object -ComObject WScript.Shell
+$target = Join-Path $projDir "launch_desktop_workbench.bat"
+if (-not (Test-Path $target)) {
+    throw "Missing launcher: $target"
+}
+
+$lnkPath = Join-Path $desktop "Antigravity 同步工作台.lnk"
+$shortcut = $wsh.CreateShortcut($lnkPath)
+$shortcut.TargetPath = $target
+$shortcut.WorkingDirectory = $projDir
+$shortcut.WindowStyle = 7
+$shortcut.Description = "一键启动后台服务与公网隧道，打开电脑宽屏同步工作台（内置手机扫码配对）"
+if (Test-Path $icoPath) {
+    $shortcut.IconLocation = "$icoPath,0"
+}
+$shortcut.Save()
+Write-Output "Created unified shortcut: $lnkPath"

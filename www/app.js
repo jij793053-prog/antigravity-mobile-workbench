@@ -141,7 +141,7 @@
 
   // Exposed native back button hook
   window.__handleAndroidBack = () => {
-    for (const mid of ["preview-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
+    for (const mid of ["preview-modal", "pair-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
       const el = $(mid);
       if (el && !el.classList.contains("hidden")) {
         el.classList.add("hidden");
@@ -2498,10 +2498,38 @@
     });
     $("btn-scroll-bottom").addEventListener("click", () => scrollToBottom(true));
 
-    // --- Unified Drawer Settings Entry & In-Settings Tools ---
-    $("nav-pair-qr")?.addEventListener("click", () => {
+    // --- Unified Drawer Settings Entry & In-App Desktop Phone Pairing ---
+    function openPairModal() {
       closeDrawer();
+      const modal = $("pair-modal");
+      const iframe = $("pair-iframe");
+      if (!modal || !iframe) {
+        window.open(`${location.origin}/pair`, "_blank", "noopener");
+        return;
+      }
+      iframe.src = `${location.origin}/pair?_t=${Date.now()}`;
+      modal.classList.remove("hidden");
+    }
+    $("nav-pair-qr")?.addEventListener("click", openPairModal);
+    $("btn-top-pair")?.addEventListener("click", openPairModal);
+    $("btn-pair-refresh")?.addEventListener("click", () => {
+      const iframe = $("pair-iframe");
+      if (iframe) iframe.src = `${location.origin}/pair?_t=${Date.now()}`;
+    });
+    $("btn-pair-external")?.addEventListener("click", () => {
       window.open(`${location.origin}/pair`, "_blank", "noopener");
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        for (const mid of ["preview-modal", "pair-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
+          const el = $(mid);
+          if (el && !el.classList.contains("hidden")) {
+            el.classList.add("hidden");
+            e.preventDefault();
+            return;
+          }
+        }
+      }
     });
     $("nav-settings")?.addEventListener("click", openSettingsModal);
 
@@ -2775,6 +2803,7 @@
   async function tryLocalAutoBootstrap() {
     if (!isLocalDesktopBrowser()) return false;
     $("nav-pair-qr")?.classList.remove("hidden");
+    $("btn-top-pair")?.classList.remove("hidden");
     try {
       const resp = await fetch("/api/local-auth", {
         method: "GET",
@@ -2805,15 +2834,30 @@
     updateModelPill();
     bindEvents();
 
+    const wantPairOpen = (() => {
+      try {
+        const qs = new URLSearchParams(location.search);
+        if (qs.get("open") === "pair") {
+          if (history.replaceState) history.replaceState(null, "", location.pathname);
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    })();
+
     if (isLocalDesktopBrowser()) {
       $("nav-pair-qr")?.classList.remove("hidden");
+      $("btn-top-pair")?.classList.remove("hidden");
     }
 
     const pairedFromLaunch = checkInitialPairSources();
     if (!pairedFromLaunch) {
       if (isLocalDesktopBrowser()) {
         const autoOk = await tryLocalAutoBootstrap();
-        if (autoOk) return;
+        if (autoOk) {
+          if (wantPairOpen) $("btn-top-pair")?.click();
+          return;
+        }
       }
       if (getActiveHost()) {
         showWorkspaceScreen();

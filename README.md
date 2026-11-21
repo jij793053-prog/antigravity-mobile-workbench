@@ -10,9 +10,9 @@
 
 - **电脑宽屏同步工作台（v1.6 新增）**
   - **免配对本机自动静默登录**：在电脑打开 `http://127.0.0.1:18795/` 自动同源回环鉴权秒进工作台，零手动输入（同时严格校验回环来源与同源头，杜绝跨站与公网窃取）。
-  - **宽屏双栏布局（`>= 960px`）**：左侧 300px 对话列表常驻展开，右侧居中宽屏阅读区，支持一键跳转手机扫码配对页。
+  - **宽屏双栏布局（`>= 960px`）**：左侧 300px 对话列表常驻展开，右侧居中宽屏阅读区，顶栏与侧栏底部内置 **「手机配对」** 弹窗（同窗口直看二维码与 6 位码，无需第二个图标或切换标签页）。
   - **拖图 / 粘贴无损原图**：支持直接将电脑里的图片/文件拖进窗口，或截图后 `Ctrl+V` 粘贴，二进制原文件直传不压画质。
-  - **独立应用窗口秒开**：附带 [launch_desktop_workbench.bat](launch_desktop_workbench.bat) 与一键桌面快捷方式脚本 [create_desktop_shortcuts.ps1](create_desktop_shortcuts.ps1)，双击即以 Edge/Chrome `--app` 原生无地址栏窗口启动。
+  - **单一图标一键秒开**：附带 [launch_desktop_workbench.bat](launch_desktop_workbench.bat) 与一键桌面快捷方式脚本 [create_desktop_shortcuts.ps1](create_desktop_shortcuts.ps1)，双击一个图标即可自动后台拉起服务 + 公网隧道，并以 Edge/Chrome `--app` 原生无地址栏窗口打开。
 - **跨端真·实时双向流式同步**
   - 手机 App 与电脑同步工作台共用同一套本机后端与 WebSocket 实时广播通道：手机派发指令、电脑大屏实时同步呈现思考工具步与逐字流式输出；电脑端发送同理秒级同步到手机。
   - 自动镜像读取桌面端 Antigravity IDE 会话历史，手机/网页续聊时自动合并在同一会话项下，不分裂重复记录。
@@ -37,11 +37,11 @@
 - *(可选，强烈推荐免 VPN 公网直连)* 下载官方 [cloudflared](https://github.com/cloudflare/cloudflared/releases/latest) 放到本项目的 `bin/cloudflared.exe`（macOS/Linux 放到 `bin/cloudflared` 或加入系统 `PATH`），服务端启动时将自动建立加密公网隧道。
 
 ### 2. 启动服务端 / 打开电脑同步工作台
-- **方式 A（Windows 推荐，一键桌面图标）**：在 Windows PowerShell 中运行一次：
+- **方式 A（Windows 推荐，单一桌面图标）**：在 Windows PowerShell 中运行一次：
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\create_desktop_shortcuts.ps1
   ```
-  桌面会生成带统一四色 A 标的 **「Antigravity 同步工作台」**（双击免配对宽屏秒开）和 **「Antigravity 手机配对」**（双击打开二维码页）。
+  桌面会生成唯一一个带统一四色 A 标的 **「Antigravity 同步工作台」** 图标：双击即自动后台拉起服务与公网隧道，并秒开电脑宽屏工作台（右上角与左下角内置「手机配对」二维码弹窗，关掉窗口后台服务仍保持常驻）。
 - **方式 B（macOS / Linux / 命令行启动）**：
   ```bash
   # macOS / Linux
@@ -58,7 +58,7 @@
 ## 二、手机端安装与配对
 
 1. 从本仓库的 [Releases](../../releases)（或 `dist/Antigravity-Mobile-Universal-v1.5.apk`）下载并安装 Android APK。
-2. 在电脑打开 `http://127.0.0.1:18795/pair`（或双击桌面「Antigravity 手机配对」）：
+2. 在电脑同步工作台右上角点 **「手机配对」**（或访问 `http://127.0.0.1:18795/pair`）：
    - **扫码一键配对（推荐）**：打开手机 App 点「扫码一键配对」，对准电脑上的 **「Cloudflare 公网免VPN ★」** 二维码即可秒连。
    - **6 位数字配对码**：在手机 App 输入电脑地址（公网隧道地址 / 局域网 IP / Tailscale `100.x`）与页面上的 6 位配对码即可。
 

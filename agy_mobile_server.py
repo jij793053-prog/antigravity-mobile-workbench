@@ -3263,7 +3263,11 @@ if ('{tun_status}' === 'starting') {{
 </script>
 </body>
 </html>"""
-    return web.Response(text=page_html, content_type="text/html", headers={"Cache-Control": "no-store"})
+    return web.Response(
+        text=page_html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN"},
+    )
 
 
 async def handle_static_www(request: web.Request) -> web.StreamResponse:
