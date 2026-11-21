@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Base.V27.Theme.Antigravity" parent="Base.Theme.Antigravity">
+        <item name="android:windowLightNavigationBar">@bool/is_light_theme</item>
+    </style>
+
+    <style name="Theme.Antigravity" parent="Base.V27.Theme.Antigravity" />
+</resources>

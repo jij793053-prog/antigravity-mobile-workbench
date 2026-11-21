@@ -1,0 +1,742 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta id="meta-theme-color" name="theme-color" content="#FFFFFF" />
+  <link rel="icon" href="./favicon.ico" />
+  <link rel="apple-touch-icon" href="./logo-app.png" />
+  <link rel="manifest" href="./manifest.json" />
+  <title>Antigravity</title>
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <!-- =========================================================
+       VIEW 1: UNIVERSAL M3 WELCOME & PAIRING SETUP
+       Shown automatically on first launch when no host is saved
+       ========================================================= -->
+  <section id="welcome-view" class="welcome-view hidden" aria-label="配对与连接设置">
+    <div class="welcome-topbar">
+      <div class="welcome-topbar-brand">
+        <span class="mini-prism-dot" aria-hidden="true"></span>
+        <span>Antigravity Link</span>
+      </div>
+      <button id="btn-welcome-theme" class="m3-tonal-chip sm" type="button" aria-label="切换外观主题">
+        <svg class="icon-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="4"></circle>
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+        </svg>
+        <svg class="icon-moon hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+        <span id="welcome-theme-label">浅色</span>
+      </button>
+    </div>
+
+    <div class="welcome-scroll">
+      <div class="welcome-hero">
+        <div class="brand-emblem lg" aria-hidden="true">
+          <img src="./logo-mark.png" alt="Antigravity" width="44" height="44" style="display:block;object-fit:contain;" />
+        </div>
+        <h1 class="welcome-title">连接你的 Antigravity</h1>
+        <p class="welcome-sub">通用移动工作台 · 支持局域网直连、Tailscale 远程与 Google 官方云端</p>
+      </div>
+
+      <!-- Option 0: Direct In-App Camera QR Scan (Primary Recommended) -->
+      <button id="btn-welcome-qr-scan" class="m3-card setup-card action-card" type="button">
+        <div class="setup-card-head">
+          <div class="m3-icon-badge primary">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
+              <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
+            </svg>
+          </div>
+          <div class="setup-card-titles">
+            <div class="setup-card-title">扫码一键配对（调用相机）</div>
+            <div class="setup-card-desc">直接扫电脑 /pair 二维码秒连 · 支持手电筒与相册选图</div>
+          </div>
+          <svg class="trailing-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
+        </div>
+      </button>
+
+      <!-- Option A: 6-Digit PIN Quick Pair -->
+      <div class="m3-card setup-card">
+        <div class="setup-card-head">
+          <div class="m3-icon-badge secondary">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
+            </svg>
+          </div>
+          <div class="setup-card-titles">
+            <div class="setup-card-title">局域网快速配对（6 位配对码）</div>
+            <div class="setup-card-desc">输入电脑地址与 6 位配对码，无需扫码也能直连</div>
+          </div>
+        </div>
+
+        <div class="m3-field-group">
+          <label class="m3-label" for="welcome-host-input">电脑地址（IP:端口）</label>
+          <input id="welcome-host-input" class="m3-input" type="text" inputmode="url" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="输入电脑 IP:18795 或 Tailscale 100.x" />
+        </div>
+
+        <div class="m3-field-group">
+          <label class="m3-label" for="welcome-pin-input">6 位配对码</label>
+          <input id="welcome-pin-input" class="m3-input pin-input" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="000000" />
+        </div>
+
+        <div id="welcome-pin-msg" class="m3-inline-banner hidden" role="status"></div>
+
+        <button id="btn-welcome-pin-pair" class="m3-btn filled full" type="button">
+          <span>配对并连接</span>
+        </button>
+      </div>
+
+      <!-- Option B: Paste URI or Manual Token -->
+      <details id="welcome-alt-card" class="m3-card setup-card collapsible">
+        <summary class="setup-card-head summary-head">
+          <div class="m3-icon-badge secondary">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+            </svg>
+          </div>
+          <div class="setup-card-titles">
+            <div class="setup-card-title">粘贴配对链接 / 手动令牌</div>
+            <div class="setup-card-desc">手动粘贴 agylink:// 链接或输入服务地址与 Token</div>
+          </div>
+          <svg class="chevron-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </summary>
+
+        <div class="collapsible-body">
+          <button id="btn-welcome-alt-scan" class="m3-btn tonal full" type="button">打开相机扫描二维码</button>
+
+          <div class="m3-segmented sm" role="tablist" aria-label="配对方式">
+            <button type="button" class="seg-btn active" data-welcome-tab="uri">粘贴配对链接</button>
+            <button type="button" class="seg-btn" data-welcome-tab="manual">手动地址与令牌</button>
+          </div>
+
+          <div id="welcome-tab-uri" class="tab-panel">
+            <div class="m3-field-group">
+              <label class="m3-label" for="welcome-uri-input">配对链接（agylink://pair?...）</label>
+              <input id="welcome-uri-input" class="m3-input" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 agylink://pair?u=...&t=...&n=..." />
+            </div>
+            <button id="btn-welcome-uri-pair" class="m3-btn tonal full" type="button">解析并连接</button>
+          </div>
+
+          <div id="welcome-tab-manual" class="tab-panel hidden">
+            <div class="m3-field-group">
+              <label class="m3-label" for="welcome-manual-name">主机备注名（可选）</label>
+              <input id="welcome-manual-name" class="m3-input" type="text" placeholder="例如 家里电脑 / 办公室工作站" />
+            </div>
+            <div class="m3-field-group">
+              <label class="m3-label" for="welcome-manual-url">服务地址（Server URL）</label>
+              <input id="welcome-manual-url" class="m3-input" type="url" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:18795" />
+            </div>
+            <div class="m3-field-group">
+              <label class="m3-label" for="welcome-manual-token">访问令牌（Access Token）</label>
+              <input id="welcome-manual-token" class="m3-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴电脑端显示的访问令牌" />
+            </div>
+            <button id="btn-welcome-manual-pair" class="m3-btn tonal full" type="button">验证并连接</button>
+          </div>
+
+          <div id="welcome-alt-msg" class="m3-inline-banner hidden" role="status"></div>
+        </div>
+      </details>
+
+      <!-- Option C: Official Google Remote Mode -->
+      <button id="btn-welcome-official" class="m3-card setup-card action-card" type="button">
+        <div class="setup-card-head">
+          <div class="m3-icon-badge tertiary">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </svg>
+          </div>
+          <div class="setup-card-titles">
+            <div class="setup-card-title">直接使用 Google 官方远程模式</div>
+            <div class="setup-card-desc">无需电脑端本地服务，无边框全屏直达官方云端</div>
+          </div>
+          <svg class="trailing-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
+        </div>
+      </button>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       VIEW 2: MAIN MATERIAL 3 EXPRESSIVE WORKSPACE
+       ========================================================= -->
+  <div id="app" class="app-shell">
+    <!-- M3 Top App Bar (56px) -->
+    <header id="topbar" class="m3-topbar">
+      <button id="btn-drawer" class="m3-icon-btn" type="button" aria-label="打开侧边栏">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="4" y1="7" x2="20" y2="7"></line>
+          <line x1="4" y1="12" x2="16" y2="12"></line>
+          <line x1="4" y1="17" x2="20" y2="17"></line>
+        </svg>
+        <span id="running-badge" class="badge-dot hidden" aria-hidden="true"></span>
+      </button>
+
+      <div id="topbar-title-wrap" class="topbar-center">
+        <div class="title-row">
+          <span id="conv-title" class="conv-title">Antigravity</span>
+        </div>
+        <div class="status-row">
+          <span id="conn-dot" class="conn-dot connecting" aria-hidden="true"></span>
+          <span id="conv-subtitle" class="conv-subtitle">正在连接主机...</span>
+        </div>
+      </div>
+
+      <button id="btn-new-top" class="m3-icon-btn" type="button" aria-label="新建对话">
+        <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+          <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.375-9.375z"></path>
+        </svg>
+      </button>
+    </header>
+
+    <!-- Main Chat Scroll Area -->
+    <main id="chat-scroll" class="chat-scroll">
+      <div id="empty-state" class="empty-state">
+        <div class="brand-emblem md" aria-hidden="true">
+          <img src="./logo-mark.png" alt="Antigravity" width="38" height="38" style="display:block;object-fit:contain;" />
+        </div>
+
+        <h1 class="hero-title">你好，开始今天的任务</h1>
+
+        <button id="empty-host-chip" class="host-status-chip" type="button">
+          <span id="empty-host-dot" class="conn-dot connecting"></span>
+          <span id="empty-host-name">正在连接主机</span>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </button>
+
+        <div class="quick-grid">
+          <button class="quick-card" type="button" data-prompt="检查当前电脑的开发环境、磁盘空间和正在运行的服务状态，给我一份简洁汇报">
+            <span class="qc-icon-wrap">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
+              </svg>
+            </span>
+            <span class="qc-title">主机环境巡检</span>
+            <span class="qc-desc">查看磁盘、服务与运行状态</span>
+          </button>
+
+          <button class="quick-card" type="button" data-prompt="帮我看看工作区里最近修改过哪些项目和主要文件，按时间列出摘要">
+            <span class="qc-icon-wrap">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+              </svg>
+            </span>
+            <span class="qc-title">工作区动态</span>
+            <span class="qc-desc">浏览近期代码与修改记录</span>
+          </button>
+
+          <button class="quick-card" type="button" data-prompt="帮我整理今天桌面端 Antigravity 做过的主要改动与待办事项清单">
+            <span class="qc-icon-wrap">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 11l3 3L22 4"></path>
+                <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
+              </svg>
+            </span>
+            <span class="qc-title">今日任务总结</span>
+            <span class="qc-desc">汇总已完成改动与进度</span>
+          </button>
+
+          <button class="quick-card" type="button" data-prompt="测试一下当前直连环境是否畅通，顺便告诉我现在正在使用的模型和工作目录">
+            <span class="qc-icon-wrap">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+              </svg>
+            </span>
+            <span class="qc-title">快速连通测试</span>
+            <span class="qc-desc">验证直连速度与当前模型</span>
+          </button>
+        </div>
+      </div>
+
+      <div id="messages-list" class="messages-list"></div>
+
+      <!-- Inline Deliverables Section (Default Collapsed) -->
+      <details id="deliverables-box" class="deliverables-box hidden" aria-label="关联与交付文件">
+        <summary class="deliv-header">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+          </svg>
+          <span id="deliverables-count" class="deliv-title-text">本会话生成与关联文件</span>
+          <svg class="deliv-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </summary>
+        <div id="deliverables-list" class="deliv-list"></div>
+      </details>
+    </main>
+
+    <!-- Jump To Bottom M3 Small FAB -->
+    <button id="btn-scroll-bottom" class="scroll-fab hidden" type="button" aria-label="回到底部">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="12" y1="5" x2="12" y2="19"></line>
+        <polyline points="19 12 12 19 5 12"></polyline>
+      </svg>
+    </button>
+
+    <!-- Gemini-Android Floating Pill Composer -->
+    <footer class="composer-wrap">
+      <div id="attach-tray" class="attach-tray hidden"></div>
+      <div class="composer-pill">
+        <textarea id="prompt-input" class="prompt-input" rows="1" placeholder="向 Antigravity 下达指令..."></textarea>
+        <div class="composer-toolbar">
+          <div class="composer-tools-left">
+            <input id="file-input" type="file" multiple class="hidden" />
+            <input id="gallery-input" type="file" accept="image/*" multiple class="hidden" />
+            <button id="btn-attach" class="composer-circle-btn" type="button" aria-label="选择图片或文件" title="选择图片或文件">
+              <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="12" y1="5" x2="12" y2="19"></line>
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+              </svg>
+            </button>
+
+            <button id="btn-model" class="composer-model-pill" type="button" aria-label="选择推理模型与 Orchestrator 搭配">
+              <span id="model-pill-text">Neon Med</span>
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </button>
+
+            <button id="btn-swarm" class="swarm-pill" type="button" aria-pressed="false" title="开启或关闭 /swarm 蜂群多智能体模式">
+              <svg class="swarm-ic-off" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="5" r="2.2"></circle>
+                <circle cx="5.5" cy="17.5" r="2.2"></circle>
+                <circle cx="18.5" cy="17.5" r="2.2"></circle>
+                <path d="M10.7 6.9L6.8 15.6M13.3 6.9l3.9 8.7M7.7 17.5h8.6"></path>
+              </svg>
+              <svg class="swarm-ic-on hidden" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+              <span>蜂群</span>
+            </button>
+          </div>
+
+          <button id="btn-send" class="send-btn" type="button" aria-label="发送">
+            <svg id="icon-send" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5"></line>
+              <polyline points="5 12 12 5 19 12"></polyline>
+            </svg>
+            <svg id="icon-stop" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="3"></rect>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- =========================================================
+       M3 NAVIGATION DRAWER
+       ========================================================= -->
+  <div id="drawer-backdrop" class="scrim hidden"></div>
+  <aside id="drawer" class="m3-drawer" aria-label="导航抽屉">
+    <div class="drawer-header">
+      <div class="drawer-brand">
+        <div class="brand-emblem sm" aria-hidden="true">
+          <img src="./logo-mark.png" alt="Antigravity" width="24" height="24" style="display:block;object-fit:contain;" />
+        </div>
+        <span class="drawer-brand-title">Antigravity</span>
+      </div>
+      <button id="btn-close-drawer" class="m3-icon-btn sm" type="button" aria-label="关闭抽屉">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <div class="drawer-top-controls">
+      <!-- Host Switcher Chip -->
+      <button id="btn-drawer-host" class="drawer-host-chip" type="button">
+        <span id="drawer-host-dot" class="conn-dot connecting"></span>
+        <div class="drawer-host-text">
+          <div id="drawer-host-name" class="drawer-host-name">未配置主机</div>
+          <div id="drawer-host-url" class="drawer-host-url">点击切换或添加电脑</div>
+        </div>
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="7 15 12 20 17 15"></polyline>
+          <polyline points="7 9 12 4 17 9"></polyline>
+        </svg>
+      </button>
+
+      <!-- New Chat Tonal FAB-like Pill -->
+      <button id="btn-new-chat" class="drawer-new-fab" type="button">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        <span>新建对话</span>
+        <span id="new-chat-draft-pill" class="drawer-draft-pill hidden">草稿</span>
+      </button>
+
+      <!-- Search Input -->
+      <div class="m3-search-wrap">
+        <svg class="search-ic" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="11" cy="11" r="7"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input id="conv-search" class="m3-search-input" type="search" placeholder="搜索会话..." />
+      </div>
+    </div>
+
+    <div id="conv-list" class="conv-list"></div>
+
+    <!-- Bottom Utilities -->
+    <nav class="drawer-utilities" aria-label="设置与工具">
+      <button id="nav-pair-qr" class="drawer-util-item hidden" type="button">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
+          <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
+        </svg>
+        <span>手机扫码配对</span>
+        <svg class="drawer-util-meta" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      </button>
+      <button id="nav-settings" class="drawer-util-item" type="button">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+        <span>设置与工具</span>
+        <svg class="drawer-util-meta" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      </button>
+    </nav>
+  </aside>
+
+  <!-- =========================================================
+       M3 MODAL BOTTOM SHEETS (Model Picker & Host Switcher)
+       ========================================================= -->
+  <div id="sheet-backdrop" class="scrim hidden"></div>
+
+  <section id="model-sheet" class="m3-bottom-sheet hidden" aria-label="选择推理模型">
+    <div class="sheet-drag-handle" aria-hidden="true"></div>
+    <div class="sheet-header">
+      <span class="sheet-title">选择推理模型</span>
+      <button class="m3-icon-btn sm close-sheet" type="button" aria-label="关闭">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div id="model-groups" class="sheet-body"></div>
+  </section>
+
+  <section id="host-sheet" class="m3-bottom-sheet hidden" aria-label="切换已配对主机">
+    <div class="sheet-drag-handle" aria-hidden="true"></div>
+    <div class="sheet-header">
+      <span class="sheet-title">切换主机</span>
+      <button class="m3-icon-btn sm close-sheet" type="button" aria-label="关闭">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div class="sheet-body">
+      <div id="host-sheet-list" class="host-sheet-list"></div>
+      <button id="btn-host-sheet-add" class="m3-btn tonal full" type="button">＋ 添加或配对新主机</button>
+    </div>
+  </section>
+
+  <!-- QQ-Style Bottom Photo & Attachment Drawer -->
+  <section id="attach-sheet" class="m3-bottom-sheet attach-sheet hidden" aria-label="选择图片与文件">
+    <div class="sheet-drag-handle" aria-hidden="true"></div>
+    <div id="attach-photo-strip" class="photo-strip" aria-label="最近照片"></div>
+    <div class="attach-sheet-bar">
+      <div class="attach-bar-actions">
+        <button id="btn-attach-album" class="attach-bar-link" type="button">相册</button>
+        <button id="btn-attach-folder" class="attach-bar-link" type="button">打开文件夹</button>
+      </div>
+      <button id="btn-attach-confirm" class="attach-confirm-btn" type="button" disabled>添加</button>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       FULL-SCREEN M3 UTILITY VIEWS
+       ========================================================= -->
+  <!-- Workspace Files Browser -->
+  <section id="files-modal" class="m3-full-view hidden" aria-label="工作区文件">
+    <header class="m3-topbar">
+      <button class="m3-icon-btn close-modal" type="button" data-target="files-modal" aria-label="返回">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="19" y1="12" x2="5" y2="12"></line>
+          <polyline points="12 19 5 12 12 5"></polyline>
+        </svg>
+      </button>
+      <div class="topbar-center">
+        <div class="conv-title">工作区文件</div>
+        <div id="files-path" class="conv-subtitle">加载中...</div>
+      </div>
+      <button id="btn-files-up" class="m3-icon-btn" type="button" aria-label="返回上一级" title="上一级">
+        <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="17 11 12 6 7 11"></polyline>
+          <line x1="12" y1="18" x2="12" y2="6"></line>
+        </svg>
+      </button>
+    </header>
+    <div id="files-list" class="view-body"></div>
+  </section>
+
+  <!-- File Preview Sheet -->
+  <section id="preview-modal" class="m3-full-view hidden" aria-label="文件预览">
+    <header class="m3-topbar">
+      <button class="m3-icon-btn close-modal" type="button" data-target="preview-modal" aria-label="返回">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="19" y1="12" x2="5" y2="12"></line>
+          <polyline points="12 19 5 12 12 5"></polyline>
+        </svg>
+      </button>
+      <div class="topbar-center">
+        <div id="preview-name" class="conv-title">文件预览</div>
+        <div id="preview-meta" class="conv-subtitle"></div>
+      </div>
+      <button id="btn-preview-download" class="m3-btn tonal sm" type="button">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="7 10 12 15 17 10"></polyline>
+          <line x1="12" y1="15" x2="12" y2="3"></line>
+        </svg>
+        <span>下载</span>
+      </button>
+    </header>
+    <div id="preview-body" class="view-body preview-body"></div>
+  </section>
+
+  <!-- QQ Bot Control (Shown only when server supports it) -->
+  <section id="qqbot-modal" class="m3-full-view hidden" aria-label="QQ Bot 控制台">
+    <header class="m3-topbar">
+      <button class="m3-icon-btn close-modal" type="button" data-target="qqbot-modal" aria-label="返回">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="19" y1="12" x2="5" y2="12"></line>
+          <polyline points="12 19 5 12 12 5"></polyline>
+        </svg>
+      </button>
+      <div class="topbar-center">
+        <div class="conv-title">QQ Bot 控制台</div>
+        <div class="conv-subtitle">本机桥接状态与模型切换</div>
+      </div>
+      <button id="btn-qqbot-refresh" class="m3-icon-btn" type="button" aria-label="刷新状态">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+        </svg>
+      </button>
+    </header>
+    <div id="qqbot-body" class="view-body settings-body"></div>
+  </section>
+
+  <!-- Unified Settings & Tools View -->
+  <section id="settings-modal" class="m3-full-view hidden" aria-label="设置与工具">
+    <header class="m3-topbar">
+      <button class="m3-icon-btn close-modal" type="button" data-target="settings-modal" aria-label="返回">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="19" y1="12" x2="5" y2="12"></line>
+          <polyline points="12 19 5 12 12 5"></polyline>
+        </svg>
+      </button>
+      <div class="topbar-center">
+        <div class="conv-title">设置与工具</div>
+        <div class="conv-subtitle">工具箱、下载路径、外观主题与多主机管理</div>
+      </div>
+    </header>
+
+    <div class="view-body settings-body">
+      <!-- Unified Tools Section -->
+      <div class="m3-card">
+        <div class="section-heading">工具箱</div>
+        <div class="settings-tools-list">
+          <button id="settings-open-files" class="settings-tool-row" type="button">
+            <span class="settings-tool-ic">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+              </svg>
+            </span>
+            <span class="settings-tool-text">
+              <span class="settings-tool-title">工作区文件</span>
+              <span class="settings-tool-desc">浏览电脑目录、无损原图预览与下载</span>
+            </span>
+            <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </button>
+
+          <button id="settings-open-official" class="settings-tool-row" type="button">
+            <span class="settings-tool-ic">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+              </svg>
+            </span>
+            <span class="settings-tool-text">
+              <span class="settings-tool-title">官方远程模式</span>
+              <span class="settings-tool-desc">无边框全屏直达 Google 官方 Antigravity Web</span>
+            </span>
+            <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </button>
+
+          <!-- Shown ONLY when /api/server-info returns qqbot_available: true -->
+          <button id="settings-open-qqbot" class="settings-tool-row hidden" type="button">
+            <span class="settings-tool-ic">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="4" y="8" width="16" height="12" rx="4"></rect>
+                <path d="M12 4v4M9 14h.01M15 14h.01"></path>
+              </svg>
+            </span>
+            <span class="settings-tool-text">
+              <span class="settings-tool-title">QQ Bot 控制台</span>
+              <span class="settings-tool-desc">查看桥接状态与切换 QQ 群聊模型</span>
+            </span>
+            <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Download Folder Settings Section -->
+      <div class="m3-card">
+        <div class="section-heading">文件下载位置</div>
+        <div class="m3-segmented sm" role="group" aria-label="文件下载方式">
+          <button type="button" class="seg-btn dl-mode-opt active" data-dl-mode="subdir">固定目录</button>
+          <button type="button" class="seg-btn dl-mode-opt" data-dl-mode="ask">每次手动选文件夹</button>
+        </div>
+        <div id="dl-subdir-wrap" class="m3-field-group" style="margin-top:10px;">
+          <label class="m3-label" for="settings-dl-subdir">Download 下的子文件夹（留空直存 Download 根目录）</label>
+          <div class="dl-subdir-row">
+            <input id="settings-dl-subdir" class="m3-input" type="text" autocomplete="off" spellcheck="false" placeholder="例如 Antigravity 或 工作/代码" />
+            <button id="btn-save-dl-dir" class="m3-btn tonal sm" type="button">保存</button>
+          </div>
+        </div>
+        <p id="settings-dl-hint" class="info-text" style="margin-top:8px;">当前将保存到手机 <code>Download/Antigravity/</code></p>
+      </div>
+
+      <!-- Theme Section -->
+      <div class="m3-card">
+        <div class="section-heading">外观主题</div>
+        <div class="m3-segmented" role="group" aria-label="外观主题选择">
+          <button type="button" class="seg-btn theme-opt" data-theme-choice="light">浅色</button>
+          <button type="button" class="seg-btn theme-opt" data-theme-choice="dark">深色</button>
+          <button type="button" class="seg-btn theme-opt" data-theme-choice="system">跟随系统</button>
+        </div>
+      </div>
+
+      <!-- Saved Hosts List -->
+      <div class="m3-card">
+        <div class="section-heading-row">
+          <span class="section-heading">已保存主机</span>
+          <span id="settings-host-count" class="section-meta">0 台</span>
+        </div>
+        <div id="settings-hosts-msg" class="m3-inline-banner hidden" role="status"></div>
+        <div id="settings-hosts-list" class="saved-hosts-list"></div>
+      </div>
+
+      <!-- Add New Host Card -->
+      <div class="m3-card">
+        <div class="section-heading">添加新主机</div>
+        <button id="btn-settings-qr-scan" class="m3-btn tonal full" type="button" style="margin-bottom:12px;">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
+            <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
+          </svg>
+          <span>扫描电脑二维码一键添加</span>
+        </button>
+        <div class="m3-segmented sm" role="tablist" aria-label="添加主机方式">
+          <button type="button" class="seg-btn active" data-add-tab="pin">6 位配对码</button>
+          <button type="button" class="seg-btn" data-add-tab="uri">配对链接</button>
+          <button type="button" class="seg-btn" data-add-tab="manual">手动输入</button>
+        </div>
+
+        <div id="add-tab-pin" class="tab-panel">
+          <div class="m3-field-group">
+            <label class="m3-label" for="add-pin-host">电脑地址（IP:端口）</label>
+            <input id="add-pin-host" class="m3-input" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="192.168.1.10:18795 或 100.x.x.x:18795" />
+          </div>
+          <div class="m3-field-group">
+            <label class="m3-label" for="add-pin-code">6 位配对码</label>
+            <input id="add-pin-code" class="m3-input pin-input" type="text" inputmode="numeric" maxlength="8" placeholder="000000" />
+          </div>
+          <button id="btn-add-pin" class="m3-btn filled full" type="button">配对并切换</button>
+        </div>
+
+        <div id="add-tab-uri" class="tab-panel hidden">
+          <div class="m3-field-group">
+            <label class="m3-label" for="add-uri-input">配对链接</label>
+            <input id="add-uri-input" class="m3-input" type="text" autocomplete="off" spellcheck="false" placeholder="agylink://pair?u=...&t=...&n=..." />
+          </div>
+          <button id="btn-add-uri" class="m3-btn filled full" type="button">解析并添加</button>
+        </div>
+
+        <div id="add-tab-manual" class="tab-panel hidden">
+          <div class="m3-field-group">
+            <label class="m3-label" for="add-manual-name">主机名称（可选）</label>
+            <input id="add-manual-name" class="m3-input" type="text" placeholder="例如 我的台式机" />
+          </div>
+          <div class="m3-field-group">
+            <label class="m3-label" for="add-manual-url">服务地址（Server URL）</label>
+            <input id="add-manual-url" class="m3-input" type="url" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:18795" />
+          </div>
+          <div class="m3-field-group">
+            <label class="m3-label" for="add-manual-token">访问令牌（Access Token）</label>
+            <input id="add-manual-token" class="m3-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴电脑端显示的访问令牌" />
+          </div>
+          <div class="form-actions">
+            <button id="btn-test-manual" class="m3-btn outlined" type="button">测试连通</button>
+            <button id="btn-add-manual" class="m3-btn filled" type="button">保存并连接</button>
+          </div>
+        </div>
+
+        <div id="settings-add-msg" class="m3-inline-banner hidden" role="status"></div>
+      </div>
+
+      <!-- 5G Remote & Official Info -->
+      <div class="m3-card tonal-info-card">
+        <div class="section-heading">出门在外免 VPN / 5G 远程连接</div>
+        <p class="info-text">
+          1. <strong>Cloudflare 公网免 VPN 隧道（推荐）</strong>：电脑服务端自带内置隧道，直接扫描电脑 <code>/pair</code> 页的公网二维码即可加密直连，手机可同时挂着 v2rayNG / 梯子，校园网与 5G 通吃；<br />
+          2. <strong>Tailscale 私有组网</strong>：也可在电脑与手机登录同一 Tailscale 账号，填入 <code>http://100.x.x.x:18795</code> 直连；<br />
+          3. 或在工具箱点击「官方远程模式」，无边框全屏直达 Google 官方云端。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Desktop Drag & Drop Lossless Upload Overlay -->
+  <div id="drop-overlay" class="drop-overlay hidden" aria-hidden="true">
+    <div class="drop-overlay-card">
+      <div class="drop-overlay-icon">
+        <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="17 8 12 3 7 8"></polyline>
+          <line x1="12" y1="3" x2="12" y2="15"></line>
+        </svg>
+      </div>
+      <div class="drop-overlay-title">松开即可无损添加到当前会话</div>
+      <div class="drop-overlay-desc">原图 / 原文件直传不压缩 · 支持一次拖入多张图片与文件</div>
+    </div>
+  </div>
+
+  <!-- M3 Snackbar Toast -->
+  <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
