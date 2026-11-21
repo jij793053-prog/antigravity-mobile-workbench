@@ -30,20 +30,23 @@
 
 ### 1. 环境准备
 - 已安装官方 Antigravity CLI（`agy` / `agy.exe`）
-- Python 3.10+ 并安装 `aiohttp`：
+- Python 3.10+ 并安装依赖：
   ```bash
-  pip install aiohttp
+  pip install -r requirements.txt
   ```
-- *(可选，强烈推荐免 VPN 公网直连)* 下载官方 [cloudflared](https://github.com/cloudflare/cloudflared/releases/latest) 放到本项目的 `bin/cloudflared.exe`（或加入系统 `PATH`），服务端启动时将自动建立加密公网隧道。
+- *(可选，强烈推荐免 VPN 公网直连)* 下载官方 [cloudflared](https://github.com/cloudflare/cloudflared/releases/latest) 放到本项目的 `bin/cloudflared.exe`（macOS/Linux 放到 `bin/cloudflared` 或加入系统 `PATH`），服务端启动时将自动建立加密公网隧道。
 
 ### 2. 启动服务端 / 打开电脑同步工作台
-- **方式 A（推荐，一键桌面图标）**：在 Windows PowerShell 中运行一次：
+- **方式 A（Windows 推荐，一键桌面图标）**：在 Windows PowerShell 中运行一次：
   ```powershell
   powershell -ExecutionPolicy Bypass -File .\create_desktop_shortcuts.ps1
   ```
   桌面会生成带统一四色 A 标的 **「Antigravity 同步工作台」**（双击免配对宽屏秒开）和 **「Antigravity 手机配对」**（双击打开二维码页）。
-- **方式 B（命令行启动）**：
+- **方式 B（macOS / Linux / 命令行启动）**：
   ```bash
+  # macOS / Linux
+  bash ./start_link_server.sh
+  # 或直接运行 Python
   python agy_mobile_server.py
   ```
   启动后：

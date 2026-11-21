@@ -2109,8 +2109,14 @@ def _is_strict_loopback_request(request: web.Request) -> bool:
     except ValueError:
         return False
     host_hdr = str(request.headers.get("Host") or "").strip().lower()
-    host_only = host_hdr.split(":")[0]
-    if host_only not in ("127.0.0.1", "localhost", "[::1]"):
+    try:
+        host_only = str(urllib.parse.urlparse(f"http://{host_hdr}").hostname or "").lower()
+    except Exception:
+        return False
+    if host_only not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    sfd = str(request.headers.get("Sec-Fetch-Dest") or "").strip().lower()
+    if sfd in ("iframe", "frame", "object", "embed"):
         return False
     sfs = str(request.headers.get("Sec-Fetch-Site") or "").strip().lower()
     if sfs and sfs not in ("same-origin", "none"):
@@ -2161,11 +2167,12 @@ async def cors_and_auth_middleware(request: web.Request, handler):
 
 async def handle_local_auth(request: web.Request) -> web.Response:
     """Zero-input auto-login exclusively for local desktop workbench opened on 127.0.0.1 / localhost."""
+    sec_headers = {"Cache-Control": "no-store", "Vary": "Origin", "X-Frame-Options": "DENY"}
     if not _is_strict_loopback_request(request):
         return web.json_response(
             {"ok": False, "error": "本机自动登录仅允许在电脑本机 http://127.0.0.1 访问"},
             status=403,
-            headers={"Cache-Control": "no-store"},
+            headers=sec_headers,
         )
     cfg = load_or_create_config()
     host_hdr = str(request.headers.get("Host") or f"127.0.0.1:{PORT}").strip()
@@ -2179,7 +2186,7 @@ async def handle_local_auth(request: web.Request) -> web.Response:
             "default_model": cfg.get("default_model", "gemini-4-neon-medium"),
             "port": PORT,
         },
-        headers={"Cache-Control": "no-store"},
+        headers=sec_headers,
     )
 
 

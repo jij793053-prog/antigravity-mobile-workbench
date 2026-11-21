@@ -1,0 +1,5 @@
+# Runtime dependency for Antigravity Link Server & Desktop Sync Workbench
+aiohttp>=3.9.0
+
+# Optional: only required if rebuilding the Android APK from source via android/build_apk.py
+# Pillow>=10.0.0
