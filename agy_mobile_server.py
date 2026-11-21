@@ -3281,7 +3281,7 @@ async def handle_static_www(request: web.Request) -> web.StreamResponse:
     if p.name.lower() == "manifest.json":
         resp.headers["Content-Type"] = "application/manifest+json; charset=utf-8"
     if p.suffix.lower() in (".html", ".css", ".js", ".json"):
-        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Cache-Control"] = "no-store"
     return resp
 
 

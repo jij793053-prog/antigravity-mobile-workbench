@@ -2512,6 +2512,16 @@ button {
   100% { left: 105%; }
 }
 
+.desktop-host-only {
+  display: none !important;
+}
+body.desktop-host-mode .desktop-host-only {
+  display: revert !important;
+}
+body.desktop-host-mode .phone-only {
+  display: none !important;
+}
+
 .topbar-actions {
   display: inline-flex;
   align-items: center;

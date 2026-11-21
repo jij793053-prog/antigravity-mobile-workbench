@@ -704,14 +704,21 @@
 
   function updateHostDisplays() {
     const host = getActiveHost();
-    const label = host ? host.name : "未配置主机";
-    const sub = host ? host.url.replace(/^https?:\/\//i, "") : "点击添加主机";
+    const isDesktopHost = isLocalDesktopBrowser();
+    const label = host ? host.name : (isDesktopHost ? "本机主机" : "未配置主机");
+    const sub = isDesktopHost
+      ? (state.wsConnected ? "本机主机在线 · 点此出示手机扫码" : "正在连接本机服务...")
+      : (host ? host.url.replace(/^https?:\/\//i, "") : "点击添加主机");
     const dName = $("drawer-host-name");
     const dUrl = $("drawer-host-url");
     const eName = $("empty-host-name");
     if (dName) dName.textContent = label;
     if (dUrl) dUrl.textContent = sub;
-    if (eName) eName.textContent = state.wsConnected ? `已连接 · ${label}` : label;
+    if (eName) {
+      eName.textContent = isDesktopHost
+        ? (state.wsConnected ? `${label} · 点此出示手机扫码二维码` : "正在连接本机主机...")
+        : (state.wsConnected ? `已连接 · ${label}` : label);
+    }
   }
 
   function disconnectWs() {
@@ -2303,9 +2310,19 @@
     $("btn-new-chat").addEventListener("click", startNewChat);
     $("btn-drawer-host").addEventListener("click", () => {
       closeDrawer();
-      openHostSheet();
+      if (isLocalDesktopBrowser()) {
+        $("btn-top-pair")?.click();
+      } else {
+        openHostSheet();
+      }
     });
-    $("empty-host-chip").addEventListener("click", openHostSheet);
+    $("empty-host-chip").addEventListener("click", () => {
+      if (isLocalDesktopBrowser()) {
+        $("btn-top-pair")?.click();
+      } else {
+        openHostSheet();
+      }
+    });
 
     // --- Sheets ---
     $("btn-model").addEventListener("click", openModelSheet);
@@ -2512,6 +2529,10 @@
     }
     $("nav-pair-qr")?.addEventListener("click", openPairModal);
     $("btn-top-pair")?.addEventListener("click", openPairModal);
+    $("btn-settings-show-qr")?.addEventListener("click", () => {
+      $("settings-modal")?.classList.add("hidden");
+      openPairModal();
+    });
     $("btn-pair-refresh")?.addEventListener("click", () => {
       const iframe = $("pair-iframe");
       if (iframe) iframe.src = `${location.origin}/pair?_t=${Date.now()}`;
@@ -2829,7 +2850,21 @@
   }
 
   async function boot() {
+    const isDesktopHost = isLocalDesktopBrowser();
+    if (isDesktopHost) {
+      document.body.classList.add("desktop-host-mode");
+    }
+    const hadSavedCfg = (() => {
+      try {
+        return Boolean(localStorage.getItem(CONFIG_STORAGE_KEY));
+      } catch (_) {
+        return false;
+      }
+    })();
     loadConfig();
+    if (isDesktopHost && !hadSavedCfg && state.themePref === "light") {
+      state.themePref = "dark";
+    }
     applyTheme(state.themePref, false);
     updateModelPill();
     bindEvents();
@@ -2845,19 +2880,28 @@
       return false;
     })();
 
-    if (isLocalDesktopBrowser()) {
+    if (isDesktopHost) {
       $("nav-pair-qr")?.classList.remove("hidden");
       $("btn-top-pair")?.classList.remove("hidden");
     }
 
     const pairedFromLaunch = checkInitialPairSources();
     if (!pairedFromLaunch) {
-      if (isLocalDesktopBrowser()) {
-        const autoOk = await tryLocalAutoBootstrap();
+      if (isDesktopHost) {
+        let autoOk = false;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          autoOk = await tryLocalAutoBootstrap();
+          if (autoOk) break;
+          await new Promise((r) => setTimeout(r, 500));
+        }
         if (autoOk) {
           if (wantPairOpen) $("btn-top-pair")?.click();
           return;
         }
+        // Host PC must NEVER show the phone "scan PC QR" welcome screen
+        showWorkspaceScreen();
+        setConnState("offline", "本机服务连接中，请刷新或重启工作台");
+        return;
       }
       if (getActiveHost()) {
         showWorkspaceScreen();
