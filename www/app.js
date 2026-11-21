@@ -25,10 +25,11 @@
     connectEpoch: 0,
 
     conversations: [],
-    filter: "desktop",
     search: "",
     currentCid: "",
     currentConv: null,
+    openConvSeq: 0,
+    lastRenderedConvFp: "",
     models: [],
 
     drafts: {}, // { [cid || "__new__"]: { text: string, attachments: Array } }
@@ -168,6 +169,11 @@
     if (uri) {
       handlePairUri(String(uri), { source: "deeplink" });
     }
+  };
+
+  // Exposed native Android Activity.onResume() hook for silent foreground sync
+  window.__onAndroidResume = () => {
+    syncOnForegroundResume();
   };
 
   // Exposed native media permission callback for QQ-style bottom photo drawer
@@ -721,10 +727,16 @@
     }
   }
 
+  let _refreshConvsTimer = null;
+  let _lastRefreshConvsAt = 0;
+  let _lastResumeSyncAt = 0;
+
   function disconnectWs() {
     state.connectEpoch += 1;
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
+    clearTimeout(_refreshConvsTimer);
+    _refreshConvsTimer = null;
     if (state.ws) {
       try {
         state.ws.onopen = null;
@@ -736,6 +748,23 @@
       state.ws = null;
     }
     state.wsConnected = false;
+  }
+
+  function syncOnForegroundResume() {
+    if (!getActiveHost()) return;
+    const now = Date.now();
+    if (now - _lastResumeSyncAt < 600) return;
+    _lastResumeSyncAt = now;
+    if (!state.wsConnected) {
+      const rs = state.ws ? state.ws.readyState : WebSocket.CLOSED;
+      if (rs === WebSocket.CLOSED || rs === WebSocket.CLOSING) {
+        connectWs();
+      }
+    }
+    refreshConversationsThrottled(500);
+    if (state.currentCid && !state.streaming) {
+      openConversation(state.currentCid, { silent: true });
+    }
   }
 
   // =========================================================================
@@ -851,6 +880,8 @@
       return;
     }
     loadHostDrafts();
+    state.openConvSeq += 1;
+    state.lastRenderedConvFp = "";
     state.currentCid = "";
     state.currentConv = null;
     state.conversations = [];
@@ -894,6 +925,9 @@
         fetchServerInfo();
         refreshConversations();
         loadModels();
+        if (state.currentCid && !state.streaming) {
+          openConversation(state.currentCid, { silent: true });
+        }
       };
 
       ws.onmessage = (ev) => {
@@ -1032,18 +1066,18 @@
     } else if (ev.type === "run_done") {
       adoptPendingCid();
       haptic("success");
-      if (cid === state.currentCid) {
+      if (cid === state.currentCid || (ev.aliased_cid && ev.aliased_cid === state.currentCid)) {
         state.streaming = false;
-        openConversation(cid);
+        openConversation(state.currentCid, { silent: true });
       }
-      refreshConversations();
+      refreshConversationsThrottled(400);
     } else if (ev.type === "run_canceled") {
       adoptPendingCid();
       if (cid === state.currentCid) {
         state.streaming = false;
-        renderConversation();
+        renderConversation({ preserveScroll: true });
       }
-      refreshConversations();
+      refreshConversationsThrottled(400);
     } else if (ev.type === "run_error") {
       adoptPendingCid();
       if (cid === state.currentCid) {
@@ -1055,14 +1089,18 @@
             model: state.selectedModel,
           });
         }
-        renderConversation();
+        renderConversation({ preserveScroll: true });
       }
-      refreshConversations();
+      refreshConversationsThrottled(400);
     } else if (ev.type === "desktop_update") {
-      if (cid === state.currentCid && !state.streaming) {
-        openConversation(cid);
+      const aliasedCid = ev.aliased_cid || "";
+      const matchesCurrent = Boolean(state.currentCid) && (
+        cid === state.currentCid || (aliasedCid && aliasedCid === state.currentCid)
+      );
+      if (matchesCurrent && !state.streaming) {
+        openConversation(state.currentCid, { silent: true });
       }
-      refreshConversations();
+      refreshConversationsThrottled();
     }
   }
 
@@ -1314,11 +1352,35 @@
   // =========================================================================
   // 8. CHAT & STREAMING RENDER
   // =========================================================================
-  function renderConversation() {
+  function computeConvFingerprint(conv, isRunning) {
+    if (!conv) return "";
+    const cid = conv.id || state.currentCid || "";
+    const msgs = Array.isArray(conv.messages) ? conv.messages : [];
+    const last = msgs.length ? msgs[msgs.length - 1] : null;
+    const lastTime = last && last.time ? String(last.time) : "";
+    const lastTextLen = last && typeof last.text === "string" ? last.text.length : 0;
+    const lastRole = last && last.role ? String(last.role) : "";
+    const lastToolsLen = last && Array.isArray(last.tools) ? last.tools.length : 0;
+    const lastAttsLen = last && Array.isArray(last.attachments) ? last.attachments.length : 0;
+    let totalTextLen = 0;
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      if (m && typeof m.text === "string") totalTextLen += m.text.length;
+    }
+    const delivs = Array.isArray(conv.deliverables) ? conv.deliverables : [];
+    const running = isRunning ? 1 : 0;
+    const title = conv.title || "";
+    return `${cid}|${msgs.length}|${lastRole}|${lastTime}|${lastTextLen}|${totalTextLen}|${lastToolsLen}|${lastAttsLen}|${running}|${delivs.length}|${title}`;
+  }
+
+  function renderConversation(opts = {}) {
+    const { preserveScroll = false } = opts || {};
     const list = $("messages-list");
     const conv = state.currentConv;
+    const scrollEl = $("chat-scroll");
 
     if (!conv || (!conv.messages.length && !state.streaming)) {
+      state.lastRenderedConvFp = "";
       $("empty-state").classList.remove("hidden");
       list.innerHTML = "";
       $("deliverables-box").classList.add("hidden");
@@ -1327,6 +1389,12 @@
       updateSendButton();
       return;
     }
+
+    // Check scroll position BEFORE replacing DOM so silent refresh never yanks user
+    const prevScrollTop = scrollEl ? scrollEl.scrollTop : 0;
+    const wasNearBottom = scrollEl
+      ? (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120)
+      : true;
 
     $("empty-state").classList.add("hidden");
     $("conv-title").textContent = conv.title || "新对话";
@@ -1434,12 +1502,13 @@
       updateStreamingRow();
     }
 
-    // Inline Deliverables (Default Collapsed)
+    // Inline Deliverables (Default Collapsed; preserve expanded state on silent refresh)
     const delivs = conv.deliverables || [];
     const delivBox = $("deliverables-box");
     if (delivs.length) {
+      const wasOpen = preserveScroll && delivBox.open;
       delivBox.classList.remove("hidden");
-      delivBox.open = false;
+      delivBox.open = wasOpen;
       const cntEl = $("deliverables-count");
       if (cntEl) cntEl.textContent = `本会话生成与关联文件（${delivs.length} 个）`;
       $("deliverables-list").innerHTML = delivs
@@ -1456,8 +1525,18 @@
       delivBox.open = false;
     }
 
+    state.lastRenderedConvFp = computeConvFingerprint(conv, state.streaming);
     updateSendButton();
-    scrollToBottom(true);
+    if (!preserveScroll || wasNearBottom) {
+      scrollToBottom(true);
+    } else if (scrollEl) {
+      scrollEl.scrollTop = prevScrollTop;
+      requestAnimationFrame(() => {
+        scrollEl.scrollTop = prevScrollTop;
+        const away = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight > 220;
+        $("btn-scroll-bottom").classList.toggle("hidden", !away);
+      });
+    }
   }
 
   function updateStreamingRow() {
@@ -1505,7 +1584,23 @@
   // =========================================================================
   // 9. CONVERSATIONS LIST & DRAWER
   // =========================================================================
+  function refreshConversationsThrottled(minIntervalMs = 1500) {
+    const now = Date.now();
+    const elapsed = now - _lastRefreshConvsAt;
+    if (elapsed >= minIntervalMs && !_refreshConvsTimer) {
+      refreshConversations();
+      return;
+    }
+    if (_refreshConvsTimer) return;
+    const wait = Math.max(250, minIntervalMs - elapsed);
+    _refreshConvsTimer = setTimeout(() => {
+      _refreshConvsTimer = null;
+      refreshConversations();
+    }, wait);
+  }
+
   async function refreshConversations() {
+    _lastRefreshConvsAt = Date.now();
     try {
       const data = await apiFetch("/api/conversations?limit=80");
       state.conversations = data.conversations || [];
@@ -1554,37 +1649,60 @@
       .join("");
   }
 
-  async function openConversation(cid) {
+  async function openConversation(cid, opts = {}) {
+    const { silent = false } = opts || {};
+    if (!cid) return;
     const prevKey = currentDraftKey();
     const switching = cid !== state.currentCid;
     if (switching) {
       saveCurrentDraft(prevKey);
       state.currentCid = cid;
+      state.lastRenderedConvFp = "";
       restoreDraftFor(cid);
       renderConvList();
     }
-    closeDrawer();
+    if (!silent) {
+      closeDrawer();
+    }
+    const reqSeq = ++state.openConvSeq;
     try {
       const data = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}`);
-      if (state.currentCid !== cid) return;
-      state.currentConv = data.conversation;
-      if (state.currentConv.model) {
-        state.selectedModel = state.currentConv.model;
+      if (reqSeq !== state.openConvSeq || state.currentCid !== cid) return;
+      const nextConv = data.conversation;
+      const nextRunning = Boolean(nextConv && nextConv.activeRun && nextConv.activeRun.running);
+      const nextFp = computeConvFingerprint(nextConv, nextRunning);
+
+      state.currentConv = nextConv;
+      if ((!silent || switching) && nextConv && nextConv.model) {
+        state.selectedModel = nextConv.model;
         updateModelPill();
       }
-      if (state.currentConv.activeRun && state.currentConv.activeRun.running) {
+      if (nextRunning) {
         state.streaming = true;
-        state.streamBuffer = state.currentConv.activeRun.streamText || "";
-        state.streamTools = state.currentConv.activeRun.tools || [];
+        state.streamBuffer = nextConv.activeRun.streamText || "";
+        state.streamTools = nextConv.activeRun.tools || [];
       } else {
         state.streaming = false;
         state.streamBuffer = "";
         state.streamTools = [];
       }
-      renderConversation();
-      renderConvList();
+
+      if (!switching && nextFp && nextFp === state.lastRenderedConvFp) {
+        if (nextRunning) {
+          updateStreamingRow();
+        }
+        return;
+      }
+
+      renderConversation({ preserveScroll: silent && !switching });
+      if (!silent || switching) {
+        renderConvList();
+      }
     } catch (e) {
-      showToast(`加载会话失败：${e.message}`);
+      if (reqSeq !== state.openConvSeq) return;
+      if (!silent) {
+        showToast(`加载会话失败：${e.message}`);
+      }
     }
   }
 
@@ -1594,6 +1712,8 @@
     closeDrawer();
     if (prevKey !== NEW_DRAFT_KEY) {
       saveCurrentDraft(prevKey);
+      state.openConvSeq += 1;
+      state.lastRenderedConvFp = "";
       state.currentCid = "";
       state.currentConv = null;
       state.streaming = false;
@@ -1654,6 +1774,7 @@
     state.attachments = [];
     renderAttachTray();
 
+    state.openConvSeq += 1;
     state.streaming = true;
     state.streamBuffer = "";
     state.streamTools = [];
@@ -2357,19 +2478,16 @@
 
     $("btn-host-sheet-add").addEventListener("click", openSettingsModal);
 
-    // --- Conversation Search & Filter ---
+    // --- Conversation Search & Foreground Visibility Sync ---
     $("conv-search").addEventListener("input", (e) => {
       state.search = e.target.value;
       renderConvList();
     });
 
-    document.querySelectorAll(".filter-pill").forEach((p) => {
-      p.addEventListener("click", () => {
-        document.querySelectorAll(".filter-pill").forEach((x) => x.classList.remove("active"));
-        p.classList.add("active");
-        state.filter = p.dataset.filter;
-        renderConvList();
-      });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        syncOnForegroundResume();
+      }
     });
 
     $("conv-list").addEventListener("click", (e) => {

@@ -28,7 +28,7 @@ MANIFEST_PATH = MAIN_DIR / "AndroidManifest.xml"
 WWW_SRC_DIR = PROJECT_DIR / "www"
 BUILD_DIR = ANDROID_DIR / "build"
 DIST_DIR = PROJECT_DIR / "dist"
-OUTPUT_APK = DIST_DIR / "Antigravity-Mobile-Universal-v1.5.apk"
+OUTPUT_APK = DIST_DIR / "Antigravity-Mobile-Universal-v1.6.apk"
 
 KEYSTORE_PATH = Path(os.environ.get("AGY_KEYSTORE_PATH", str(ANDROID_DIR / "antigravity_mobile.jks")))
 KEY_ALIAS = os.environ.get("AGY_KEY_ALIAS", "antigravity_mobile")
@@ -46,8 +46,8 @@ ZXING_JAR = Path(os.environ.get("ZXING_CORE_JAR", str(ANDROID_DIR / "libs" / "zx
 
 MIN_SDK = "26"
 TARGET_SDK = "34"
-VERSION_CODE = "7"
-VERSION_NAME = "1.5.1"
+VERSION_CODE = "8"
+VERSION_NAME = "1.6.0"
 
 
 def find_tool(name: str, fallback_dir: Path | None = None) -> str:
@@ -425,6 +425,7 @@ def build_apk() -> None:
             VERSION_CODE,
             "--version-name",
             VERSION_NAME,
+            "--replace-version",
             "--auto-add-overlay",
             "-o",
             str(unaligned_apk),

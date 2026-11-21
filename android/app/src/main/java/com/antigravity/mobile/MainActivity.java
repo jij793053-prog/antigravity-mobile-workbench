@@ -162,6 +162,9 @@ public class MainActivity extends Activity {
         super.onResume();
         if (webView != null) {
             webView.onResume();
+            if (localPageLoaded && !inOfficialWebMode) {
+                webView.evaluateJavascript("window.__onAndroidResume && window.__onAndroidResume()", null);
+            }
         }
         if (rootLayout != null) {
             rootLayout.requestApplyInsets();

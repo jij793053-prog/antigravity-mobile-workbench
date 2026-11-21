@@ -57,7 +57,7 @@
 
 ## 二、手机端安装与配对
 
-1. 从本仓库的 [Releases](../../releases)（或 `dist/Antigravity-Mobile-Universal-v1.5.apk`）下载并安装 Android APK。
+1. 从本仓库的 [Releases](../../releases)（或 `dist/Antigravity-Mobile-Universal-v1.6.apk`）下载并安装 Android APK。
 2. 在电脑同步工作台右上角点 **「手机配对」**（或访问 `http://127.0.0.1:18795/pair`）：
    - **扫码一键配对（推荐）**：打开手机 App 点「扫码一键配对」，对准电脑上的 **「Cloudflare 公网免VPN ★」** 二维码即可秒连。
    - **6 位数字配对码**：在手机 App 输入电脑地址（公网隧道地址 / 局域网 IP / Tailscale `100.x`）与页面上的 6 位配对码即可。

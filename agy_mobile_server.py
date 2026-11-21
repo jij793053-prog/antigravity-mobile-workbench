@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import collections
+from datetime import datetime, timezone
 import html as html_lib
 import ipaddress
 import json
@@ -38,8 +39,8 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.0"
-APK_FILENAME = "Antigravity-Mobile-Universal-v1.5.apk"
+APP_VERSION = "1.6.1"
+APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
 WWW_DIR = PROJECT_DIR / "www"
@@ -627,6 +628,9 @@ def _load_config_unlocked() -> dict[str, Any]:
     if not isinstance(cfg.get("desktop_to_cli_alias"), dict):
         cfg["desktop_to_cli_alias"] = {}
         changed = True
+    if not isinstance(cfg.get("desktop_bridge_watermark"), dict):
+        cfg["desktop_bridge_watermark"] = {}
+        changed = True
     if not isinstance(cfg.get("mobile_own_cids"), list):
         cfg["mobile_own_cids"] = []
         changed = True
@@ -707,6 +711,33 @@ def get_desktop_parent_for_cli(cli_cid: str) -> str:
         if str(mapped_cli or "").strip() == cli_cid:
             return str(desk_id).strip()
     return ""
+
+
+def get_desktop_bridge_watermark(cli_cid: str) -> str:
+    if not cli_cid:
+        return ""
+    cfg = load_or_create_config()
+    return str((cfg.get("desktop_bridge_watermark") or {}).get(cli_cid) or "").strip()
+
+
+def set_desktop_bridge_watermark(cli_cid: str, iso_time: str) -> None:
+    if not cli_cid or not iso_time:
+        return
+    iso_clean = str(iso_time).strip()
+    if not iso_clean:
+        return
+
+    def _mut(cfg: dict[str, Any]) -> None:
+        wm = cfg.setdefault("desktop_bridge_watermark", {})
+        if not isinstance(wm, dict):
+            wm = {}
+            cfg["desktop_bridge_watermark"] = wm
+        wm[cli_cid] = iso_clean
+        if len(wm) > 500:
+            for k in list(wm.keys())[:-500]:
+                wm.pop(k, None)
+
+    _update_config(_mut)
 
 
 def register_mobile_own_cid(cid: str) -> None:
@@ -1219,6 +1250,15 @@ def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> 
     return out
 
 
+_DELTA_BRIDGE_BLOCK_RE = re.compile(
+    r"^(?:/swarm\s+)?【同步电脑桌面端最新增量对话[^】]*】[\s\S]*\n【同步结束，请直接回复用户的最新指令】[ \t]*(?:\n+|$)"
+)
+_DELTA_BRIDGE_INLINE_RE = re.compile(
+    r"^(?:/swarm\s+)?【同步电脑桌面端最新增量对话[^】]*】[\s\S]*【同步结束，请直接回复用户的最新指令】\s*"
+)
+_ISO_FRAC_RE = re.compile(r"(\.\d{6})\d+")
+
+
 def _clean_user_text(raw: str, strip_att_note: bool = False) -> str:
     txt = str(raw or "").strip()
     if not txt:
@@ -1230,7 +1270,20 @@ def _clean_user_text(raw: str, strip_att_note: bool = False) -> str:
         txt = re.sub(r"<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>", "", txt).strip()
         txt = re.sub(r"<CONTEXT_SUMMARY>[\s\S]*?</CONTEXT_SUMMARY>", "", txt).strip()
 
-    # Strip desktop-to-CLI context bridge prefix so old assistant/user history never merges into user bubble
+    # Strip incremental Desktop->CLI delta context bridge block cleanly before checking other markers
+    if re.match(r"^(?:/swarm\s+)?【同步电脑桌面端最新增量对话", txt):
+        stripped = _DELTA_BRIDGE_BLOCK_RE.sub("", txt, count=1).strip()
+        if stripped != txt:
+            txt = stripped
+        elif "【同步结束，请直接回复用户的最新指令】" in txt:
+            txt = _DELTA_BRIDGE_INLINE_RE.sub("", txt, count=1).strip()
+    elif txt.startswith("【同步结束，请直接回复用户的最新指令】"):
+        txt = txt.split("【同步结束，请直接回复用户的最新指令】", 1)[1].strip()
+
+    # Strip desktop-to-CLI initial context bridge prefix so old assistant/user history never merges into user bubble
+    if re.match(r"^(?:/swarm\s+)?【衔接电脑桌面端", txt) and "【用户在 Antigravity Mobile 手机端针对以上会话的最新指令】" in txt:
+        txt = txt.rsplit("【用户在 Antigravity Mobile 手机端针对以上会话的最新指令】", 1)[1].strip()
+
     bridge_markers = (
         "【用户在 Antigravity Mobile 手机端针对以上会话的最新指令】",
         "【当前用户指令与要求】",
@@ -1337,6 +1390,86 @@ def _is_swarm_worker_quick(steps: list[dict[str, Any]]) -> bool:
         if s.get("type") == "USER_INPUT" and s.get("source") == "USER_EXPLICIT":
             return False
     return True
+
+
+def _is_swarm_worker_file(tf: pathlib.Path) -> bool:
+    """Fast check whether a transcript belongs to an internal swarm worker (no USER_EXPLICIT USER_INPUT)."""
+    try:
+        with tf.open("r", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                if "USER_EXPLICIT" in ln and "USER_INPUT" in ln:
+                    try:
+                        o = json.loads(ln)
+                        if isinstance(o, dict) and o.get("type") == "USER_INPUT" and o.get("source") == "USER_EXPLICIT":
+                            return False
+                    except Exception:
+                        continue
+        return True
+    except OSError:
+        return False
+
+
+def _parse_iso_ts(val: Any) -> float:
+    """Safely parse ISO-8601 timestamp string (Z or offset) to UTC epoch seconds; returns 0.0 on failure."""
+    if isinstance(val, (int, float)):
+        return float(val) if val > 0 else 0.0
+    s = str(val or "").strip()
+    if not s:
+        return 0.0
+    try:
+        if s.endswith("Z") or s.endswith("z"):
+            s = s[:-1] + "+00:00"
+        s = _ISO_FRAC_RE.sub(r"\1", s)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _merge_messages_chronologically(*streams: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stably interleave one or more message lists in ascending chronological order (ts, orig_order)."""
+    tagged: list[tuple[float, int, dict[str, Any]]] = []
+    seq = 0
+    for stream in streams:
+        prev_ts = 0.0
+        for m in stream:
+            ts = _parse_iso_ts(m.get("time"))
+            if ts > 0.0:
+                prev_ts = ts
+            else:
+                ts = prev_ts
+            tagged.append((ts, seq, m))
+            seq += 1
+    tagged.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in tagged]
+
+
+def _get_cli_first_step_time(cli_cid: str) -> str:
+    """Read the earliest step `created_at` from a CLI transcript (fallback watermark for pre-existing aliases)."""
+    if not cli_cid:
+        return ""
+    tf = CLI_BRAIN / cli_cid / ".system_generated" / "logs" / "transcript.jsonl"
+    if not tf.is_file():
+        return ""
+    try:
+        with tf.open("r", encoding="utf-8", errors="replace") as fh:
+            for idx, ln in enumerate(fh):
+                if idx >= 10:
+                    break
+                s = ln.strip()
+                if not s:
+                    continue
+                try:
+                    o = json.loads(s)
+                    if isinstance(o, dict) and o.get("created_at"):
+                        return str(o["created_at"]).strip()
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return ""
 
 
 def _summarize_tool(tc: dict[str, Any]) -> dict[str, str]:
@@ -1511,6 +1644,7 @@ def list_all_conversations(limit: int = 80, source_filter: str = "all") -> list[
         except OSError:
             c_item = None
         if c_item:
+            d_item["stepCount"] = int(d_item.get("stepCount") or 0) + int(c_item.get("stepCount") or 0)
             if float(c_item.get("updatedAt") or 0) > float(d_item.get("updatedAt") or 0):
                 d_item["updatedAt"] = c_item["updatedAt"]
                 if c_item.get("preview"):
@@ -1564,10 +1698,16 @@ def list_all_conversations(limit: int = 80, source_filter: str = "all") -> list[
                 "updatedAt": float(run.get("started_at") or time.time()),
                 "stepCount": 1,
             })
+    if source_filter in ("desktop", "mobile"):
+        result = [r for r in result if r.get("source") == source_filter]
     return result[:limit]
 
 
-def load_conversation_detail(cid: str, _include_parent: bool = True) -> dict[str, Any]:
+def load_conversation_detail(
+    cid: str,
+    _include_parent: bool = True,
+    _include_cli_alias: bool = True,
+) -> dict[str, Any]:
     tf, source = _locate_transcript(cid)
     title = _read_pbtxt_title(cid)
     steps = _parse_jsonl(tf) if tf is not None else []
@@ -1585,38 +1725,47 @@ def load_conversation_detail(cid: str, _include_parent: bool = True) -> dict[str
             if full_map:
                 steps = [full_map.get(s.get("step_index"), s) if isinstance(s.get("step_index"), int) else s for s in steps]
 
-    messages: list[dict[str, Any]] = []
-    # If this mobile CLI session branched off a Desktop conversation, prepend clean Desktop history
+    parent_msgs: list[dict[str, Any]] = []
+    # If this mobile CLI session branched off a Desktop conversation, load pure Desktop-only history
     if _include_parent and source == "mobile":
         parent_desk = get_desktop_parent_for_cli(cid)
         if parent_desk and parent_desk != cid:
-            parent_detail = load_conversation_detail(parent_desk, _include_parent=False)
+            parent_detail = load_conversation_detail(parent_desk, _include_parent=False, _include_cli_alias=False)
             p_msgs = parent_detail.get("messages") or []
             if p_msgs:
-                messages.extend(p_msgs[-24:])
+                parent_msgs = list(p_msgs[-60:])
             if not title and parent_detail.get("title"):
                 title = str(parent_detail["title"])
+
+    own_messages: list[dict[str, Any]] = []
     deliverable_cands: list[str] = []
     last_model = ""
     pending_tools: list[dict[str, str]] = []
     pending_thinking: list[str] = []
+    last_step_time = ""
+    pending_tool_time = ""
 
     for s in steps:
+        step_time = str(s.get("created_at") or "").strip()
+        if step_time:
+            last_step_time = step_time
         st_t = str(s.get("type") or "")
         if st_t in ("EPHEMERAL_MESSAGE", "CHECKPOINT"):
             continue
         if st_t == "USER_INPUT" and s.get("source") == "USER_EXPLICIT":
+            msg_time = step_time or last_step_time
             if pending_tools:
-                messages.append({
+                own_messages.append({
                     "role": "assistant",
                     "text": "",
                     "tools": list(pending_tools),
                     "thinking": "\n".join(pending_thinking)[-1200:],
                     "model": last_model,
-                    "time": str(s.get("created_at") or ""),
+                    "time": pending_tool_time or msg_time or last_step_time,
                 })
                 pending_tools.clear()
                 pending_thinking.clear()
+                pending_tool_time = ""
             raw_u_content = str(s.get("content") or "")
             u_atts = _extract_user_attachments(raw_u_content, s.get("media"))
             u_txt = _clean_user_text(raw_u_content, strip_att_note=bool(u_atts))
@@ -1628,12 +1777,13 @@ def load_conversation_detail(cid: str, _include_parent: bool = True) -> dict[str
             u_msg: dict[str, Any] = {
                 "role": "user",
                 "text": u_txt,
-                "time": str(s.get("created_at") or ""),
+                "time": msg_time,
             }
             if u_atts:
                 u_msg["attachments"] = u_atts
-            messages.append(u_msg)
+            own_messages.append(u_msg)
         elif st_t == "PLANNER_RESPONSE":
+            msg_time = step_time or last_step_time
             if s.get("model"):
                 last_model = str(s["model"])
             th = str(s.get("thinking") or "").strip()
@@ -1643,6 +1793,8 @@ def load_conversation_detail(cid: str, _include_parent: bool = True) -> dict[str
             for tc in tcs:
                 if isinstance(tc, dict) and tc.get("name"):
                     pending_tools.append(_summarize_tool(tc))
+                    if msg_time:
+                        pending_tool_time = msg_time
                     tname = str(tc["name"])
                     targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
                     if tname in ("write_file", "edit_file", "write_to_file", "replace_file_content"):
@@ -1656,41 +1808,55 @@ def load_conversation_detail(cid: str, _include_parent: bool = True) -> dict[str
                     if re.match(r"^/[A-Za-z]:/", u_dec):
                         u_dec = u_dec[1:]
                     deliverable_cands.append(u_dec)
-                messages.append({
+                own_messages.append({
                     "role": "assistant",
                     "text": a_txt,
                     "tools": list(pending_tools),
                     "thinking": "\n".join(pending_thinking)[-2000:],
                     "model": last_model,
-                    "time": str(s.get("created_at") or ""),
+                    "time": msg_time,
                     "isFinal": not bool(tcs),
                 })
                 pending_tools.clear()
                 pending_thinking.clear()
+                pending_tool_time = ""
 
     if pending_tools:
-        messages.append({
+        own_messages.append({
             "role": "assistant",
             "text": "",
             "tools": list(pending_tools),
             "thinking": "\n".join(pending_thinking)[-1200:],
             "model": last_model,
-            "time": "",
+            "time": pending_tool_time or last_step_time,
             "isFinal": False,
         })
 
-    # If opening a Desktop conversation that also has mobile CLI continuation turns, append them seamlessly!
-    aliased_cli = get_desktop_cli_alias(cid) if (_include_parent and source == "desktop") else ""
+    # If opening a Desktop conversation that also has mobile CLI continuation turns, merge them chronologically
+    child_msgs: list[dict[str, Any]] = []
+    aliased_cli = get_desktop_cli_alias(cid) if (_include_cli_alias and source == "desktop") else ""
     if aliased_cli and aliased_cli != cid:
-        child_detail = load_conversation_detail(aliased_cli, _include_parent=False)
+        child_detail = load_conversation_detail(aliased_cli, _include_parent=False, _include_cli_alias=False)
         c_msgs = child_detail.get("messages") or []
         if c_msgs:
-            messages.extend(c_msgs)
-        if child_detail.get("model"):
-            last_model = str(child_detail["model"])
-        for cd in child_detail.get("deliverables") or []:
+            child_msgs = list(c_msgs)
+        for cd in reversed(child_detail.get("deliverables") or []):
             if cd.get("path"):
                 deliverable_cands.append(str(cd["path"]))
+
+    if parent_msgs and child_msgs:
+        messages = _merge_messages_chronologically(parent_msgs, own_messages, child_msgs)
+    elif parent_msgs:
+        messages = _merge_messages_chronologically(parent_msgs, own_messages)
+    elif child_msgs:
+        messages = _merge_messages_chronologically(own_messages, child_msgs)
+    else:
+        messages = own_messages
+
+    for m in reversed(messages):
+        if m.get("model"):
+            last_model = str(m["model"])
+            break
 
     deliverables: list[dict[str, Any]] = []
     seen_p: set[str] = set()
@@ -1726,49 +1892,127 @@ def load_conversation_detail(cid: str, _include_parent: bool = True) -> dict[str
                 "startedAt": ar.get("started_at"),
             }
 
-    # If a desktop conversation was continued from Mobile, append its aliased CLI turns cleanly
-    if _include_parent and source == "desktop":
-        aliased_cli = get_desktop_cli_alias(cid)
-        if aliased_cli and aliased_cli != cid:
-            child_detail = load_conversation_detail(aliased_cli, _include_parent=False)
-            c_msgs = child_detail.get("messages") or []
-            if c_msgs:
-                messages.extend(c_msgs)
-            c_delivs = child_detail.get("deliverables") or []
-            if c_delivs:
-                seen_dp = {d["path"] for d in deliverables}
-                merged_d = list(c_delivs) + [d for d in deliverables if d["path"] not in {x["path"] for x in c_delivs}]
-                deliverables = merged_d[:16]
-            if child_detail.get("activeRun") and not active_run_snap:
-                active_run_snap = child_detail["activeRun"]
-            if child_detail.get("model"):
-                last_model = str(child_detail["model"])
-
     return {
         "id": cid,
         "title": title or f"对话 {cid[:8]}",
         "source": source,
         "model": last_model or load_or_create_config().get("default_model", "gemini-4-neon-medium"),
         "status": "running" if active_run_snap else "idle",
-        "messages": messages[-80:],
+        "messages": messages[-120:],
         "deliverables": deliverables,
         "activeRun": active_run_snap,
     }
 
 
-def _extract_desktop_bridge_context(desktop_cid: str) -> str:
-    detail = load_conversation_detail(desktop_cid)
+def _build_desktop_initial_bridge(desktop_cid: str) -> tuple[str, str]:
+    """Build initial Desktop->CLI context bridge from pure Desktop-only turns and return (text, latest_iso)."""
+    detail = load_conversation_detail(desktop_cid, _include_parent=False, _include_cli_alias=False)
     msgs = detail.get("messages") or []
     if not msgs:
-        return ""
-    lines = [f"【衔接电脑桌面端 Antigravity 原会话（标题：{detail.get('title')}，ID：{desktop_cid[:8]}）】"]
-    for m in msgs[-6:]:
+        return "", ""
+    recent = [m for m in msgs if str(m.get("text") or "").strip()][-6:]
+    if not recent:
+        return "", ""
+    latest_iso = ""
+    latest_ts = 0.0
+    for m in recent:
+        mt = str(m.get("time") or "").strip()
+        mts = _parse_iso_ts(mt)
+        if mt and mts >= latest_ts:
+            latest_ts = mts
+            latest_iso = mt
+    title = str(detail.get("title") or desktop_cid[:8])
+    header = f"【衔接电脑桌面端 Antigravity 原会话（标题：{title}，ID：{desktop_cid[:8]}）】"
+    budget = max(200, 5500 - len(header) - 2)
+    body_lines: list[str] = []
+    used = 0
+    for m in reversed(recent):
         role = "用户" if m.get("role") == "user" else "助手"
         txt = str(m.get("text") or "").strip()
-        if txt:
-            lines.append(f"[{role}] {txt[:1600]}")
-    ctx = "\n".join(lines)
-    return ctx[-5500:]
+        if len(txt) > 1600:
+            txt = txt[:1599] + "…"
+        line = f"[{role}] {txt}"
+        add_len = len(line) + (1 if body_lines else 0)
+        if used + add_len > budget:
+            if not body_lines:
+                avail = max(80, budget - len(f"[{role}] ") - 1)
+                body_lines.append(f"[{role}] {txt[:avail]}…")
+            break
+        body_lines.append(line)
+        used += add_len
+    body_lines.reverse()
+    return f"{header}\n" + "\n".join(body_lines), latest_iso
+
+
+def _extract_desktop_bridge_context(desktop_cid: str) -> str:
+    ctx, _ = _build_desktop_initial_bridge(desktop_cid)
+    return ctx
+
+
+def _extract_desktop_delta_context(
+    desktop_cid: str,
+    watermark_iso: str = "",
+    max_turns: int = 8,
+    max_msg_chars: int = 1400,
+    max_total_chars: int = 5000,
+) -> tuple[str, str]:
+    """Extract pure Desktop-only turns strictly newer than `watermark_iso` for incremental CLI sync.
+
+    Returns `(formatted_delta_block, latest_desktop_iso_time)` or `("", "")` if no newer turns exist.
+    """
+    detail = load_conversation_detail(desktop_cid, _include_parent=False, _include_cli_alias=False)
+    msgs = detail.get("messages") or []
+    if not msgs:
+        return "", ""
+
+    wm_ts = _parse_iso_ts(watermark_iso)
+    delta_msgs: list[dict[str, Any]] = []
+    for m in msgs:
+        txt = str(m.get("text") or "").strip()
+        if not txt:
+            continue
+        m_time = str(m.get("time") or "").strip()
+        m_ts = _parse_iso_ts(m_time)
+        if wm_ts > 0.0 and m_ts <= wm_ts:
+            continue
+        delta_msgs.append(m)
+
+    if not delta_msgs:
+        return "", ""
+
+    selected = delta_msgs[-max_turns:]
+    latest_iso = ""
+    latest_ts = 0.0
+    for m in selected:
+        mt = str(m.get("time") or "").strip()
+        mts = _parse_iso_ts(mt)
+        if mt and mts >= latest_ts:
+            latest_ts = mts
+            latest_iso = mt
+
+    title = str(detail.get("title") or desktop_cid[:8])
+    header = f"【同步电脑桌面端最新增量对话（标题：{title}，ID：{desktop_cid[:8]}）】"
+    footer = "【同步结束，请直接回复用户的最新指令】"
+    budget = max(200, max_total_chars - len(header) - len(footer) - 4)
+    body_lines: list[str] = []
+    used = 0
+    for m in reversed(selected):
+        role = "用户" if m.get("role") == "user" else "助手"
+        txt = str(m.get("text") or "").strip()
+        if len(txt) > max_msg_chars:
+            txt = txt[: max_msg_chars - 1] + "…"
+        line = f"[{role}] {txt}"
+        add_len = len(line) + (1 if body_lines else 0)
+        if used + add_len > budget:
+            if not body_lines:
+                avail = max(80, budget - len(f"[{role}] ") - 1)
+                body_lines.append(f"[{role}] {txt[:avail]}…")
+            break
+        body_lines.append(line)
+        used += add_len
+    body_lines.reverse()
+    block = f"{header}\n" + "\n".join(body_lines) + f"\n{footer}"
+    return block, latest_iso
 
 
 def _broadcast_ws(payload: dict[str, Any]) -> None:
@@ -1811,6 +2055,8 @@ def start_cli_chat_run(
     resume_cli_cid = ""
     source_desktop_cid = ""
     desktop_ctx = ""
+    delta_ctx = ""
+    pending_watermark = ""
 
     if not is_new:
         if (CLI_CONV / f"{req_cid}.db").is_file():
@@ -1825,13 +2071,22 @@ def start_cli_chat_run(
                 source_desktop_cid = req_cid
             elif (DESKTOP_BRAIN / req_cid / ".system_generated" / "logs" / "transcript.jsonl").is_file():
                 source_desktop_cid = req_cid
-                desktop_ctx = _extract_desktop_bridge_context(req_cid)
+                desktop_ctx, pending_watermark = _build_desktop_initial_bridge(req_cid)
+
+    # Incremental Desktop->CLI Delta Context Bridge on EVERY resumed CLI run linked to a Desktop parent
+    if resume_cli_cid and source_desktop_cid and not desktop_ctx:
+        wm_iso = get_desktop_bridge_watermark(resume_cli_cid)
+        if not wm_iso:
+            wm_iso = _get_cli_first_step_time(resume_cli_cid)
+        delta_ctx, pending_watermark = _extract_desktop_delta_context(source_desktop_cid, wm_iso)
 
     eff_model = str(model or "").strip() or load_or_create_config().get("default_model", "gemini-4-neon-medium")
     parts: list[str] = []
     if desktop_ctx:
         parts.append(desktop_ctx)
         parts.append("【用户在 Antigravity Mobile 手机端针对以上会话的最新指令】")
+    elif delta_ctx:
+        parts.append(delta_ctx)
     if attachments:
         att_txt = "\n".join(f"- {a}" for a in attachments if a)
         if att_txt:
@@ -1871,6 +2126,11 @@ def start_cli_chat_run(
         )
     except Exception as exc:
         return {"ok": False, "error": f"启动 agy CLI 失败: {exc}"}
+
+    watermark_saved = False
+    if resume_cli_cid and pending_watermark:
+        set_desktop_bridge_watermark(resume_cli_cid, pending_watermark)
+        watermark_saved = True
 
     run_id = uuid.uuid4().hex[:10]
     init_evt = threading.Event()
@@ -1931,8 +2191,22 @@ def start_cli_chat_run(
         t_err.start()
         bound_cid = resume_cli_cid
         disp_cid = source_desktop_cid or resume_cli_cid
+        wm_persisted = watermark_saved
         final_resp = ""
         usage: dict[str, Any] = {}
+
+        def _persist_binding(cli_id: str) -> None:
+            nonlocal wm_persisted
+            if not cli_id:
+                return
+            if source_desktop_cid and source_desktop_cid != cli_id:
+                set_desktop_cli_alias(source_desktop_cid, cli_id)
+                if pending_watermark and not wm_persisted:
+                    set_desktop_bridge_watermark(cli_id, pending_watermark)
+                    wm_persisted = True
+            elif is_new or not source_desktop_cid:
+                register_mobile_own_cid(cli_id)
+
         try:
             if proc.stdout is not None:
                 for raw_ln in proc.stdout:
@@ -1956,10 +2230,7 @@ def start_cli_chat_run(
                             with _ACTIVE_RUNS_LOCK:
                                 _ACTIVE_RUNS[cid_i] = run_rec
                                 _ACTIVE_RUNS[disp_cid] = run_rec
-                            if source_desktop_cid and source_desktop_cid != cid_i:
-                                set_desktop_cli_alias(source_desktop_cid, cid_i)
-                            elif is_new or not source_desktop_cid:
-                                register_mobile_own_cid(cid_i)
+                            _persist_binding(cid_i)
                             _broadcast_ws({
                                 "type": "run_init",
                                 "conversation_id": disp_cid,
@@ -1979,8 +2250,7 @@ def start_cli_chat_run(
                             with _ACTIVE_RUNS_LOCK:
                                 _ACTIVE_RUNS[bound_cid] = run_rec
                                 _ACTIVE_RUNS[disp_cid] = run_rec
-                            if not source_desktop_cid:
-                                register_mobile_own_cid(bound_cid)
+                            _persist_binding(bound_cid)
                             init_evt.set()
                         st_type = str(su.get("step_type") or "")
                         if st_type == "tool":
@@ -2022,6 +2292,7 @@ def start_cli_chat_run(
                             disp_cid = source_desktop_cid or bound_cid
                             run_rec["cid"] = bound_cid
                             run_rec["display_cid"] = disp_cid
+                            _persist_binding(bound_cid)
                             init_evt.set()
                         final_resp = _clean_assistant_text(str(ro.get("response") or ""))
                         if isinstance(ro.get("usage"), dict):
@@ -3286,15 +3557,33 @@ async def handle_static_www(request: web.Request) -> web.StreamResponse:
 
 
 async def _desktop_transcript_push_loop(_app: web.Application) -> None:
-    """Broadcast real-time update pings whenever any recent desktop transcript changes."""
+    """Broadcast real-time update pings whenever any desktop transcript changes."""
     last_sigs: dict[str, tuple[int, int]] = {}
-    while True:
-        await asyncio.sleep(2.0)
-        if not _WS_CLIENTS or not DESKTOP_BRAIN.is_dir():
-            continue
+    known_real_chats: set[str] = set()
+
+    def _seed_initial_sigs() -> None:
+        if not DESKTOP_BRAIN.is_dir():
+            return
         try:
-            now = time.time()
-            changed_cids: list[str] = []
+            with os.scandir(DESKTOP_BRAIN) as it:
+                for e in it:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    tf = pathlib.Path(e.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                    try:
+                        st = tf.stat()
+                        if st.st_size > 0:
+                            last_sigs[e.name] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        continue
+        except Exception:
+            pass
+
+    def _scan_changes(now_ts: float) -> list[tuple[int, str]]:
+        changed: list[tuple[int, str]] = []
+        if not DESKTOP_BRAIN.is_dir():
+            return changed
+        try:
             with os.scandir(DESKTOP_BRAIN) as it:
                 for e in it:
                     if not e.is_dir(follow_symlinks=False):
@@ -3304,15 +3593,47 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
                         st = tf.stat()
                     except OSError:
                         continue
-                    if now - st.st_mtime > 300.0:
+                    if st.st_size <= 0 or (now_ts - st.st_mtime > 300.0):
                         continue
                     sig = (st.st_mtime_ns, st.st_size)
                     prev = last_sigs.get(e.name)
+                    if prev == sig:
+                        continue
                     last_sigs[e.name] = sig
-                    if prev is not None and prev != sig:
-                        changed_cids.append(e.name)
-            for c in changed_cids[:4]:
-                _broadcast_ws({"type": "desktop_update", "conversation_id": c, "ts": now})
+                    # Ignore internal swarm worker / subagent transcripts so user chats are never starved
+                    if e.name not in known_real_chats:
+                        if _is_swarm_worker_file(tf):
+                            continue
+                        known_real_chats.add(e.name)
+                    changed.append((st.st_mtime_ns, e.name))
+        except Exception:
+            pass
+        changed.sort(key=lambda item: item[0], reverse=True)
+        return changed
+
+    await asyncio.to_thread(_seed_initial_sigs)
+
+    while True:
+        await asyncio.sleep(2.0)
+        if not _WS_CLIENTS or not DESKTOP_BRAIN.is_dir():
+            continue
+        try:
+            now = time.time()
+            changed_cids = await asyncio.to_thread(_scan_changes, now)
+            if not changed_cids:
+                continue
+            cfg = load_or_create_config()
+            aliases = cfg.get("desktop_to_cli_alias") or {}
+            for _, c in changed_cids[:8]:
+                payload: dict[str, Any] = {
+                    "type": "desktop_update",
+                    "conversation_id": c,
+                    "ts": now,
+                }
+                aliased_cid = str(aliases.get(c) or "").strip()
+                if aliased_cid:
+                    payload["aliased_cid"] = aliased_cid
+                _broadcast_ws(payload)
         except Exception:
             pass
 
