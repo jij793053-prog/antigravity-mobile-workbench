@@ -15,8 +15,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-
-from PIL import Image, ImageDraw
+from typing import Any
 
 # Paths (relative to this script so the project stays portable)
 ANDROID_DIR = Path(__file__).resolve().parent
@@ -32,34 +31,103 @@ OUTPUT_APK = DIST_DIR / "Antigravity-Mobile-Universal-v1.6.apk"
 
 KEYSTORE_PATH = Path(os.environ.get("AGY_KEYSTORE_PATH", str(ANDROID_DIR / "antigravity_mobile.jks")))
 KEY_ALIAS = os.environ.get("AGY_KEY_ALIAS", "antigravity_mobile")
-KEY_PASS = os.environ.get("AGY_KEYSTORE_PASS", "changeit-local-dev-key")
+KEY_PASS_ENV = "AGY_KEYSTORE_PASS"
 KEY_DNAME = "CN=Antigravity Mobile, OU=Antigravity, O=Antigravity, L=Universal, S=Universal, C=US"
 
-SDK_ROOT = Path(
-    os.environ.get("ANDROID_SDK_ROOT")
-    or os.environ.get("ANDROID_HOME")
-    or str(Path.home() / "AppData" / "Local" / "Android" / "Sdk")
-)
-BUILD_TOOLS_DIR = SDK_ROOT / "build-tools" / "34.0.0"
-ANDROID_JAR = SDK_ROOT / "platforms" / "android-34" / "android.jar"
+ZXING_MAVEN_URL = "https://repo1.maven.org/maven2/com/google/zxing/core/3.5.3/core-3.5.3.jar"
 ZXING_JAR = Path(os.environ.get("ZXING_CORE_JAR", str(ANDROID_DIR / "libs" / "zxing-core-3.5.3.jar")))
 
 MIN_SDK = "26"
 TARGET_SDK = "34"
-VERSION_CODE = "8"
-VERSION_NAME = "1.6.0"
+VERSION_CODE = "9"
+VERSION_NAME = "1.6.1"
+
+
+def _version_tuple(name: str) -> tuple[int, ...]:
+    nums = re.findall(r"\d+", name)
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def detect_sdk_root() -> Path:
+    for env_key in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return Path(val)
+
+    candidates: list[Path] = []
+    if os.name == "nt":
+        local_app = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app:
+            candidates.append(Path(local_app) / "Android" / "Sdk")
+        candidates.append(Path.home() / "AppData" / "Local" / "Android" / "Sdk")
+    elif sys.platform == "darwin":
+        candidates.append(Path.home() / "Library" / "Android" / "sdk")
+        candidates.append(Path.home() / "Android" / "Sdk")
+    else:
+        candidates.append(Path.home() / "Android" / "Sdk")
+        candidates.append(Path.home() / "android-sdk")
+        candidates.append(Path("/usr/lib/android-sdk"))
+        candidates.append(Path("/opt/android-sdk"))
+
+    for cand in candidates:
+        if cand.is_dir():
+            return cand
+    return candidates[0]
+
+
+def detect_build_tools_dir(sdk_root: Path) -> Path:
+    preferred = sdk_root / "build-tools" / "34.0.0"
+    if preferred.is_dir():
+        return preferred
+    bt_root = sdk_root / "build-tools"
+    if bt_root.is_dir():
+        found: list[tuple[tuple[int, ...], Path]] = []
+        aapt_names = ("aapt2.exe", "aapt2") if os.name == "nt" else ("aapt2",)
+        for child in bt_root.iterdir():
+            if child.is_dir() and any((child / n).is_file() for n in aapt_names):
+                found.append((_version_tuple(child.name), child))
+        if found:
+            found.sort(key=lambda item: item[0], reverse=True)
+            return found[0][1]
+    return preferred
+
+
+def detect_android_jar(sdk_root: Path) -> Path:
+    preferred = sdk_root / "platforms" / "android-34" / "android.jar"
+    if preferred.is_file():
+        return preferred
+    plat_root = sdk_root / "platforms"
+    if plat_root.is_dir():
+        found: list[tuple[tuple[int, ...], Path]] = []
+        for child in plat_root.iterdir():
+            jar = child / "android.jar"
+            if child.is_dir() and child.name.startswith("android-") and jar.is_file():
+                found.append((_version_tuple(child.name), jar))
+        if found:
+            found.sort(key=lambda item: item[0], reverse=True)
+            return found[0][1]
+    return preferred
+
+
+SDK_ROOT = detect_sdk_root()
+BUILD_TOOLS_DIR = detect_build_tools_dir(SDK_ROOT)
+ANDROID_JAR = detect_android_jar(SDK_ROOT)
 
 
 def find_tool(name: str, fallback_dir: Path | None = None) -> str:
+    exts = (".exe", ".bat", ".cmd") if os.name == "nt" else ("",)
     if fallback_dir is not None:
-        for ext in ("", ".exe", ".bat", ".cmd"):
+        for ext in exts:
             candidate = fallback_dir / f"{name}{ext}"
             if candidate.is_file():
                 return str(candidate)
     found = shutil.which(name)
     if found:
         return found
-    raise FileNotFoundError(f"Required tool not found: {name}")
+    raise FileNotFoundError(
+        f"Required tool not found: {name} (checked {fallback_dir or 'PATH'}). "
+        f"Verify ANDROID_SDK_ROOT={SDK_ROOT} has Android build-tools installed."
+    )
 
 
 def find_keytool() -> str:
@@ -93,7 +161,11 @@ def find_keytool() -> str:
     raise FileNotFoundError("keytool not found in PATH or java.home")
 
 
-def run_cmd(cmd: list[str], label: str) -> subprocess.CompletedProcess[str]:
+def run_cmd(
+    cmd: list[str],
+    label: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     print(f"[build] {label}...")
     proc = subprocess.run(
         cmd,
@@ -101,6 +173,7 @@ def run_cmd(cmd: list[str], label: str) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
         check=False,
     )
     if proc.returncode != 0:
@@ -172,12 +245,18 @@ def _prism_gradient_color(nx: float, ny: float) -> tuple[int, int, int]:
     return stops[-1][1]
 
 
-def _render_antigravity_mark(canvas_size: int, mark_scale: float, monochrome: bool = False) -> Image.Image:
+def _render_antigravity_mark(
+    image_mod: Any,
+    draw_mod: Any,
+    canvas_size: int,
+    mark_scale: float,
+    monochrome: bool = False,
+) -> Any:
     """
     Renders the sculptural geometric Antigravity prismatic 'A' mark onto a transparent canvas.
     """
-    mask = Image.new("L", (canvas_size, canvas_size), 0)
-    draw = ImageDraw.Draw(mask)
+    mask = image_mod.new("L", (canvas_size, canvas_size), 0)
+    draw = draw_mod.Draw(mask)
 
     box = canvas_size * mark_scale
     ox = (canvas_size - box) * 0.5
@@ -223,13 +302,13 @@ def _render_antigravity_mark(canvas_size: int, mark_scale: float, monochrome: bo
         draw.ellipse((x - bridge_r, y - bridge_r, x + bridge_r, y + bridge_r), fill=255)
 
     if monochrome:
-        out = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 0))
-        solid = Image.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
+        out = image_mod.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 0))
+        solid = image_mod.new("RGBA", (canvas_size, canvas_size), (255, 255, 255, 255))
         out.paste(solid, (0, 0), mask)
         return out
 
     # Build smooth prism gradient over mark bounding box
-    grad = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    grad = image_mod.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
     px = grad.load()
     x0 = max(0, int(ox - main_r - 2))
     y0 = max(0, int(oy - main_r - 2))
@@ -249,9 +328,9 @@ def _render_antigravity_mark(canvas_size: int, mark_scale: float, monochrome: bo
     return grad
 
 
-def _draw_squircle_mask(size: int, margin: int, power: float = 4.6) -> Image.Image:
+def _draw_squircle_mask(image_mod: Any, size: int, margin: int, power: float = 4.6) -> Any:
     """Superellipse (squircle) alpha mask for Material 3 legacy launcher icon."""
-    mask = Image.new("L", (size, size), 0)
+    mask = image_mod.new("L", (size, size), 0)
     px = mask.load()
     cx = (size - 1) * 0.5
     cy = (size - 1) * 0.5
@@ -271,23 +350,54 @@ def _draw_squircle_mask(size: int, margin: int, power: float = 4.6) -> Image.Ima
     return mask
 
 
+def _all_launcher_icons_present(densities: dict[str, tuple[int, int]]) -> bool:
+    required = (
+        "ic_launcher.png",
+        "ic_launcher_round.png",
+        "ic_launcher_foreground.png",
+        "ic_launcher_monochrome.png",
+    )
+    for folder in densities:
+        out_dir = RES_DIR / folder
+        if not all((out_dir / fname).is_file() for fname in required):
+            return False
+    return True
+
+
 def generate_icons() -> None:
+    densities = {
+        "mipmap-mdpi": (48, 108),
+        "mipmap-hdpi": (72, 162),
+        "mipmap-xhdpi": (96, 216),
+        "mipmap-xxhdpi": (144, 324),
+        "mipmap-xxxhdpi": (192, 432),
+    }
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        if _all_launcher_icons_present(densities):
+            print("[warn] Pillow not installed (pip install Pillow); reusing existing launcher icons in res/mipmap-*.")
+            return
+        print("[ERROR] Pillow is required to generate launcher icons.")
+        print("        Install it with: pip install Pillow")
+        sys.exit(1)
+
     print("[build] Generating Material 3 adaptive & legacy launcher icons...")
     master_size = 512
 
     # 1. Adaptive foreground (safe zone: ~52% of 108dp canvas)
-    fg_master = _render_antigravity_mark(master_size, mark_scale=0.52, monochrome=False)
-    mono_master = _render_antigravity_mark(master_size, mark_scale=0.52, monochrome=True)
+    fg_master = _render_antigravity_mark(Image, ImageDraw, master_size, mark_scale=0.52, monochrome=False)
+    mono_master = _render_antigravity_mark(Image, ImageDraw, master_size, mark_scale=0.52, monochrome=True)
 
     # 2. Legacy squircle porcelain icon
-    sq_outer = _draw_squircle_mask(master_size, margin=20)
-    sq_inner = _draw_squircle_mask(master_size, margin=26)
+    sq_outer = _draw_squircle_mask(Image, master_size, margin=20)
+    sq_inner = _draw_squircle_mask(Image, master_size, margin=26)
     legacy_master = Image.new("RGBA", (master_size, master_size), (0, 0, 0, 0))
     border_layer = Image.new("RGBA", (master_size, master_size), (230, 234, 240, 255))
     white_layer = Image.new("RGBA", (master_size, master_size), (255, 255, 255, 255))
     legacy_master.paste(border_layer, (0, 0), sq_outer)
     legacy_master.paste(white_layer, (0, 0), sq_inner)
-    mark_legacy = _render_antigravity_mark(master_size, mark_scale=0.62, monochrome=False)
+    mark_legacy = _render_antigravity_mark(Image, ImageDraw, master_size, mark_scale=0.62, monochrome=False)
     legacy_master.alpha_composite(mark_legacy)
 
     # 3. Round porcelain icon
@@ -296,14 +406,6 @@ def generate_icons() -> None:
     r_draw.ellipse((20, 20, master_size - 20, master_size - 20), fill=(230, 234, 240, 255))
     r_draw.ellipse((26, 26, master_size - 26, master_size - 26), fill=(255, 255, 255, 255))
     round_master.alpha_composite(mark_legacy)
-
-    densities = {
-        "mipmap-mdpi": (48, 108),
-        "mipmap-hdpi": (72, 162),
-        "mipmap-xhdpi": (96, 216),
-        "mipmap-xxhdpi": (144, 324),
-        "mipmap-xxxhdpi": (192, 432),
-    }
 
     for folder, (icon_px, fg_px) in densities.items():
         out_dir = RES_DIR / folder
@@ -322,7 +424,18 @@ def generate_icons() -> None:
         )
 
 
-def ensure_keystore(keytool: str) -> None:
+def require_keystore_pass() -> str:
+    pw = os.environ.get(KEY_PASS_ENV, "").strip()
+    if not pw:
+        print(f"[ERROR] Missing required signing password environment variable: {KEY_PASS_ENV}")
+        print("        Set it before building (never commit keystore passwords into the repository):")
+        print('          PowerShell : $env:AGY_KEYSTORE_PASS = "your-strong-keystore-password"')
+        print('          macOS/Linux: export AGY_KEYSTORE_PASS="your-strong-keystore-password"')
+        sys.exit(1)
+    return pw
+
+
+def ensure_keystore(keytool: str, sign_env: dict[str, str]) -> None:
     if KEYSTORE_PATH.is_file():
         return
     run_cmd(
@@ -342,14 +455,15 @@ def ensure_keystore(keytool: str) -> None:
             "2048",
             "-validity",
             "10000",
-            "-storepass",
-            KEY_PASS,
-            "-keypass",
-            KEY_PASS,
+            "-storepass:env",
+            KEY_PASS_ENV,
+            "-keypass:env",
+            KEY_PASS_ENV,
             "-dname",
             KEY_DNAME,
         ],
         "Generating release signing keystore",
+        env=sign_env,
     )
 
 
@@ -357,11 +471,28 @@ def build_apk() -> None:
     t0 = time.perf_counter()
 
     if not ANDROID_JAR.is_file():
-        raise FileNotFoundError(f"android.jar not found at {ANDROID_JAR}")
+        print(f"[ERROR] android.jar not found at {ANDROID_JAR}")
+        print(f"        Detected SDK root: {SDK_ROOT}")
+        print("        Install Android SDK platform (e.g. platforms;android-34) or set ANDROID_SDK_ROOT.")
+        sys.exit(1)
     if not ZXING_JAR.is_file():
-        raise FileNotFoundError(f"zxing-core jar not found at {ZXING_JAR}")
+        print(f"[ERROR] zxing-core jar not found at {ZXING_JAR}")
+        print("        Download zxing-core-3.5.3.jar from Maven Central:")
+        print(f"          {ZXING_MAVEN_URL}")
+        print(f"        Save it to: {ANDROID_DIR / 'libs' / 'zxing-core-3.5.3.jar'}")
+        print("        Or set environment variable ZXING_CORE_JAR=/path/to/zxing-core-3.5.3.jar")
+        sys.exit(1)
     if not WWW_SRC_DIR.is_dir():
         raise FileNotFoundError(f"Web assets directory not found at {WWW_SRC_DIR}")
+
+    key_pass = require_keystore_pass()
+    sign_env = os.environ.copy()
+    sign_env[KEY_PASS_ENV] = key_pass
+
+    print(f"[build] SDK root    : {SDK_ROOT}")
+    print(f"[build] build-tools : {BUILD_TOOLS_DIR}")
+    print(f"[build] android.jar : {ANDROID_JAR}")
+    print(f"[build] version     : {VERSION_NAME} (code {VERSION_CODE})")
 
     aapt2 = find_tool("aapt2", BUILD_TOOLS_DIR)
     d8 = find_tool("d8", BUILD_TOOLS_DIR)
@@ -371,7 +502,7 @@ def build_apk() -> None:
     keytool = find_keytool()
 
     generate_icons()
-    ensure_keystore(keytool)
+    ensure_keystore(keytool, sign_env)
 
     # Clean build scratch directory
     if BUILD_DIR.exists():
@@ -488,7 +619,7 @@ def build_apk() -> None:
         "zipalign APK",
     )
 
-    # 7. Sign APK (v1 + v2 + v3)
+    # 7. Sign APK (v1 + v2 + v3) using env: to keep signing password out of process argv
     run_cmd(
         [
             apksigner,
@@ -498,9 +629,9 @@ def build_apk() -> None:
             "--ks-key-alias",
             KEY_ALIAS,
             "--ks-pass",
-            f"pass:{KEY_PASS}",
+            f"env:{KEY_PASS_ENV}",
             "--key-pass",
-            f"pass:{KEY_PASS}",
+            f"env:{KEY_PASS_ENV}",
             "--v1-signing-enabled",
             "true",
             "--v2-signing-enabled",
@@ -512,6 +643,7 @@ def build_apk() -> None:
             str(aligned_apk),
         ],
         "apksigner sign APK (v1+v2+v3)",
+        env=sign_env,
     )
 
     # 8. Verify signature & dump badging

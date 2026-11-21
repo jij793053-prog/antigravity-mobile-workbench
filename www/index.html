@@ -2,13 +2,13 @@
 <html lang="zh-CN" data-theme="light">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta id="meta-theme-color" name="theme-color" content="#FFFFFF" />
   <link rel="icon" href="./favicon.ico" />
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.6.3" />
+  <link rel="stylesheet" href="./app.css?v=1.6.4" />
 </head>
 <body>
   <!-- =========================================================
@@ -403,6 +403,14 @@
         </svg>
         <input id="conv-search" class="m3-search-input" type="search" placeholder="搜索会话..." />
       </div>
+
+      <!-- Sidebar Conversation Source Filter Bar -->
+      <div id="conv-filter-bar" class="m3-segmented sm conv-filter-bar" role="tablist" aria-label="会话分类">
+        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-filter="all">全部</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-filter="mobile">移动</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-filter="desktop">桌面</button>
+        <button id="filter-pill-external" type="button" class="seg-btn hidden" role="tab" aria-selected="false" data-filter="external">外部/QQ</button>
+      </div>
     </div>
 
     <div id="conv-list" class="conv-list"></div>
@@ -661,6 +669,17 @@
         </div>
       </div>
 
+      <!-- Sidebar Conversation Filter Section -->
+      <div class="m3-card">
+        <div class="section-heading">侧栏会话过滤</div>
+        <div class="m3-label" style="margin-bottom:8px;">显示外部 CLI / QQ 机器人会话</div>
+        <div class="m3-segmented sm" role="group" aria-label="显示外部 CLI / QQ 机器人会话">
+          <button type="button" class="seg-btn ext-cli-opt active" data-ext-cli="off">关闭（默认）</button>
+          <button type="button" class="seg-btn ext-cli-opt" data-ext-cli="on">开启</button>
+        </div>
+        <p class="info-text" style="margin-top:8px;">默认仅显示桌面端与手机/工作台会话；开启后侧栏将多出「外部/QQ」栏位，用于查看终端或 QQ 机器人产生的独立对话。</p>
+      </div>
+
       <!-- Saved Hosts List (Phone Client Only) -->
       <div class="m3-card phone-only">
         <div class="section-heading-row">
@@ -752,7 +771,7 @@
       </button>
       <div class="topbar-center">
         <div class="conv-title">手机扫码配对</div>
-        <div class="conv-subtitle">后台服务与公网免 VPN 隧道已同步就绪</div>
+        <div class="conv-subtitle">本机服务已就绪 · 支持公网免 VPN 隧道与局域网扫码</div>
       </div>
       <div class="topbar-actions">
         <button id="btn-pair-refresh" class="m3-icon-btn" type="button" aria-label="刷新配对页" title="刷新二维码与隧道状态">
@@ -788,9 +807,31 @@
     </div>
   </div>
 
+  <!-- M3 Host Pair Import Confirmation Dialog -->
+  <div id="pair-confirm-dialog" class="m3-dialog-scrim hidden" role="dialog" aria-modal="true" aria-labelledby="pair-confirm-title">
+    <div class="m3-dialog-card">
+      <div id="pair-confirm-title" class="m3-dialog-title">确认连接此主机？</div>
+      <p id="pair-confirm-desc" class="m3-dialog-desc">检测到外部配对信息，请核对主机名称与服务地址无误后再保存并切换连接：</p>
+      <div class="m3-dialog-kv">
+        <div class="m3-dialog-kv-row">
+          <span class="m3-dialog-kv-k">主机名称</span>
+          <span id="pair-confirm-name" class="m3-dialog-kv-v"></span>
+        </div>
+        <div class="m3-dialog-kv-row">
+          <span class="m3-dialog-kv-k">服务地址</span>
+          <span id="pair-confirm-url" class="m3-dialog-kv-v mono"></span>
+        </div>
+      </div>
+      <div class="m3-dialog-actions">
+        <button id="btn-pair-confirm-cancel" class="m3-btn outlined sm" type="button">取消</button>
+        <button id="btn-pair-confirm-ok" class="m3-btn filled sm" type="button">确认连接</button>
+      </div>
+    </div>
+  </div>
+
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=1.6.3"></script>
+  <script src="./app.js?v=1.6.4"></script>
 </body>
 </html>

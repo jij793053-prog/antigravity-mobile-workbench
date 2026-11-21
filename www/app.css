@@ -1097,7 +1097,9 @@ button {
 .md-body h1,
 .md-body h2,
 .md-body h3,
-.md-body h4 {
+.md-body h4,
+.md-body h5,
+.md-body h6 {
   margin: 16px 0 8px;
   font-weight: 600;
   line-height: 1.35;
@@ -1108,6 +1110,8 @@ button {
 .md-body h2 { font-size: 17px; }
 .md-body h3 { font-size: 15.5px; }
 .md-body h4 { font-size: 14.5px; color: var(--md-text-secondary); }
+.md-body h5 { font-size: 13.5px; color: var(--md-text-secondary); }
+.md-body h6 { font-size: 12.5px; color: var(--md-text-muted); }
 .md-body ul,
 .md-body ol {
   margin: 6px 0 12px;
@@ -1754,6 +1758,17 @@ button {
   color: var(--md-text-muted);
 }
 
+.conv-filter-bar .seg-btn {
+  padding: 0 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  border-right: none;
+  border-left: 1px solid var(--md-outline-variant);
+}
+.conv-filter-bar .seg-btn:first-child {
+  border-left: none;
+}
+
 .conv-list {
   flex: 1;
   overflow-y: auto;
@@ -1812,6 +1827,22 @@ button {
   color: var(--md-text-secondary);
   flex-shrink: 0;
 }
+.ci-badge.run {
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+.ci-badge.mob {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+.ci-badge.sync {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+.ci-badge.ext {
+  background: var(--md-surface-highest);
+  color: var(--md-text-muted);
+}
 .conv-item.active .ci-badge {
   background: rgba(0, 0, 0, 0.08);
   color: var(--md-on-secondary-container);
@@ -1819,7 +1850,7 @@ button {
 [data-theme="dark"] .conv-item.active .ci-badge {
   background: rgba(255, 255, 255, 0.14);
 }
-.ci-badge.run {
+.conv-item.active .ci-badge.run {
   background: var(--md-primary-container);
   color: var(--md-on-primary-container);
 }
@@ -2459,6 +2490,82 @@ button {
   text-align: center;
   color: var(--md-text-muted);
   font-size: 13.5px;
+}
+
+/* ==========================================================================
+   M3 CONFIRMATION DIALOG
+   ========================================================================== */
+
+.m3-dialog-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 98;
+  background: var(--md-scrim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  animation: m3FadeIn 160ms var(--md-motion);
+}
+.m3-dialog-card {
+  width: 100%;
+  max-width: 380px;
+  border-radius: 28px;
+  background: var(--md-surface-low);
+  border: 1px solid var(--md-outline-variant);
+  box-shadow: var(--md-shadow-lg);
+  padding: 22px 22px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.m3-dialog-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--md-text);
+  line-height: 1.3;
+}
+.m3-dialog-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--md-text-secondary);
+}
+.m3-dialog-kv {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+}
+.m3-dialog-kv-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.m3-dialog-kv-k {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--md-text-muted);
+}
+.m3-dialog-kv-v {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--md-text);
+  word-break: break-all;
+}
+.m3-dialog-kv-v.mono {
+  font-family: "Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+.m3-dialog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 /* ==========================================================================

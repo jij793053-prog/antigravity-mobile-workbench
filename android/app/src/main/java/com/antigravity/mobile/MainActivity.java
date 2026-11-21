@@ -62,26 +62,34 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class MainActivity extends Activity {
 
     private static final String PREFS_NAME = "antigravity_mobile_prefs";
     private static final String KEY_CONFIG_JSON = "config_json";
-    private static final String LOCAL_ENTRY_URL = "file:///android_asset/www/index.html";
+    private static final String VIRTUAL_APP_SCHEME = "http";
+    private static final String VIRTUAL_APP_HOST = "appassets.local";
+    private static final String VIRTUAL_APP_ORIGIN = VIRTUAL_APP_SCHEME + "://" + VIRTUAL_APP_HOST;
+    private static final String LOCAL_ENTRY_URL = VIRTUAL_APP_ORIGIN + "/www/index.html";
+    private static final String MEDIA_THUMB_PATH = "/media-thumb";
     private static final String OFFICIAL_WEB_URL = "https://antigravity.google";
+    private static final String APP_VERSION_NAME = "1.6.1";
     private static final int FILE_CHOOSER_REQUEST_CODE = 1001;
     private static final int QR_SCAN_REQUEST_CODE = 1002;
     private static final int SAVE_FILE_REQUEST_CODE = 1003;
     private static final int CAMERA_PERMISSION_REQUEST_CODE = 2001;
     private static final int MEDIA_PERMISSION_REQUEST_CODE = 2002;
-    private static final String VIRTUAL_THUMB_HOST = "agylocal.thumb";
 
     private volatile String pendingSaveUrl = null;
     private volatile String pendingSaveFilename = null;
@@ -93,14 +101,15 @@ public class MainActivity extends Activity {
 
     private FrameLayout rootLayout;
     private WebView webView;
+    private WebView officialWebView;
     private TextView backToLocalPill;
 
     private ValueCallback<Uri[]> filePathCallback;
 
     private volatile String pendingPairUri = null;
-    private boolean inOfficialWebMode = false;
-    private boolean localPageLoaded = false;
-    private boolean clearHistoryOnNextLocalFinish = false;
+    private volatile boolean inOfficialWebMode = false;
+    private volatile boolean localOriginActive = false;
+    private volatile boolean localPageLoaded = false;
     private boolean currentIsDark = false;
     private boolean themeSetByWeb = false;
 
@@ -135,7 +144,7 @@ public class MainActivity extends Activity {
         webView.setVerticalScrollBarEnabled(false);
         webView.setHorizontalScrollBarEnabled(false);
 
-        configureWebView(webView);
+        configureLocalWebView(webView);
         rootLayout.addView(webView);
 
         backToLocalPill = buildBackToLocalPill();
@@ -147,6 +156,7 @@ public class MainActivity extends Activity {
         setupWindowInsets();
 
         handlePairIntent(getIntent());
+        localOriginActive = true;
         webView.loadUrl(LOCAL_ENTRY_URL);
     }
 
@@ -160,9 +170,13 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) {
+        if (inOfficialWebMode) {
+            if (officialWebView != null) {
+                officialWebView.onResume();
+            }
+        } else if (webView != null) {
             webView.onResume();
-            if (localPageLoaded && !inOfficialWebMode) {
+            if (localPageLoaded) {
                 webView.evaluateJavascript("window.__onAndroidResume && window.__onAndroidResume()", null);
             }
         }
@@ -175,6 +189,9 @@ public class MainActivity extends Activity {
     protected void onPause() {
         if (webView != null) {
             webView.onPause();
+        }
+        if (officialWebView != null) {
+            officialWebView.onPause();
         }
         super.onPause();
     }
@@ -197,6 +214,16 @@ public class MainActivity extends Activity {
         if (filePathCallback != null) {
             filePathCallback.onReceiveValue(null);
             filePathCallback = null;
+        }
+        if (officialWebView != null) {
+            officialWebView.stopLoading();
+            officialWebView.setWebChromeClient(null);
+            officialWebView.setWebViewClient(new WebViewClient());
+            if (rootLayout != null) {
+                rootLayout.removeView(officialWebView);
+            }
+            officialWebView.destroy();
+            officialWebView = null;
         }
         if (webView != null) {
             webView.stopLoading();
@@ -259,6 +286,9 @@ public class MainActivity extends Activity {
         }
         if (webView != null) {
             webView.setBackgroundColor(bgColor);
+        }
+        if (officialWebView != null) {
+            officialWebView.setBackgroundColor(bgColor);
         }
         styleBackToLocalPill(isDark);
 
@@ -377,14 +407,17 @@ public class MainActivity extends Activity {
     }
 
     private void applyWebViewInsetsOrPadding(boolean forceInject) {
-        if (webView == null) {
+        if (inOfficialWebMode) {
+            if (officialWebView != null) {
+                int bottomPad = Math.max(lastNavBottomPx, lastImeBottomPx);
+                if (officialWebView.getPaddingTop() != lastTopPx
+                        || officialWebView.getPaddingBottom() != bottomPad) {
+                    officialWebView.setPadding(0, lastTopPx, 0, bottomPad);
+                }
+            }
             return;
         }
-        if (inOfficialWebMode) {
-            int bottomPad = Math.max(lastNavBottomPx, lastImeBottomPx);
-            if (webView.getPaddingTop() != lastTopPx || webView.getPaddingBottom() != bottomPad) {
-                webView.setPadding(0, lastTopPx, 0, bottomPad);
-            }
+        if (webView == null) {
             return;
         }
 
@@ -429,16 +462,69 @@ public class MainActivity extends Activity {
 
     @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
     @SuppressWarnings("deprecation")
-    private void configureWebView(WebView wv) {
+    private void configureLocalWebView(WebView wv) {
         WebSettings settings = wv.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
-        settings.setAllowFileAccess(true);
+        settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
-        settings.setAllowFileAccessFromFileURLs(true);
-        settings.setAllowUniversalAccessFromFileURLs(true);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setSupportMultipleWindows(false);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        settings.setBuiltInZoomControls(false);
+        settings.setDisplayZoomControls(false);
+        settings.setTextZoom(100);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+        CookieManager cookieManager = CookieManager.getInstance();
+        cookieManager.setAcceptCookie(true);
+        cookieManager.setAcceptThirdPartyCookies(wv, false);
+
+        wv.addJavascriptInterface(new AndroidBridge(this), "AndroidBridge");
+
+        wv.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) -> {
+            if (!isBridgeCallAllowed() || !isPairedHostOrigin(url)) {
+                return;
+            }
+            String guessed = URLUtil.guessFileName(url, contentDisposition, mimetype);
+            enqueueDownload(url, guessed);
+        });
+
+        wv.setWebViewClient(new MainWebViewClient(this));
+        wv.setWebChromeClient(new MainWebChromeClient(this));
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressWarnings("deprecation")
+    private WebView ensureOfficialWebView() {
+        if (officialWebView != null) {
+            return officialWebView;
+        }
+        WebView wv = new WebView(this);
+        wv.setLayoutParams(new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        wv.setBackgroundColor(currentIsDark ? COLOR_DARK_BG : COLOR_LIGHT_BG);
+        wv.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        wv.setVerticalScrollBarEnabled(false);
+        wv.setHorizontalScrollBarEnabled(false);
+        wv.setVisibility(View.GONE);
+
+        WebSettings settings = wv.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setAllowFileAccessFromFileURLs(false);
+        settings.setAllowUniversalAccessFromFileURLs(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         settings.setJavaScriptCanOpenWindowsAutomatically(true);
         settings.setSupportMultipleWindows(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
@@ -461,15 +547,162 @@ public class MainActivity extends Activity {
         cookieManager.setAcceptCookie(true);
         cookieManager.setAcceptThirdPartyCookies(wv, true);
 
-        wv.addJavascriptInterface(new AndroidBridge(this), "AndroidBridge");
-
+        // SECURITY: NEVER attach AndroidBridge to officialWebView.
         wv.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) -> {
+            if (url == null || !url.toLowerCase().startsWith("https://")) {
+                return;
+            }
             String guessed = URLUtil.guessFileName(url, contentDisposition, mimetype);
             enqueueDownload(url, guessed);
         });
 
-        wv.setWebViewClient(new MainWebViewClient(this));
+        wv.setWebViewClient(new OfficialWebViewClient(this));
         wv.setWebChromeClient(new MainWebChromeClient(this));
+
+        int pillIdx = rootLayout != null && backToLocalPill != null
+                ? rootLayout.indexOfChild(backToLocalPill)
+                : -1;
+        if (rootLayout != null) {
+            if (pillIdx >= 0) {
+                rootLayout.addView(wv, pillIdx);
+            } else {
+                rootLayout.addView(wv);
+            }
+        }
+        officialWebView = wv;
+        return officialWebView;
+    }
+
+    private static boolean isLocalAppUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return false;
+        }
+        Uri uri = Uri.parse(url);
+        if (uri == null) {
+            return false;
+        }
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        String path = uri.getPath();
+        return VIRTUAL_APP_SCHEME.equalsIgnoreCase(scheme)
+                && VIRTUAL_APP_HOST.equalsIgnoreCase(host)
+                && path != null
+                && (path.equals("/www") || path.equals("/www/") || path.startsWith("/www/"));
+    }
+
+    private static WebResourceResponse makeStatusResponse(int statusCode, String reason) {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Cache-Control", "no-store");
+        headers.put("X-Content-Type-Options", "nosniff");
+        return new WebResourceResponse(
+                "text/plain",
+                "utf-8",
+                statusCode,
+                reason,
+                headers,
+                new ByteArrayInputStream(new byte[0]));
+    }
+
+    private WebResourceResponse serveVirtualAppRequest(Uri uri) {
+        if (uri == null || !VIRTUAL_APP_SCHEME.equalsIgnoreCase(uri.getScheme())) {
+            return makeStatusResponse(403, "Forbidden");
+        }
+        String path = uri.getPath();
+        if (path == null || path.isEmpty()) {
+            return makeStatusResponse(404, "Not Found");
+        }
+        if (MEDIA_THUMB_PATH.equals(path)) {
+            return serveMediaThumbnail(uri);
+        }
+        if ("/favicon.ico".equals(path)) {
+            return serveLocalAsset("www/favicon.ico");
+        }
+        if (path.equals("/www") || path.equals("/www/") || path.startsWith("/www/")) {
+            String rel = path.substring(1);
+            if ("www".equals(rel) || "www/".equals(rel)) {
+                rel = "www/index.html";
+            }
+            return serveLocalAsset(rel);
+        }
+        return makeStatusResponse(404, "Not Found");
+    }
+
+    private WebResourceResponse serveLocalAsset(String relPath) {
+        if (relPath == null || relPath.isEmpty()
+                || relPath.contains("..")
+                || relPath.contains("\\")
+                || relPath.indexOf('\0') >= 0
+                || !relPath.startsWith("www/")) {
+            return makeStatusResponse(403, "Forbidden");
+        }
+        String[] parts = relPath.split("/");
+        for (String part : parts) {
+            if (part.isEmpty() || ".".equals(part) || "..".equals(part)) {
+                return makeStatusResponse(403, "Forbidden");
+            }
+        }
+        try {
+            InputStream in = getAssets().open(relPath);
+            String mime = guessAssetMimeType(relPath);
+            String encoding = isTextMime(mime) ? "utf-8" : null;
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Cache-Control", "no-cache");
+            headers.put("X-Content-Type-Options", "nosniff");
+            return new WebResourceResponse(mime, encoding, 200, "OK", headers, in);
+        } catch (IOException ignored) {
+            return makeStatusResponse(404, "Not Found");
+        }
+    }
+
+    private String guessAssetMimeType(String path) {
+        String lower = path.toLowerCase();
+        if (lower.endsWith(".html") || lower.endsWith(".htm")) {
+            return "text/html";
+        }
+        if (lower.endsWith(".css")) {
+            return "text/css";
+        }
+        if (lower.endsWith(".js") || lower.endsWith(".mjs")) {
+            return "application/javascript";
+        }
+        if (lower.endsWith(".json") || lower.endsWith(".webmanifest")) {
+            return "application/json";
+        }
+        if (lower.endsWith(".svg")) {
+            return "image/svg+xml";
+        }
+        if (lower.endsWith(".png")) {
+            return "image/png";
+        }
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+            return "image/jpeg";
+        }
+        if (lower.endsWith(".webp")) {
+            return "image/webp";
+        }
+        if (lower.endsWith(".gif")) {
+            return "image/gif";
+        }
+        if (lower.endsWith(".ico")) {
+            return "image/x-icon";
+        }
+        if (lower.endsWith(".woff2")) {
+            return "font/woff2";
+        }
+        if (lower.endsWith(".woff")) {
+            return "font/woff";
+        }
+        if (lower.endsWith(".ttf")) {
+            return "font/ttf";
+        }
+        return guessMimeType(path);
+    }
+
+    private static boolean isTextMime(String mime) {
+        return mime != null && (mime.startsWith("text/")
+                || "application/javascript".equals(mime)
+                || "application/json".equals(mime)
+                || "image/svg+xml".equals(mime));
     }
 
     private static final class MainWebViewClient extends WebViewClient {
@@ -482,8 +715,8 @@ public class MainActivity extends Activity {
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
             Uri uri = request != null ? request.getUrl() : null;
-            if (uri != null && VIRTUAL_THUMB_HOST.equalsIgnoreCase(uri.getHost())) {
-                return activity.serveMediaThumbnail(uri);
+            if (uri != null && VIRTUAL_APP_HOST.equalsIgnoreCase(uri.getHost())) {
+                return activity.serveVirtualAppRequest(uri);
             }
             return super.shouldInterceptRequest(view, request);
         }
@@ -492,20 +725,29 @@ public class MainActivity extends Activity {
         public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
             Uri uri = request != null ? request.getUrl() : null;
             if (uri == null) {
-                return false;
+                return true;
             }
-            return activity.handleNavigationUri(uri);
+            return activity.handleLocalNavigationUri(uri);
+        }
+
+        @Override
+        public void onPageStarted(WebView view, String url, Bitmap favicon) {
+            super.onPageStarted(view, url, favicon);
+            if (!isLocalAppUrl(url)) {
+                activity.localOriginActive = false;
+                view.stopLoading();
+                view.loadUrl(LOCAL_ENTRY_URL);
+                return;
+            }
+            activity.localOriginActive = true;
         }
 
         @Override
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
-            if (url != null && url.startsWith("file:///android_asset/www/")) {
+            if (isLocalAppUrl(url)) {
+                activity.localOriginActive = true;
                 activity.localPageLoaded = true;
-                if (activity.clearHistoryOnNextLocalFinish) {
-                    activity.clearHistoryOnNextLocalFinish = false;
-                    view.clearHistory();
-                }
                 activity.applyWebViewInsetsOrPadding(true);
 
                 activity.mainHandler.postDelayed(() -> {
@@ -516,6 +758,32 @@ public class MainActivity extends Activity {
                     }
                 }, 150);
             }
+        }
+    }
+
+    private static final class OfficialWebViewClient extends WebViewClient {
+        private final MainActivity activity;
+
+        OfficialWebViewClient(MainActivity activity) {
+            this.activity = activity;
+        }
+
+        @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+            Uri uri = request != null ? request.getUrl() : null;
+            if (uri != null && VIRTUAL_APP_HOST.equalsIgnoreCase(uri.getHost())) {
+                return makeStatusResponse(403, "Forbidden");
+            }
+            return super.shouldInterceptRequest(view, request);
+        }
+
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            Uri uri = request != null ? request.getUrl() : null;
+            if (uri == null) {
+                return true;
+            }
+            return activity.handleOfficialNavigationUri(uri);
         }
     }
 
@@ -636,21 +904,56 @@ public class MainActivity extends Activity {
         }
     }
 
-    private boolean handleNavigationUri(Uri uri) {
+    private boolean handleLocalNavigationUri(Uri uri) {
         String scheme = uri.getScheme();
         if (scheme == null) {
-            return false;
+            return true;
         }
         String lower = scheme.toLowerCase();
         if ("agylink".equals(lower) && "pair".equalsIgnoreCase(uri.getHost())) {
             handlePairUri(uri.toString());
             return true;
         }
-        if ("http".equals(lower) || "https".equals(lower)
-                || "file".equals(lower) || "about".equals(lower)
-                || "blob".equals(lower) || "data".equals(lower)) {
+        if (VIRTUAL_APP_SCHEME.equals(lower) && VIRTUAL_APP_HOST.equalsIgnoreCase(uri.getHost())) {
+            String path = uri.getPath();
+            if (path != null && (path.equals("/www") || path.equals("/www/") || path.startsWith("/www/"))) {
+                return false;
+            }
+            return true;
+        }
+        // Block non-app local/data/blob/script navigations in the privileged local WebView.
+        if ("file".equals(lower) || "data".equals(lower) || "blob".equals(lower)
+                || "content".equals(lower) || "about".equals(lower) || "javascript".equals(lower)) {
+            return true;
+        }
+        // Open ALL external http/https and app-scheme links externally; NEVER load third-party sites here.
+        try {
+            Intent external = new Intent(Intent.ACTION_VIEW, uri);
+            startActivity(external);
+            return true;
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
+    private boolean handleOfficialNavigationUri(Uri uri) {
+        String scheme = uri.getScheme();
+        if (scheme == null) {
+            return true;
+        }
+        String lower = scheme.toLowerCase();
+        if ("agylink".equals(lower) && "pair".equalsIgnoreCase(uri.getHost())) {
+            handlePairUri(uri.toString());
+            return true;
+        }
+        if ("https".equals(lower)) {
             return false;
         }
+        if ("file".equals(lower) || "data".equals(lower) || "blob".equals(lower)
+                || "content".equals(lower) || "about".equals(lower) || "javascript".equals(lower)) {
+            return true;
+        }
+        // Open http:// and external schemes via system browser (keep Official WebView HTTPS-only).
         try {
             Intent external = new Intent(Intent.ACTION_VIEW, uri);
             startActivity(external);
@@ -878,7 +1181,7 @@ public class MainActivity extends Activity {
                         item.put("height", h);
                         item.put("size", size);
                         item.put("mime", mime);
-                        item.put("thumbUrl", "https://" + VIRTUAL_THUMB_HOST + "/" + id);
+                        item.put("thumbUrl", VIRTUAL_APP_ORIGIN + MEDIA_THUMB_PATH + "?id=" + id);
                         items.put(item);
                         count++;
                     }
@@ -900,13 +1203,18 @@ public class MainActivity extends Activity {
 
     @SuppressWarnings("deprecation")
     private WebResourceResponse serveMediaThumbnail(Uri uri) {
+        if (inOfficialWebMode || !localOriginActive) {
+            return makeStatusResponse(403, "Forbidden");
+        }
         try {
-            String seg = uri.getLastPathSegment();
-            if (seg == null || seg.isEmpty()) {
-                return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null,
-                        new ByteArrayInputStream(new byte[0]));
+            String idStr = uri.getQueryParameter("id");
+            if (idStr == null || idStr.isEmpty()) {
+                return makeStatusResponse(404, "Not Found");
             }
-            long id = Long.parseLong(seg);
+            long id = Long.parseLong(idStr.trim());
+            if (id < 0L) {
+                return makeStatusResponse(404, "Not Found");
+            }
             Uri contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
             Bitmap bmp = null;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -948,17 +1256,19 @@ public class MainActivity extends Activity {
                 }
             }
             if (bmp == null) {
-                return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null,
-                        new ByteArrayInputStream(new byte[0]));
+                return makeStatusResponse(404, "Not Found");
             }
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             bmp.compress(Bitmap.CompressFormat.JPEG, 82, baos);
             bmp.recycle();
             byte[] bytes = baos.toByteArray();
-            return new WebResourceResponse("image/jpeg", null, new ByteArrayInputStream(bytes));
+            Map<String, String> headers = new HashMap<>();
+            headers.put("Cache-Control", "private, max-age=60");
+            headers.put("X-Content-Type-Options", "nosniff");
+            return new WebResourceResponse(
+                    "image/jpeg", null, 200, "OK", headers, new ByteArrayInputStream(bytes));
         } catch (Throwable ignored) {
-            return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null,
-                    new ByteArrayInputStream(new byte[0]));
+            return makeStatusResponse(404, "Not Found");
         }
     }
 
@@ -1032,6 +1342,7 @@ public class MainActivity extends Activity {
                 byte[] footerBytes = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
 
                 conn = (HttpURLConnection) new URL(uploadUrl).openConnection();
+                conn.setInstanceFollowRedirects(false);
                 conn.setDoOutput(true);
                 conn.setRequestMethod("POST");
                 conn.setConnectTimeout(15000);
@@ -1272,8 +1583,14 @@ public class MainActivity extends Activity {
         if (webView == null) {
             return;
         }
+        WebView official = ensureOfficialWebView();
         inOfficialWebMode = true;
-        localPageLoaded = false;
+
+        webView.setVisibility(View.GONE);
+        webView.onPause();
+
+        official.setVisibility(View.VISIBLE);
+        official.onResume();
         applyWebViewInsetsOrPadding(false);
 
         if (backToLocalPill != null) {
@@ -1284,7 +1601,10 @@ public class MainActivity extends Activity {
             backToLocalPill.setVisibility(View.VISIBLE);
             backToLocalPill.animate().alpha(1f).setDuration(200).start();
         }
-        webView.loadUrl(OFFICIAL_WEB_URL);
+        String currentUrl = official.getUrl();
+        if (currentUrl == null || currentUrl.isEmpty() || !currentUrl.toLowerCase().startsWith("https://")) {
+            official.loadUrl(OFFICIAL_WEB_URL);
+        }
     }
 
     private void exitOfficialWeb() {
@@ -1292,14 +1612,25 @@ public class MainActivity extends Activity {
             return;
         }
         inOfficialWebMode = false;
-        localPageLoaded = false;
-        clearHistoryOnNextLocalFinish = true;
 
         if (backToLocalPill != null) {
             backToLocalPill.setVisibility(View.GONE);
         }
-        applyWebViewInsetsOrPadding(false);
-        webView.loadUrl(LOCAL_ENTRY_URL);
+        if (officialWebView != null) {
+            officialWebView.setVisibility(View.GONE);
+            officialWebView.onPause();
+        }
+
+        webView.setVisibility(View.VISIBLE);
+        webView.onResume();
+        applyWebViewInsetsOrPadding(true);
+
+        if (localPageLoaded) {
+            String pending = consumePendingPairUri();
+            if (pending != null && !pending.isEmpty()) {
+                deliverPairUriToWeb(pending);
+            }
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -1353,6 +1684,24 @@ public class MainActivity extends Activity {
         enqueueDownloadWithOptions(url, filename, "Antigravity", false);
     }
 
+    private boolean launchSafSave(String url, String safeName) {
+        try {
+            pendingSaveUrl = url;
+            pendingSaveFilename = safeName;
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType(guessMimeType(safeName));
+            intent.putExtra(Intent.EXTRA_TITLE, safeName);
+            startActivityForResult(intent, SAVE_FILE_REQUEST_CODE);
+            return true;
+        } catch (Exception e) {
+            pendingSaveUrl = null;
+            pendingSaveFilename = null;
+            return false;
+        }
+    }
+
+    @SuppressWarnings("deprecation")
     private void enqueueDownloadWithOptions(String url, String filename, String subdir, boolean askFolder) {
         if (url == null || !(url.startsWith("http://") || url.startsWith("https://"))) {
             Toast.makeText(this, "不支持的下载链接", Toast.LENGTH_SHORT).show();
@@ -1361,47 +1710,86 @@ public class MainActivity extends Activity {
         String safeName = sanitizeFilename(filename, url);
 
         if (askFolder) {
-            try {
-                pendingSaveUrl = url;
-                pendingSaveFilename = safeName;
-                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType(guessMimeType(safeName));
-                intent.putExtra(Intent.EXTRA_TITLE, safeName);
-                startActivityForResult(intent, SAVE_FILE_REQUEST_CODE);
+            if (launchSafSave(url, safeName)) {
                 return;
-            } catch (Exception e) {
-                pendingSaveUrl = null;
-                pendingSaveFilename = null;
-                Toast.makeText(this, "无法打开文件夹选择器，改为默认下载", Toast.LENGTH_SHORT).show();
             }
+            Toast.makeText(this, "无法打开文件夹选择器，改为默认下载", Toast.LENGTH_SHORT).show();
+        }
+
+        // On Android 8-9 (API 26-28), DownloadManager.setDestinationInExternalPublicDir requires
+        // WRITE_EXTERNAL_STORAGE at runtime. Fall back cleanly to SAF when not granted.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            if (launchSafSave(url, safeName)) {
+                return;
+            }
+            Toast.makeText(this, "缺少存储权限且无法打开系统保存器", Toast.LENGTH_LONG).show();
+            return;
         }
 
         String cleanSub = sanitizeSubdir(subdir);
-        String relDest = cleanSub.isEmpty() ? safeName : (cleanSub + "/" + safeName);
-        try {
-            DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
-            if (dm == null) {
-                Toast.makeText(this, "系统下载服务不可用", Toast.LENGTH_SHORT).show();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && !cleanSub.isEmpty()) {
+            try {
+                File dlRoot = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                File targetDir = new File(dlRoot, cleanSub);
+                if (!targetDir.exists() && !targetDir.mkdirs()) {
+                    cleanSub = cleanSub.replace('/', '_');
+                }
+            } catch (Exception ignored) {
+                cleanSub = cleanSub.replace('/', '_');
+            }
+        }
+
+        DownloadManager dm = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+        if (dm == null) {
+            if (launchSafSave(url, safeName)) {
                 return;
             }
-            DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
-            req.setTitle(safeName);
-            req.setDescription("Antigravity");
-            req.setNotificationVisibility(
-                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, relDest);
-
-            String cookies = CookieManager.getInstance().getCookie(url);
-            if (cookies != null && !cookies.isEmpty()) {
-                req.addRequestHeader("Cookie", cookies);
-            }
-            dm.enqueue(req);
-            String folderDisp = cleanSub.isEmpty() ? "Download/" : ("Download/" + cleanSub + "/");
-            Toast.makeText(this, "开始下载到 " + folderDisp + safeName, Toast.LENGTH_SHORT).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "下载失败：" + e.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "系统下载服务不可用", Toast.LENGTH_SHORT).show();
+            return;
         }
+
+        String usedSub = cleanSub;
+        String relDest = usedSub.isEmpty() ? safeName : (usedSub + "/" + safeName);
+        try {
+            enqueueDownloadRequest(dm, url, safeName, relDest);
+            String folderDisp = usedSub.isEmpty() ? "Download/" : ("Download/" + usedSub + "/");
+            Toast.makeText(this, "开始下载到 " + folderDisp + safeName, Toast.LENGTH_SHORT).show();
+        } catch (Exception firstErr) {
+            // Some Android 10+ OEM ROMs reject multi-segment subdirs under Downloads; retry flattened.
+            if (usedSub.contains("/")) {
+                String flatSub = usedSub.replace('/', '_');
+                String flatDest = flatSub.isEmpty() ? safeName : (flatSub + "/" + safeName);
+                try {
+                    enqueueDownloadRequest(dm, url, safeName, flatDest);
+                    String folderDisp = flatSub.isEmpty() ? "Download/" : ("Download/" + flatSub + "/");
+                    Toast.makeText(this, "开始下载到 " + folderDisp + safeName, Toast.LENGTH_SHORT).show();
+                    return;
+                } catch (Exception ignored) {
+                    // Fall through to SAF fallback below
+                }
+            }
+            if (launchSafSave(url, safeName)) {
+                return;
+            }
+            Toast.makeText(this, "下载失败：" + firstErr.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void enqueueDownloadRequest(DownloadManager dm, String url, String safeName, String relDest) {
+        DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+        req.setTitle(safeName);
+        req.setDescription("Antigravity");
+        req.setNotificationVisibility(
+                DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+        req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, relDest);
+
+        String cookies = CookieManager.getInstance().getCookie(url);
+        if (cookies != null && !cookies.isEmpty()) {
+            req.addRequestHeader("Cookie", cookies);
+        }
+        dm.enqueue(req);
     }
 
     private String sanitizeSubdir(String raw) {
@@ -1409,17 +1797,29 @@ public class MainActivity extends Activity {
             return "";
         }
         String s = raw.trim().replace('\\', '/');
-        while (s.contains("..")) {
-            s = s.replace("..", "");
+        String[] rawParts = s.split("/");
+        StringBuilder sb = new StringBuilder();
+        for (String part : rawParts) {
+            String clean = part.trim().replaceAll("[<>:\"|?*\\r\\n\\u0000]+", "_");
+            while (clean.startsWith(".")) {
+                clean = clean.substring(1);
+            }
+            while (clean.endsWith(".")) {
+                clean = clean.substring(0, clean.length() - 1);
+            }
+            clean = clean.trim();
+            if (clean.isEmpty() || ".".equals(clean) || "..".equals(clean)) {
+                continue;
+            }
+            if (clean.length() > 48) {
+                clean = clean.substring(0, 48);
+            }
+            if (sb.length() > 0) {
+                sb.append('/');
+            }
+            sb.append(clean);
         }
-        s = s.replaceAll("[<>:\"|?*\\r\\n]+", "_");
-        while (s.startsWith("/")) {
-            s = s.substring(1);
-        }
-        while (s.endsWith("/")) {
-            s = s.substring(0, s.length() - 1);
-        }
-        return s;
+        return sb.toString();
     }
 
     private String guessMimeType(String filename) {
@@ -1454,8 +1854,11 @@ public class MainActivity extends Activity {
                 conn = (HttpURLConnection) new URL(srcUrl).openConnection();
                 conn.setConnectTimeout(15000);
                 conn.setReadTimeout(60000);
-                conn.setInstanceFollowRedirects(true);
+                conn.setInstanceFollowRedirects(false);
                 int code = conn.getResponseCode();
+                if (code >= 300 && code < 400) {
+                    throw new RuntimeException("已阻止下载重定向 (HTTP " + code + ")");
+                }
                 if (code < 200 || code >= 300) {
                     throw new RuntimeException("HTTP " + code);
                 }
@@ -1517,16 +1920,16 @@ public class MainActivity extends Activity {
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
-        if (webView == null) {
-            super.onBackPressed();
-            return;
-        }
         if (inOfficialWebMode) {
-            if (webView.canGoBack()) {
-                webView.goBack();
+            if (officialWebView != null && officialWebView.canGoBack()) {
+                officialWebView.goBack();
             } else {
                 exitOfficialWeb();
             }
+            return;
+        }
+        if (webView == null) {
+            super.onBackPressed();
             return;
         }
 
@@ -1548,6 +1951,72 @@ public class MainActivity extends Activity {
         return Math.round(dp * getResources().getDisplayMetrics().density);
     }
 
+    private boolean isBridgeCallAllowed() {
+        return !inOfficialWebMode && localOriginActive;
+    }
+
+    private static String extractOrigin(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) {
+            return null;
+        }
+        try {
+            Uri u = Uri.parse(rawUrl.trim());
+            if (u == null) {
+                return null;
+            }
+            String scheme = u.getScheme();
+            String host = u.getHost();
+            if (scheme == null || host == null || host.isEmpty()) {
+                return null;
+            }
+            String lowerScheme = scheme.toLowerCase();
+            if (!"http".equals(lowerScheme) && !"https".equals(lowerScheme)) {
+                return null;
+            }
+            int port = u.getPort();
+            if (port == -1) {
+                port = "https".equals(lowerScheme) ? 443 : 80;
+            }
+            return lowerScheme + "://" + host.toLowerCase() + ":" + port;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean isPairedHostOrigin(String targetUrl) {
+        String targetOrigin = extractOrigin(targetUrl);
+        if (targetOrigin == null) {
+            return false;
+        }
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        String raw = prefs.getString(KEY_CONFIG_JSON, "");
+        if (raw == null || raw.trim().isEmpty()) {
+            return false;
+        }
+        try {
+            JSONObject cfg = new JSONObject(raw);
+            JSONArray hosts = cfg.optJSONArray("hosts");
+            if (hosts != null) {
+                for (int i = 0; i < hosts.length(); i++) {
+                    JSONObject h = hosts.optJSONObject(i);
+                    if (h != null) {
+                        String hostOrigin = extractOrigin(h.optString("url", ""));
+                        if (targetOrigin.equals(hostOrigin)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            String legacyUrl = cfg.optString("serverUrl", "");
+            if (!legacyUrl.isEmpty() && targetOrigin.equals(extractOrigin(legacyUrl))) {
+                return true;
+            }
+        } catch (Exception ignored) {
+            return false;
+        }
+        return false;
+    }
+
     private static final class AndroidBridge {
         private final MainActivity activity;
 
@@ -1557,18 +2026,27 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public String getConfig() {
+            if (!activity.isBridgeCallAllowed()) {
+                return "";
+            }
             SharedPreferences prefs = activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
             return prefs.getString(KEY_CONFIG_JSON, "");
         }
 
         @JavascriptInterface
         public void saveConfig(String json) {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             SharedPreferences prefs = activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
             prefs.edit().putString(KEY_CONFIG_JSON, json == null ? "" : json).apply();
         }
 
         @JavascriptInterface
         public void setSystemBarTheme(boolean isDark) {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             activity.mainHandler.post(() -> {
                 activity.themeSetByWeb = true;
                 activity.applySystemBarTheme(isDark);
@@ -1577,11 +2055,17 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void vibrate(String kind) {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             activity.mainHandler.post(() -> activity.performHaptic(kind));
         }
 
         @JavascriptInterface
         public void copyText(String text) {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             activity.mainHandler.post(() -> {
                 try {
                     ClipboardManager cm = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
@@ -1597,21 +2081,33 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void downloadFile(String url, String filename) {
+            if (!activity.isBridgeCallAllowed() || !activity.isPairedHostOrigin(url)) {
+                return;
+            }
             activity.mainHandler.post(() -> activity.enqueueDownload(url, filename));
         }
 
         @JavascriptInterface
         public void downloadFileWithOptions(String url, String filename, String subdir, boolean askFolder) {
+            if (!activity.isBridgeCallAllowed() || !activity.isPairedHostOrigin(url)) {
+                return;
+            }
             activity.mainHandler.post(() -> activity.enqueueDownloadWithOptions(url, filename, subdir, askFolder));
         }
 
         @JavascriptInterface
         public void openOfficialWeb() {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             activity.mainHandler.post(activity::enterOfficialWeb);
         }
 
         @JavascriptInterface
         public void openQrScanner() {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             activity.mainHandler.post(activity::launchQrScannerWithPermission);
         }
 
@@ -1622,28 +2118,45 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public String getInitialPairUri() {
+            if (!activity.isBridgeCallAllowed()) {
+                return "";
+            }
             String uri = activity.consumePendingPairUri();
             return uri == null ? "" : uri;
         }
 
         @JavascriptInterface
         public String getRecentPhotosJson(int limit) {
+            if (!activity.isBridgeCallAllowed()) {
+                return "{\"granted\":false,\"partial\":false,\"items\":[]}";
+            }
             return activity.queryRecentPhotosJson(limit);
         }
 
         @JavascriptInterface
         public void requestMediaPermission() {
+            if (!activity.isBridgeCallAllowed()) {
+                return;
+            }
             activity.mainHandler.post(activity::requestMediaImagesPermission);
         }
 
         @JavascriptInterface
         public void uploadMediaImage(long mediaId, String filename, String uploadUrl, String token, String cbId) {
+            if (!activity.isBridgeCallAllowed()) {
+                activity.deliverNativeUploadDone(cbId, "", "仅允许在本地应用内上传");
+                return;
+            }
+            if (!activity.isPairedHostOrigin(uploadUrl)) {
+                activity.deliverNativeUploadDone(cbId, "", "上传目标不在已配对主机列表中");
+                return;
+            }
             activity.uploadMediaImageAsync(mediaId, filename, uploadUrl, token, cbId);
         }
 
         @JavascriptInterface
         public String getAppVersion() {
-            return "1.5.1";
+            return APP_VERSION_NAME;
         }
 
         @JavascriptInterface

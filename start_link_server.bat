@@ -1,5 +1,5 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal
 chcp 65001 >nul 2>&1
 title Antigravity Link Server
 
@@ -63,7 +63,7 @@ if defined PY_EXE goto :found_py
 echo.
 echo [ERROR] 未找到已安装 aiohttp 的 Python 环境。
 echo 请任选一种方式安装依赖后重新双击运行：
-echo   pip install aiohttp
+echo   pip install -r requirements.txt
 echo 或手动设置环境变量 AGY_MOBILE_PYTHON 指向包含 aiohttp 的 python.exe。
 echo.
 pause
@@ -74,11 +74,12 @@ set "PORT_NUM=18795"
 if defined AGY_MOBILE_PORT set "PORT_NUM=%AGY_MOBILE_PORT%"
 
 echo ============================================================
-echo   Antigravity Link Server (Universal Companion)
+echo   Antigravity Link Server & Desktop Sync Workbench
 echo ============================================================
 echo   Python     : %PY_EXE%
+echo   Workbench  : http://127.0.0.1:%PORT_NUM%/
 echo   Local Pair : http://127.0.0.1:%PORT_NUM%/pair
-echo   Tip        : 电脑浏览器打开上方配对页，扫码或输入 6 位配对码即可连接
+echo   Tip        : 本机浏览器打开工作台免配对；配对页仅供手机扫码或 6 位码连接
 echo ============================================================
 echo.
 

@@ -39,7 +39,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -84,16 +84,25 @@ HOST = os.environ.get("AGY_MOBILE_HOST", "0.0.0.0")
 
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _STEP_IDX_RE = re.compile(r'"step_index"\s*:\s*(\d+)')
+_CID_RE = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+_LOOPBACK_HOST_RE = re.compile(r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$", re.IGNORECASE)
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 _SENSITIVE_NAMES = {
-    "agy_env.json", "onebot.json", "webui.json", "mobile_config.json",
+    "agy_env.json", "webui.json", "mobile_config.json",
+    ".env", ".netrc", ".npmrc", ".pypirc", ".git-credentials",
     "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys", "known_hosts",
+    "credentials", "credentials.json", "secrets.json",
+    "login data", "cookies", "history", "web data", "local state",
+    "passwd", "shadow", "sam",
 }
-_SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".kdbx", ".jks", ".keystore")
+_SENSITIVE_SUFFIXES = (".pem", ".key", ".pfx", ".p12", ".kdbx", ".jks", ".keystore", ".ppk")
 _SENSITIVE_SEGS = (
     "/.ssh/", "/.aws/", "/.gnupg/",
-    "/qq_env/snowluma/config/", "/qq_env/qqnt_data/", "/nt_qq/", "/appdata/roaming/",
+    "/.docker/config.json/", "/.kube/config/", "/.config/gh/hosts.yml/",
+    "/appdata/roaming/", "/appdata/local/",
+    "/etc/passwd/", "/etc/shadow/", "/proc/",
 )
 
 MODEL_GROUPS: list[dict[str, Any]] = [
@@ -162,20 +171,37 @@ MODEL_GROUPS: list[dict[str, Any]] = [
     },
 ]
 
+_KNOWN_MODEL_IDS: frozenset[str] = frozenset(
+    str(m.get("id") or "")
+    for g in MODEL_GROUPS
+    for m in (g.get("models") or [])
+    if m.get("id")
+)
+
 _CONFIG_LOCK = threading.Lock()
 _ACTIVE_RUNS_LOCK = threading.Lock()
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
+_PENDING_SPAWNS: int = 0
+_MAX_CONCURRENT_RUNS = 4
 _WS_CLIENTS: set[web.WebSocketResponse] = set()
+_MAX_WS_CLIENTS = 32
 _LOOP: asyncio.AbstractEventLoop | None = None
 
 _PAIR_PIN_LOCK = threading.Lock()
 _RUNTIME_PAIR_PIN: str = ""
+_RUNTIME_PAIR_PIN_CREATED_AT: float = 0.0
+_PAIR_PIN_FAIL_COUNT: int = 0
+_PAIR_PIN_TTL_SEC = 600.0
+_PAIR_PIN_MAX_GLOBAL_FAILS = 15
+
 _CLAIM_RATE_LOCK = threading.Lock()
-_CLAIM_ATTEMPTS: dict[str, collections.deque[float]] = {}
+_CLAIM_ATTEMPTS: collections.OrderedDict[str, collections.deque[float]] = collections.OrderedDict()
 _CLAIM_LIMIT_PER_MIN = 10
+_CLAIM_MAX_KEYS = 4096
 
 _TUNNEL_LOCK = threading.Lock()
 _TUNNEL_STOP_EVT = threading.Event()
+_TUNNEL_GEN: int = 0
 _TUNNEL_THREAD: threading.Thread | None = None
 _TUNNEL_STATE: dict[str, Any] = {
     "enabled": True,
@@ -620,7 +646,7 @@ def _load_config_unlocked() -> dict[str, Any]:
             cfg = {}
     changed = False
     if not str(cfg.get("token") or "").strip():
-        cfg["token"] = "agymob_" + secrets.token_hex(12)
+        cfg["token"] = "agymob_" + secrets.token_hex(24)
         changed = True
     if not cfg.get("default_model"):
         cfg["default_model"] = "gemini-4-neon-medium"
@@ -643,6 +669,11 @@ def _save_config_unlocked(cfg: dict[str, Any]) -> None:
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if os.name != "nt":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
     os.replace(tmp, CONFIG_FILE)
 
 
@@ -660,27 +691,50 @@ def _update_config(mutator) -> dict[str, Any]:
 
 
 def init_or_rotate_pair_pin() -> str:
-    """Generate a fresh 6-digit numeric pairing PIN for this server run and sync to mobile_config.json."""
-    global _RUNTIME_PAIR_PIN
+    """Generate a fresh 6-digit numeric pairing PIN with a 10-minute TTL and sync to mobile_config.json."""
+    global _RUNTIME_PAIR_PIN, _RUNTIME_PAIR_PIN_CREATED_AT, _PAIR_PIN_FAIL_COUNT
     new_pin = f"{secrets.randbelow(1000000):06d}"
     with _PAIR_PIN_LOCK:
         _RUNTIME_PAIR_PIN = new_pin
+        _RUNTIME_PAIR_PIN_CREATED_AT = time.monotonic()
+        _PAIR_PIN_FAIL_COUNT = 0
     _update_config(lambda cfg: cfg.__setitem__("pair_pin", new_pin))
     return new_pin
 
 
 def get_pair_pin() -> str:
     with _PAIR_PIN_LOCK:
-        if _RUNTIME_PAIR_PIN:
+        if _RUNTIME_PAIR_PIN and (time.monotonic() - _RUNTIME_PAIR_PIN_CREATED_AT) < _PAIR_PIN_TTL_SEC:
             return _RUNTIME_PAIR_PIN
     return init_or_rotate_pair_pin()
+
+
+def _record_pair_pin_failure() -> bool:
+    """Increment global bad-PIN counter and auto-rotate PIN once limit is reached."""
+    global _PAIR_PIN_FAIL_COUNT
+    should_rotate = False
+    with _PAIR_PIN_LOCK:
+        _PAIR_PIN_FAIL_COUNT += 1
+        if _PAIR_PIN_FAIL_COUNT >= _PAIR_PIN_MAX_GLOBAL_FAILS:
+            _PAIR_PIN_FAIL_COUNT = 0
+            should_rotate = True
+    if should_rotate:
+        init_or_rotate_pair_pin()
+    return should_rotate
 
 
 def _check_claim_rate_limit(client_ip: str) -> tuple[bool, int]:
     now = time.monotonic()
     key = client_ip or "unknown"
     with _CLAIM_RATE_LOCK:
-        dq = _CLAIM_ATTEMPTS.setdefault(key, collections.deque())
+        if key in _CLAIM_ATTEMPTS:
+            _CLAIM_ATTEMPTS.move_to_end(key)
+            dq = _CLAIM_ATTEMPTS[key]
+        else:
+            while len(_CLAIM_ATTEMPTS) >= _CLAIM_MAX_KEYS:
+                _CLAIM_ATTEMPTS.popitem(last=False)
+            dq = collections.deque()
+            _CLAIM_ATTEMPTS[key] = dq
         cutoff = now - 60.0
         while dq and dq[0] < cutoff:
             dq.popleft()
@@ -765,56 +819,148 @@ def get_mobile_own_cids() -> set[str]:
 # Environment, Network & Capability Detection
 # ---------------------------------------------------------------------------
 
+def _is_valid_cid(cid: str) -> bool:
+    return bool(cid and _CID_RE.match(cid))
+
+
+def _is_valid_model_id(model: str) -> bool:
+    return bool(model and (model in _KNOWN_MODEL_IDS or _MODEL_ID_RE.match(model)))
+
+
+def _has_unsafe_raw_path(raw: str, *, allow_absolute: bool = False) -> bool:
+    """Reject UNC paths, drive tricks, traversal segments, and control chars BEFORE calling .resolve()."""
+    if not raw or "\x00" in raw or any(ord(ch) < 32 for ch in raw):
+        return True
+    s = raw.strip()
+    if not s:
+        return True
+    # Reject UNC / Windows device paths immediately (prevents outbound SMB on Windows .resolve())
+    if s.startswith(("\\\\", "//", "\\/", "/\\")):
+        return True
+    segs = re.split(r"[/\\]+", s)
+    if any(seg == ".." for seg in segs):
+        return True
+    if not allow_absolute:
+        if s.startswith(("/", "\\")) or "\\" in s or ":" in s:
+            return True
+    else:
+        # Reject NTFS ADS or stray colons (only allow drive letter at index 1 on Windows, e.g. C:/...)
+        if ":" in s:
+            if not (len(s) >= 3 and s[0].isalpha() and s[1] == ":" and s[2] in ("/", "\\") and ":" not in s[2:]):
+                return True
+        if s.startswith("\\"):
+            return True
+    return False
+
+
+def _get_allowed_file_roots() -> tuple[pathlib.Path, ...]:
+    roots: list[pathlib.Path] = []
+    for r in (WORKSPACE_ROOT, UPLOAD_DIR, DESKTOP_BRAIN, CLI_BRAIN):
+        try:
+            roots.append(r.resolve())
+        except Exception:
+            roots.append(r)
+    return tuple(roots)
+
+
+def _is_within_allowed_roots(rp: pathlib.Path, roots: tuple[pathlib.Path, ...] | None = None) -> bool:
+    check_roots = roots if roots is not None else _get_allowed_file_roots()
+    for root in check_roots:
+        try:
+            if rp.is_relative_to(root):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _is_sensitive_path(p: pathlib.Path) -> bool:
     try:
         rp = p.resolve()
     except Exception:
         rp = p
     name_low = rp.name.rstrip(" .").lower()
-    if name_low in _SENSITIVE_NAMES or name_low.endswith(_SENSITIVE_SUFFIXES):
+    if (
+        name_low in _SENSITIVE_NAMES
+        or name_low == ".env"
+        or name_low.startswith(".env.")
+        or name_low.endswith(_SENSITIVE_SUFFIXES)
+    ):
         return True
     posix_low = "/" + rp.as_posix().lstrip("/").lower() + "/"
     return any(seg in posix_low for seg in _SENSITIVE_SEGS)
+
+
+def _is_valid_agy_bin(p: pathlib.Path) -> bool:
+    try:
+        if not p.is_file():
+            return False
+        if os.name == "nt":
+            # Strictly accept .exe on Windows; reject .cmd/.bat/extensionless shims
+            return p.suffix.lower() == ".exe"
+        return os.access(p, os.X_OK)
+    except OSError:
+        return False
 
 
 def _find_agy_bin() -> str:
     env_bin = str(os.environ.get("AGY_CLI_BIN") or "").strip()
     if env_bin:
         ep = pathlib.Path(env_bin).expanduser()
-        if ep.is_file():
+        if _is_valid_agy_bin(ep):
             return str(ep)
 
-    candidates: list[pathlib.Path] = [
-        WORKSPACE_ROOT / "bin" / "agy.exe",
-        WORKSPACE_ROOT / "bin" / "agy",
-    ]
-    local_app = str(os.environ.get("LOCALAPPDATA") or "").strip()
-    if local_app:
-        la = pathlib.Path(local_app)
+    candidates: list[pathlib.Path] = []
+    if os.name == "nt":
         candidates.extend([
-            la / "agy" / "bin" / "agy.exe",
-            la / "Programs" / "antigravity" / "bin" / "agy.exe",
+            PROJECT_DIR / "bin" / "agy.exe",
+            WORKSPACE_ROOT / "bin" / "agy.exe",
+            HOME_DIR / ".agy" / "bin" / "agy.exe",
+            HOME_DIR / ".antigravity" / "bin" / "agy.exe",
+            HOME_DIR / ".local" / "bin" / "agy.exe",
         ])
-    candidates.extend([
-        HOME_DIR / ".local" / "bin" / "agy",
-        HOME_DIR / ".agy" / "bin" / "agy",
-    ])
+        local_app = str(os.environ.get("LOCALAPPDATA") or "").strip()
+        if local_app:
+            la = pathlib.Path(local_app)
+            candidates.extend([
+                la / "agy" / "bin" / "agy.exe",
+                la / "Programs" / "antigravity" / "bin" / "agy.exe",
+            ])
+    else:
+        candidates.extend([
+            PROJECT_DIR / "bin" / "agy",
+            WORKSPACE_ROOT / "bin" / "agy",
+            HOME_DIR / ".local" / "bin" / "agy",
+            HOME_DIR / ".agy" / "bin" / "agy",
+            HOME_DIR / ".antigravity" / "bin" / "agy",
+            pathlib.Path("/opt/homebrew/bin/agy"),
+            pathlib.Path("/usr/local/bin/agy"),
+        ])
+
     for cand in candidates:
-        try:
-            if cand.is_file():
-                return str(cand)
-        except OSError:
-            continue
-    return str(shutil.which("agy") or shutil.which("agy.exe") or "")
+        if _is_valid_agy_bin(cand):
+            return str(cand)
+
+    if os.name == "nt":
+        for name in ("agy.exe", "agy"):
+            found = shutil.which(name)
+            if found and _is_valid_agy_bin(pathlib.Path(found)):
+                return str(found)
+        return ""
+
+    found = shutil.which("agy")
+    if found and _is_valid_agy_bin(pathlib.Path(found)):
+        return str(found)
+    return ""
 
 
 def _build_cli_env() -> dict[str, str]:
     env = dict(os.environ)
     has_proxy = any(env.get(k) for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"))
     if not has_proxy:
-        for port in (7890, 7897, 10809, 10808):
+        for port in (7890, 7897, 10809):
             try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                with socket.create_connection(("127.0.0.1", port), timeout=0.05):
                     px = f"http://127.0.0.1:{port}"
                     env["HTTP_PROXY"] = px
                     env["HTTPS_PROXY"] = px
@@ -830,12 +976,23 @@ def _build_cli_env() -> dict[str, str]:
 
 
 def check_qqbot_available() -> bool:
-    """Quick 0.2s TCP probe on local QQ Bot API (127.0.0.1:8788)."""
+    """Verify actual HTTP JSON status response from local optional QQ Bot API (127.0.0.1:8788)."""
     try:
-        with socket.create_connection(("127.0.0.1", 8788), timeout=0.2):
-            return True
-    except OSError:
+        with _DIRECT_OPENER.open("http://127.0.0.1:8788/api/status", timeout=0.4) as r:
+            if getattr(r, "status", 200) != 200:
+                return False
+            data = json.loads(r.read(65536).decode("utf-8", errors="replace"))
+            if not isinstance(data, dict):
+                return False
+            return any(k in data for k in ("bridge_online", "gateway_online", "active_model", "group_chat_model", "quotas", "ai_usage"))
+    except Exception:
         return False
+
+
+_VIRTUAL_NIC_KEYWORDS = (
+    "vethernet", "wsl", "hyper-v", "virtualbox", "vbox", "vmware", "vmnet",
+    "docker", "veth", "br-", "loopback", "virbr", "podman", "teredo", "isatap", "npcap",
+)
 
 
 def _classify_ipv4(ip: str, iface: str) -> tuple[int, str] | None:
@@ -850,8 +1007,11 @@ def _classify_ipv4(ip: str, iface: str) -> tuple[int, str] | None:
         return None
 
     iface_low = iface.lower()
-    is_lan_nic = any(k in iface_low for k in ("wlan", "wi-fi", "wifi", "以太网", "ethernet", "en0", "eth0", "local area"))
+    if any(k in iface_low for k in _VIRTUAL_NIC_KEYWORDS):
+        return None
+
     is_tailscale = ("tailscale" in iface_low) or (addr in ipaddress.IPv4Network("100.64.0.0/10"))
+    is_lan_nic = any(k in iface_low for k in ("wlan", "wi-fi", "wifi", "无线", "以太网", "ethernet", "en0", "en1", "eth0", "eth1", "wlp", "enp", "local area", "primary lan"))
     is_rfc1918 = addr.is_private
 
     if is_lan_nic and is_rfc1918:
@@ -860,11 +1020,28 @@ def _classify_ipv4(ip: str, iface: str) -> tuple[int, str] | None:
         return (1, "lan")
     if is_tailscale:
         return (2, "tailscale")
-    if any(k in iface_low for k in ("vpn", "wireguard", "zerotier", "radmin", "wg")):
+    if any(k in iface_low for k in ("vpn", "wireguard", "zerotier", "radmin", "wg", "tun", "tap")):
         return (3, "vpn")
     if is_rfc1918:
         return (4, "lan")
     return (5, "other")
+
+
+def _ip_tiebreak(ip_str: str) -> tuple[int, str]:
+    if ip_str.startswith("192.168."):
+        return (0, ip_str)
+    if ip_str.startswith("10."):
+        return (1, ip_str)
+    return (2, ip_str)
+
+
+def _decode_cmd_bytes(raw: bytes) -> str:
+    for enc in ("utf-8", "mbcs" if os.name == "nt" else "utf-8", "gbk", "cp437"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def detect_lan_addresses() -> list[dict[str, str]]:
@@ -884,15 +1061,17 @@ def detect_lan_addresses() -> list[dict[str, str]]:
             ps = subprocess.run(
                 [
                     "powershell", "-NoProfile", "-Command",
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                     "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
                     "Where-Object { $_.AddressState -eq 'Preferred' -and $_.IPAddress -notlike '127.*' "
                     "-and $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -notlike '198.18.*' "
                     "-and $_.IPAddress -notlike '198.19.*' } | "
                     "Select-Object InterfaceAlias, IPAddress | ConvertTo-Json -Compress",
                 ],
-                capture_output=True, text=True, timeout=4, creationflags=_NO_WINDOW,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=4, creationflags=_NO_WINDOW,
             )
-            raw = ps.stdout.strip()
+            raw = (ps.stdout or "").strip()
             if raw:
                 items = json.loads(raw)
                 if isinstance(items, dict):
@@ -905,7 +1084,56 @@ def detect_lan_addresses() -> list[dict[str, str]]:
         except Exception:
             pass
 
-    # Cross-platform socket fallback (macOS / Linux / if PowerShell unavailable)
+        if not found:
+            try:
+                ipc = subprocess.run(["ipconfig"], capture_output=True, timeout=4, creationflags=_NO_WINDOW)
+                txt = _decode_cmd_bytes(ipc.stdout or b"")
+                cur_iface = "LAN"
+                for ln in txt.splitlines():
+                    if ln and not ln[0].isspace() and ":" in ln:
+                        cur_iface = ln.rstrip(":\r\n ").strip()
+                    else:
+                        m = re.search(r"IPv4[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})", ln, re.IGNORECASE)
+                        if m:
+                            _add(m.group(1), cur_iface)
+            except Exception:
+                pass
+    else:
+        # macOS / Linux: prefer `ip -4 addr` or `ifconfig` before UDP/hostname fallback
+        ip_bin = shutil.which("ip")
+        if ip_bin:
+            try:
+                res = subprocess.run(
+                    [ip_bin, "-4", "-o", "addr", "show", "scope", "global"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
+                )
+                for ln in (res.stdout or "").splitlines():
+                    m = re.match(r"^\d+:\s+([^\s:]+)\s+inet\s+(\d{1,3}(?:\.\d{1,3}){3})/", ln.strip())
+                    if m:
+                        _add(m.group(2), m.group(1))
+            except Exception:
+                pass
+        if not found:
+            ifc_bin = shutil.which("ifconfig")
+            if ifc_bin:
+                try:
+                    res = subprocess.run(
+                        [ifc_bin],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
+                    )
+                    cur_iface = "LAN"
+                    for ln in (res.stdout or "").splitlines():
+                        hdr = re.match(r"^([A-Za-z0-9_.:-]+):", ln)
+                        if hdr:
+                            cur_iface = hdr.group(1)
+                            continue
+                        m = re.search(r"\binet\s+(?:addr:)?(\d{1,3}(?:\.\d{1,3}){3})\b", ln)
+                        if m:
+                            _add(m.group(1), cur_iface)
+                except Exception:
+                    pass
+
+    # Cross-platform socket fallback
     if not found:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -922,7 +1150,7 @@ def detect_lan_addresses() -> list[dict[str, str]]:
         except OSError:
             pass
 
-    ordered = sorted(found.values(), key=lambda x: (x[0], x[1]["ip"]))
+    ordered = sorted(found.values(), key=lambda x: (x[0], _ip_tiebreak(x[1]["ip"])))
     return [entry for _, entry in ordered]
 
 
@@ -970,9 +1198,10 @@ def get_tunnel_snapshot() -> dict[str, Any]:
 
 
 def _stop_cloudflared_tunnel() -> None:
-    _TUNNEL_STOP_EVT.set()
+    global _TUNNEL_STOP_EVT
     proc = None
     with _TUNNEL_LOCK:
+        _TUNNEL_STOP_EVT.set()
         proc = _TUNNEL_STATE.get("proc")
         _TUNNEL_STATE["proc"] = None
         if _TUNNEL_STATE.get("status") in ("starting", "online"):
@@ -993,7 +1222,7 @@ atexit.register(_stop_cloudflared_tunnel)
 
 
 def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) -> dict[str, Any]:
-    global _TUNNEL_THREAD
+    global _TUNNEL_THREAD, _TUNNEL_STOP_EVT, _TUNNEL_GEN
     reuse_url = str(os.environ.get("AGY_REUSE_TUNNEL_URL") or "").strip().rstrip("/") if allow_reuse else ""
     if reuse_url:
         with _TUNNEL_LOCK:
@@ -1017,13 +1246,15 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
     cf_bin = _find_cloudflared_bin()
 
     if not enabled:
+        _stop_cloudflared_tunnel()
         with _TUNNEL_LOCK:
             _TUNNEL_STATE.update({"enabled": False, "mode": "disabled", "status": "disabled", "url": "", "error": "", "bin": cf_bin})
         return get_tunnel_snapshot()
 
     if not cf_bin:
+        _stop_cloudflared_tunnel()
         with _TUNNEL_LOCK:
-            _TUNNEL_STATE.update({"enabled": True, "mode": "quick", "status": "missing", "url": "", "error": "未找到 cloudflared 可执行文件", "bin": ""})
+            _TUNNEL_STATE.update({"enabled": True, "mode": "quick", "status": "missing", "url": "", "error": "未找到 cloudflared 可执行文件（请将其放入 bin/ 目录或系统 PATH）", "bin": ""})
         return get_tunnel_snapshot()
 
     named_token = str(cfg.get("cloudflare_tunnel_token") or os.environ.get("AGY_CLOUDFLARE_TUNNEL_TOKEN") or "").strip()
@@ -1031,10 +1262,28 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
     mode = "named" if named_token else "quick"
 
     _stop_cloudflared_tunnel()
-    _TUNNEL_STOP_EVT.clear()
+
+    if mode == "named" and not named_url:
+        with _TUNNEL_LOCK:
+            _TUNNEL_STATE.update({
+                "enabled": True,
+                "mode": "named",
+                "status": "error",
+                "url": "",
+                "error": "已配置 cloudflare_tunnel_token，但缺少 cloudflare_public_url（请在 mobile_config.json 补充固定域名）",
+                "bin": cf_bin,
+                "started_at": time.time(),
+                "proc": None,
+            })
+        return get_tunnel_snapshot()
+
+    gen_stop_evt = threading.Event()
     ready_evt = threading.Event()
 
     with _TUNNEL_LOCK:
+        _TUNNEL_GEN += 1
+        my_gen = _TUNNEL_GEN
+        _TUNNEL_STOP_EVT = gen_stop_evt
         _TUNNEL_STATE.update({
             "enabled": True,
             "mode": mode,
@@ -1046,17 +1295,22 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
             "proc": None,
         })
 
-    def _runner() -> None:
-        while not _TUNNEL_STOP_EVT.is_set():
+    def _runner(my_stop_evt: threading.Event, gen_id: int) -> None:
+        while not my_stop_evt.is_set():
+            proc_env = dict(os.environ)
             if mode == "named":
-                cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "run", "--token", named_token]
+                # Pass secret via TUNNEL_TOKEN env var instead of --token CLI argv
+                proc_env["TUNNEL_TOKEN"] = named_token
+                cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "run"]
             else:
+                proc_env.pop("TUNNEL_TOKEN", None)
                 cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "--url", f"http://127.0.0.1:{PORT}"]
             last_lines: collections.deque[str] = collections.deque(maxlen=8)
             proc = None
             try:
                 proc = subprocess.Popen(
                     cmd,
+                    env=proc_env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -1066,6 +1320,12 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                     creationflags=_NO_WINDOW,
                 )
                 with _TUNNEL_LOCK:
+                    if my_stop_evt.is_set() or _TUNNEL_GEN != gen_id:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        break
                     _TUNNEL_STATE["proc"] = proc
                     if mode != "named":
                         _TUNNEL_STATE["status"] = "starting"
@@ -1074,7 +1334,7 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
 
                 assert proc.stdout is not None
                 for raw_ln in proc.stdout:
-                    if _TUNNEL_STOP_EVT.is_set():
+                    if my_stop_evt.is_set():
                         break
                     ln = raw_ln.strip()
                     if not ln:
@@ -1085,18 +1345,20 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                         if m:
                             found_url = m.group(0).rstrip("/")
                             with _TUNNEL_LOCK:
-                                _TUNNEL_STATE["url"] = found_url
-                                _TUNNEL_STATE["status"] = "online"
-                                _TUNNEL_STATE["error"] = ""
+                                if _TUNNEL_GEN == gen_id and not my_stop_evt.is_set():
+                                    _TUNNEL_STATE["url"] = found_url
+                                    _TUNNEL_STATE["status"] = "online"
+                                    _TUNNEL_STATE["error"] = ""
                             print(f"[{APP_NAME}] Public Tunnel : {found_url}", flush=True)
                             ready_evt.set()
                     if "Registered tunnel connection" in ln:
                         with _TUNNEL_LOCK:
-                            if mode == "named" and named_url:
-                                _TUNNEL_STATE["url"] = named_url
-                            if _TUNNEL_STATE.get("url"):
-                                _TUNNEL_STATE["status"] = "online"
-                                _TUNNEL_STATE["error"] = ""
+                            if _TUNNEL_GEN == gen_id and not my_stop_evt.is_set():
+                                if mode == "named" and named_url:
+                                    _TUNNEL_STATE["url"] = named_url
+                                if _TUNNEL_STATE.get("url"):
+                                    _TUNNEL_STATE["status"] = "online"
+                                    _TUNNEL_STATE["error"] = ""
                         ready_evt.set()
                 proc.wait(timeout=5.0)
             except Exception as exc:
@@ -1105,19 +1367,23 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                 if proc is not None and proc.poll() is None:
                     try:
                         proc.terminate()
+                        proc.wait(timeout=2.0)
                     except Exception:
-                        pass
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
                 with _TUNNEL_LOCK:
                     if _TUNNEL_STATE.get("proc") is proc:
                         _TUNNEL_STATE["proc"] = None
-                    if not _TUNNEL_STOP_EVT.is_set():
+                    if _TUNNEL_GEN == gen_id and not my_stop_evt.is_set():
                         _TUNNEL_STATE["status"] = "error"
                         _TUNNEL_STATE["url"] = named_url if mode == "named" else ""
                         _TUNNEL_STATE["error"] = " | ".join(list(last_lines)[-2:])[:240] or "cloudflared 进程已退出，正在重连..."
-            if _TUNNEL_STOP_EVT.wait(5.0):
+            if my_stop_evt.wait(5.0):
                 break
 
-    t = threading.Thread(target=_runner, name="cloudflared-tunnel", daemon=True)
+    t = threading.Thread(target=_runner, args=(gen_stop_evt, my_gen), name=f"cloudflared-tunnel-{my_gen}", daemon=True)
     _TUNNEL_THREAD = t
     t.start()
     if wait_sec > 0:
@@ -1140,18 +1406,39 @@ def detect_connect_endpoints() -> list[dict[str, str]]:
     return endpoints
 
 
+def _is_loopback_ip(remote: str | None) -> bool:
+    s = str(remote or "").strip()
+    if not s:
+        return False
+    try:
+        addr = ipaddress.ip_address(s)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            return addr.ipv4_mapped.is_loopback
+        return addr.is_loopback
+    except ValueError:
+        return False
+
+
 def _is_via_public_tunnel(request: web.Request) -> bool:
-    """Detect requests arriving via Cloudflare Tunnel so sensitive /pair pages stay local-only."""
-    if request.headers.get("CF-Connecting-IP") or request.headers.get("CF-Ray") or request.headers.get("CF-Visitor"):
-        return True
-    host_hdr = str(request.headers.get("Host") or "").strip().lower().split(":")[0]
-    if host_hdr.endswith(".trycloudflare.com"):
+    """Detect requests arriving via Cloudflare Tunnel or any reverse proxy so local-only routes stay protected."""
+    for hdr in (
+        "CF-Connecting-IP", "CF-Ray", "CF-Visitor",
+        "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Forwarded",
+    ):
+        if request.headers.get(hdr):
+            return True
+    host_hdr = str(request.headers.get("Host") or "").strip().lower()
+    try:
+        host_only = str(urllib.parse.urlparse(f"http://{host_hdr}").hostname or "").lower()
+    except Exception:
+        host_only = host_hdr.split(":")[0]
+    if host_only.endswith(".trycloudflare.com"):
         return True
     tun_url = str(get_tunnel_snapshot().get("url") or "")
     if tun_url:
         try:
             tun_host = (urllib.parse.urlparse(tun_url).hostname or "").lower()
-            if tun_host and host_hdr == tun_host:
+            if tun_host and host_only == tun_host:
                 return True
         except Exception:
             pass
@@ -1159,12 +1446,10 @@ def _is_via_public_tunnel(request: web.Request) -> bool:
 
 
 def _client_ip_for_rate_limit(request: web.Request) -> str:
+    """Trust CF-Connecting-IP ONLY when arriving from local cloudflared loopback with CF-Ray; ignore X-Forwarded-For."""
     cf_ip = str(request.headers.get("CF-Connecting-IP") or "").strip()
-    if cf_ip:
+    if cf_ip and request.headers.get("CF-Ray") and _is_loopback_ip(request.remote):
         return cf_ip
-    xff = str(request.headers.get("X-Forwarded-For") or "").strip()
-    if xff:
-        return xff.split(",")[0].strip()
     return str(request.remote or "unknown")
 
 
@@ -1179,6 +1464,8 @@ def _mask_token(token: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _read_pbtxt_title(cid: str) -> str:
+    if not _is_valid_cid(cid):
+        return ""
     for ann_dir in (CLI_ANN, DESKTOP_ANN):
         p = ann_dir / f"{cid}.pbtxt"
         if p.is_file():
@@ -1194,13 +1481,14 @@ def _read_pbtxt_title(cid: str) -> str:
     return ""
 
 
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 
 def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> list[dict[str, Any]]:
     """Extract clickable structured attachments (mobile uploads + Desktop media) for a user message."""
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
+    allowed_roots = _get_allowed_file_roots()
 
     def _add_path(raw_path: str, mime_hint: str = "") -> None:
         s = str(raw_path or "").strip()
@@ -1212,11 +1500,13 @@ def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> 
             s = urllib.parse.unquote(s[7:])
         if re.match(r"^/[A-Za-z]:/", s):
             s = s[1:]
+        if _has_unsafe_raw_path(s, allow_absolute=True):
+            return
         try:
             p = pathlib.Path(s).resolve()
         except Exception:
             return
-        if not p.is_file() or _is_sensitive_path(p):
+        if not p.is_file() or not _is_within_allowed_roots(p, allowed_roots) or _is_sensitive_path(p):
             return
         ps = p.as_posix()
         if ps in seen:
@@ -1224,7 +1514,8 @@ def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> 
         seen.add(ps)
         pretty_name = re.sub(r"^\d{13}_", "", p.name)
         ext = p.suffix.lower()
-        is_img = (ext in _IMAGE_EXTS) or str(mime_hint or "").lower().startswith("image/")
+        mime_low = str(mime_hint or "").lower()
+        is_img = (ext in _IMAGE_EXTS) or (mime_low.startswith("image/") and "svg" not in mime_low)
         out.append({
             "name": pretty_name,
             "path": ps,
@@ -1328,6 +1619,8 @@ def _clean_assistant_text(raw: str) -> str:
 
 
 def _locate_transcript(cid: str) -> tuple[pathlib.Path | None, str]:
+    if not _is_valid_cid(cid):
+        return None, "mobile"
     cli_t = CLI_BRAIN / cid / ".system_generated" / "logs" / "transcript.jsonl"
     if cli_t.is_file():
         return cli_t, "mobile"
@@ -1496,6 +1789,12 @@ def _extract_conv_meta(cid: str, tf: pathlib.Path, source: str, mtime: float, mt
             cached = _CONV_META_CACHE.get(cache_key)
             if cached is not None and cached[0] == mtime_ns and cached[1] == size:
                 return dict(cached[2]) if cached[2] is not None else None
+        if _is_swarm_worker_file(tf):
+            with _CONV_META_CACHE_LOCK:
+                if len(_CONV_META_CACHE) > 2000:
+                    _CONV_META_CACHE.clear()
+                _CONV_META_CACHE[cache_key] = (mtime_ns, size, None)
+            return None
 
     steps = _parse_jsonl(tf)
     if not steps:
@@ -1607,7 +1906,16 @@ def _scan_source_conversations(
     return bucket
 
 
-def list_all_conversations(limit: int = 80, source_filter: str = "all") -> list[dict[str, Any]]:
+def list_all_conversations(
+    limit: int = 80,
+    source_filter: str = "all",
+    include_external_cli: bool = False,
+) -> list[dict[str, Any]]:
+    if source_filter not in ("all", "mobile", "desktop", "external"):
+        source_filter = "all"
+    if source_filter == "external" and not include_external_cli:
+        return []
+
     active_ids: set[str] = set()
     with _ACTIVE_RUNS_LOCK:
         for k, v in _ACTIVE_RUNS.items():
@@ -1620,86 +1928,129 @@ def list_all_conversations(limit: int = 80, source_filter: str = "all") -> list[
     mobile_own = get_mobile_own_cids()
 
     seen: set[str] = set()
-    # 1. Scan Desktop Antigravity conversations (100% aligned with PC IDE left sidebar)
-    desktop_items = _scan_source_conversations(DESKTOP_BRAIN, "desktop", limit, active_ids, seen)
-    seen.update(it["id"] for it in desktop_items)
-
-    # Reflect any linked mobile continuation activity onto its unified Desktop row (no duplicate rows)
-    for d_item in desktop_items:
-        aliased_cli = str(aliases.get(d_item["id"]) or "").strip()
-        if not aliased_cli:
-            continue
-        c_tf = CLI_BRAIN / aliased_cli / ".system_generated" / "logs" / "transcript.jsonl"
-        c_item = None
-        try:
-            c_st = c_tf.stat()
-            if c_st.st_size > 0:
-                c_meta = _extract_conv_meta(
-                    aliased_cli, c_tf, "mobile", c_st.st_mtime, c_st.st_mtime_ns, c_st.st_size, aliased_cli in active_ids
-                )
-                if c_meta is not None:
-                    tr = bool(c_meta.pop("_tailRunning", False))
-                    c_meta["status"] = "running" if (aliased_cli in active_ids or (tr and time.time() - c_st.st_mtime < 180.0)) else "idle"
-                    c_item = c_meta
-        except OSError:
-            c_item = None
-        if c_item:
-            d_item["stepCount"] = int(d_item.get("stepCount") or 0) + int(c_item.get("stepCount") or 0)
-            if float(c_item.get("updatedAt") or 0) > float(d_item.get("updatedAt") or 0):
-                d_item["updatedAt"] = c_item["updatedAt"]
-                if c_item.get("preview"):
-                    d_item["preview"] = c_item["preview"]
-                if c_item.get("model"):
-                    d_item["model"] = c_item["model"]
-            if c_item.get("status") == "running" or aliased_cli in active_ids or d_item["id"] in active_ids:
-                d_item["status"] = "running"
-
-    # 2. Include ONLY standalone chats created explicitly by Antigravity Mobile (never QQ Bot / Hermes CLI chats)
-    own_mobile_items: list[dict[str, Any]] = []
     now_ts = time.time()
-    for m_cid in mobile_own:
-        if not m_cid or m_cid in seen or m_cid in aliased_cli_set:
-            continue
-        m_tf = CLI_BRAIN / m_cid / ".system_generated" / "logs" / "transcript.jsonl"
-        try:
-            st = m_tf.stat()
-            if st.st_size <= 0:
-                continue
-            meta = _extract_conv_meta(m_cid, m_tf, "mobile", st.st_mtime, st.st_mtime_ns, st.st_size, m_cid in active_ids)
-            if meta is None:
-                continue
-            tr = bool(meta.pop("_tailRunning", False))
-            meta["status"] = "running" if (m_cid in active_ids or (tr and now_ts - st.st_mtime < 180.0)) else "idle"
-            own_mobile_items.append(meta)
-            seen.add(m_cid)
-        except OSError:
-            continue
 
-    result = desktop_items + own_mobile_items
+    # 1. Scan Desktop Antigravity conversations (100% aligned with PC IDE left sidebar)
+    desktop_items: list[dict[str, Any]] = []
+    if source_filter != "external":
+        desktop_items = _scan_source_conversations(DESKTOP_BRAIN, "desktop", limit, active_ids, seen)
+        seen.update(it["id"] for it in desktop_items)
+
+        # Ensure Desktop conversations with linked mobile continuations are included even if Desktop mtime is older
+        for d_cid_raw, aliased_raw in aliases.items():
+            d_cid = str(d_cid_raw or "").strip()
+            if not d_cid or d_cid in seen or not str(aliased_raw or "").strip() or not _is_valid_cid(d_cid):
+                continue
+            d_tf = DESKTOP_BRAIN / d_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            try:
+                st = d_tf.stat()
+                if st.st_size <= 0:
+                    continue
+                d_meta = _extract_conv_meta(d_cid, d_tf, "desktop", st.st_mtime, st.st_mtime_ns, st.st_size, d_cid in active_ids)
+                if d_meta is None:
+                    continue
+                tr = bool(d_meta.pop("_tailRunning", False))
+                d_meta["status"] = "running" if (d_cid in active_ids or (tr and now_ts - st.st_mtime < 180.0)) else "idle"
+                desktop_items.append(d_meta)
+                seen.add(d_cid)
+            except OSError:
+                continue
+
+        # Reflect any linked mobile continuation activity onto its unified Desktop row (no duplicate rows)
+        for d_item in desktop_items:
+            aliased_cli = str(aliases.get(d_item["id"]) or "").strip()
+            if not aliased_cli:
+                d_item["hasMobile"] = False
+                continue
+            d_item["hasMobile"] = True
+            c_tf = CLI_BRAIN / aliased_cli / ".system_generated" / "logs" / "transcript.jsonl"
+            c_item = None
+            try:
+                c_st = c_tf.stat()
+                if c_st.st_size > 0:
+                    c_meta = _extract_conv_meta(
+                        aliased_cli, c_tf, "mobile", c_st.st_mtime, c_st.st_mtime_ns, c_st.st_size, aliased_cli in active_ids
+                    )
+                    if c_meta is not None:
+                        tr = bool(c_meta.pop("_tailRunning", False))
+                        c_meta["status"] = "running" if (aliased_cli in active_ids or (tr and now_ts - c_st.st_mtime < 180.0)) else "idle"
+                        c_item = c_meta
+            except OSError:
+                c_item = None
+            if c_item:
+                d_item["stepCount"] = int(d_item.get("stepCount") or 0) + int(c_item.get("stepCount") or 0)
+                if float(c_item.get("updatedAt") or 0) > float(d_item.get("updatedAt") or 0):
+                    d_item["updatedAt"] = c_item["updatedAt"]
+                    if c_item.get("preview"):
+                        d_item["preview"] = c_item["preview"]
+                    if c_item.get("model"):
+                        d_item["model"] = c_item["model"]
+                if c_item.get("status") == "running" or aliased_cli in active_ids or d_item["id"] in active_ids:
+                    d_item["status"] = "running"
+
+    # 2. Include standalone chats created explicitly by Antigravity Mobile / Workbench
+    own_mobile_items: list[dict[str, Any]] = []
+    if source_filter in ("all", "mobile"):
+        for m_cid in mobile_own:
+            if not m_cid or m_cid in seen or m_cid in aliased_cli_set or not _is_valid_cid(m_cid):
+                continue
+            m_tf = CLI_BRAIN / m_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            try:
+                st = m_tf.stat()
+                if st.st_size <= 0:
+                    continue
+                meta = _extract_conv_meta(m_cid, m_tf, "mobile", st.st_mtime, st.st_mtime_ns, st.st_size, m_cid in active_ids)
+                if meta is None:
+                    continue
+                tr = bool(meta.pop("_tailRunning", False))
+                meta["status"] = "running" if (m_cid in active_ids or (tr and now_ts - st.st_mtime < 180.0)) else "idle"
+                own_mobile_items.append(meta)
+                seen.add(m_cid)
+            except OSError:
+                continue
+
+    # 3. Optional External CLI / QQ Bot standalone sessions (ONLY when explicitly enabled)
+    external_items: list[dict[str, Any]] = []
+    if include_external_cli and source_filter in ("all", "external"):
+        exclude_ext = seen | mobile_own | aliased_cli_set | {str(k).strip() for k in aliases.keys() if str(k).strip()}
+        external_items = _scan_source_conversations(CLI_BRAIN, "external", limit, active_ids, exclude_ext)
+
+    if source_filter == "desktop":
+        result = list(desktop_items)
+    elif source_filter == "mobile":
+        result = [d for d in desktop_items if d.get("hasMobile")] + own_mobile_items
+    elif source_filter == "external":
+        result = list(external_items)
+    else:
+        result = desktop_items + own_mobile_items + (external_items if include_external_cli else [])
+
     result.sort(key=lambda x: float(x.get("updatedAt") or 0), reverse=True)
 
-    existing_ids = {r["id"] for r in result}
-    with _ACTIVE_RUNS_LOCK:
-        for cid, run in _ACTIVE_RUNS.items():
-            if not run.get("running"):
-                continue
-            disp_cid = str(run.get("display_cid") or cid)
-            if disp_cid in existing_ids or cid in existing_ids or cid in aliased_cli_set:
-                continue
-            existing_ids.add(disp_cid)
-            result.insert(0, {
-                "id": disp_cid,
-                "shortId": disp_cid[:8],
-                "title": str(run.get("prompt") or "新对话")[:42],
-                "source": "mobile",
-                "status": "running",
-                "model": str(run.get("model") or "gemini-4-neon-medium"),
-                "preview": "正在思考与执行...",
-                "updatedAt": float(run.get("started_at") or time.time()),
-                "stepCount": 1,
-            })
-    if source_filter in ("desktop", "mobile"):
-        result = [r for r in result if r.get("source") == source_filter]
+    if source_filter in ("all", "mobile"):
+        existing_ids = {r["id"] for r in result}
+        seen_runs: set[int] = set()
+        with _ACTIVE_RUNS_LOCK:
+            for cid, run in _ACTIVE_RUNS.items():
+                if not run.get("running") or id(run) in seen_runs:
+                    continue
+                seen_runs.add(id(run))
+                run_cid = str(run.get("cid") or "")
+                disp_cid = str(run.get("display_cid") or run_cid or cid)
+                if disp_cid in existing_ids or run_cid in existing_ids or cid in existing_ids or run_cid in aliased_cli_set:
+                    continue
+                existing_ids.add(disp_cid)
+                result.insert(0, {
+                    "id": disp_cid,
+                    "shortId": disp_cid[:8],
+                    "title": str(run.get("prompt") or "新对话")[:42],
+                    "source": "mobile",
+                    "status": "running",
+                    "model": str(run.get("model") or "gemini-4-neon-medium"),
+                    "preview": "正在思考与执行...",
+                    "updatedAt": float(run.get("started_at") or time.time()),
+                    "stepCount": 1,
+                })
+
     return result[:limit]
 
 
@@ -1860,11 +2211,14 @@ def load_conversation_detail(
 
     deliverables: list[dict[str, Any]] = []
     seen_p: set[str] = set()
+    allowed_roots = _get_allowed_file_roots()
     for cand in reversed(deliverable_cands):
         try:
+            if _has_unsafe_raw_path(cand, allow_absolute=True):
+                continue
             p = pathlib.Path(cand).resolve()
             ps = p.as_posix()
-            if ps in seen_p or not p.is_file() or _is_sensitive_path(p):
+            if ps in seen_p or not p.is_file() or not _is_within_allowed_roots(p, allowed_roots) or _is_sensitive_path(p):
                 continue
             if ".system_generated" in ps or ".user_uploaded" in ps:
                 continue
@@ -2046,12 +2400,37 @@ def start_cli_chat_run(
     attachments: list[str] | None = None,
     swarm_mode: bool = False,
 ) -> dict[str, Any]:
+    global _PENDING_SPAWNS
     agy_bin = _find_agy_bin()
     if not agy_bin:
         return {"ok": False, "error": "未找到官方 agy CLI（请安装 Antigravity CLI 或设置环境变量 AGY_CLI_BIN）"}
 
     req_cid = str(requested_cid or "").strip()
     is_new = (not req_cid) or req_cid == "__new__"
+    if not is_new and not _is_valid_cid(req_cid):
+        return {"ok": False, "error": "无效的会话 ID"}
+
+    eff_model = str(model or "").strip() or str(load_or_create_config().get("default_model") or "gemini-4-neon-medium").strip()
+    if not _is_valid_model_id(eff_model):
+        return {"ok": False, "error": "无效的模型名称"}
+
+    # Validate attachments strictly against UPLOAD_DIR / WORKSPACE_ROOT before building prompt
+    att_roots: tuple[pathlib.Path, ...] = tuple(r.resolve() for r in (UPLOAD_DIR, WORKSPACE_ROOT))
+    valid_att_paths: list[pathlib.Path] = []
+    for raw_a in (attachments or []):
+        s_a = str(raw_a or "").strip()
+        if not s_a:
+            continue
+        if _has_unsafe_raw_path(s_a, allow_absolute=True):
+            return {"ok": False, "error": "附件路径格式无效"}
+        try:
+            ap = pathlib.Path(s_a).resolve()
+        except Exception:
+            return {"ok": False, "error": "附件路径解析失败"}
+        if not ap.is_file() or not _is_within_allowed_roots(ap, att_roots) or _is_sensitive_path(ap):
+            return {"ok": False, "error": "附件不存在或超出允许目录范围"}
+        valid_att_paths.append(ap)
+
     resume_cli_cid = ""
     source_desktop_cid = ""
     desktop_ctx = ""
@@ -2066,7 +2445,7 @@ def start_cli_chat_run(
                 source_desktop_cid = parent_d
         else:
             aliased = get_desktop_cli_alias(req_cid)
-            if aliased and (CLI_CONV / f"{aliased}.db").is_file():
+            if aliased and _is_valid_cid(aliased) and (CLI_CONV / f"{aliased}.db").is_file():
                 resume_cli_cid = aliased
                 source_desktop_cid = req_cid
             elif (DESKTOP_BRAIN / req_cid / ".system_generated" / "logs" / "transcript.jsonl").is_file():
@@ -2080,15 +2459,14 @@ def start_cli_chat_run(
             wm_iso = _get_cli_first_step_time(resume_cli_cid)
         delta_ctx, pending_watermark = _extract_desktop_delta_context(source_desktop_cid, wm_iso)
 
-    eff_model = str(model or "").strip() or load_or_create_config().get("default_model", "gemini-4-neon-medium")
     parts: list[str] = []
     if desktop_ctx:
         parts.append(desktop_ctx)
         parts.append("【用户在 Antigravity Mobile 手机端针对以上会话的最新指令】")
     elif delta_ctx:
         parts.append(delta_ctx)
-    if attachments:
-        att_txt = "\n".join(f"- {a}" for a in attachments if a)
+    if valid_att_paths:
+        att_txt = "\n".join(f"- {ap.as_posix()}" for ap in valid_att_paths)
         if att_txt:
             parts.append(f"【用户从手机上传的无损原始文件/原图（未经压缩，请直接调用 read_file 查看原文件）】\n{att_txt}")
     clean_p = prompt.strip()
@@ -2112,6 +2490,12 @@ def start_cli_chat_run(
     if resume_cli_cid:
         cmd.extend(["--conversation", resume_cli_cid])
 
+    with _ACTIVE_RUNS_LOCK:
+        active_cnt = len({id(v) for v in _ACTIVE_RUNS.values() if v.get("running")}) + _PENDING_SPAWNS
+        if active_cnt >= _MAX_CONCURRENT_RUNS:
+            return {"ok": False, "error": f"当前并发任务数已达上限（{_MAX_CONCURRENT_RUNS}），请等待任务完成或停止后再试"}
+        _PENDING_SPAWNS += 1
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -2125,6 +2509,8 @@ def start_cli_chat_run(
             creationflags=_NO_WINDOW,
         )
     except Exception as exc:
+        with _ACTIVE_RUNS_LOCK:
+            _PENDING_SPAWNS = max(0, _PENDING_SPAWNS - 1)
         return {"ok": False, "error": f"启动 agy CLI 失败: {exc}"}
 
     watermark_saved = False
@@ -2133,15 +2519,13 @@ def start_cli_chat_run(
         watermark_saved = True
 
     run_id = uuid.uuid4().hex[:10]
+    pending_key = f"pending-{run_id}"
     init_evt = threading.Event()
     canonical_disp = source_desktop_cid or resume_cli_cid
     att_metas: list[dict[str, Any]] = []
-    for raw_a in (attachments or []):
-        if not raw_a:
-            continue
-        ap = pathlib.Path(raw_a)
+    for ap in valid_att_paths:
         ext = ap.suffix.lower()
-        is_img = ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+        is_img = ext in _IMAGE_EXTS
         norm_p = ap.as_posix()
         att_metas.append({
             "name": ap.name,
@@ -2165,6 +2549,8 @@ def start_cli_chat_run(
         "stderr": "",
     }
     with _ACTIVE_RUNS_LOCK:
+        _PENDING_SPAWNS = max(0, _PENDING_SPAWNS - 1)
+        _ACTIVE_RUNS[pending_key] = run_rec
         if resume_cli_cid:
             _ACTIVE_RUNS[resume_cli_cid] = run_rec
         if canonical_disp:
@@ -2271,7 +2657,7 @@ def start_cli_chat_run(
                                     run_rec["tools"].append(tool_item)
                                 _broadcast_ws({
                                     "type": "run_tool",
-                                    "conversation_id": disp_cid or bound_cid,
+                                    "conversation_id": disp_cid or bound_cid or pending_key,
                                     "run_id": run_id,
                                     "tool": tool_item,
                                 })
@@ -2281,7 +2667,7 @@ def start_cli_chat_run(
                                 run_rec["chunks"].append(delta)
                                 _broadcast_ws({
                                     "type": "run_delta",
-                                    "conversation_id": disp_cid or bound_cid,
+                                    "conversation_id": disp_cid or bound_cid or pending_key,
                                     "run_id": run_id,
                                     "delta": delta,
                                 })
@@ -2305,9 +2691,9 @@ def start_cli_chat_run(
             run_rec["running"] = False
             if not final_resp and run_rec["chunks"]:
                 final_resp = _clean_assistant_text("".join(run_rec["chunks"]))
-            cid_end = disp_cid or bound_cid or run_rec.get("display_cid") or run_rec.get("cid") or ""
+            cid_end = disp_cid or bound_cid or run_rec.get("display_cid") or run_rec.get("cid") or pending_key
             with _ACTIVE_RUNS_LOCK:
-                for k_rm in (cid_end, bound_cid, run_rec.get("cid") or ""):
+                for k_rm in (pending_key, cid_end, bound_cid, run_rec.get("display_cid") or "", run_rec.get("cid") or ""):
                     if k_rm and _ACTIVE_RUNS.get(k_rm) is run_rec:
                         _ACTIVE_RUNS.pop(k_rm, None)
             init_evt.set()
@@ -2335,7 +2721,14 @@ def start_cli_chat_run(
     if not run_rec["display_cid"]:
         init_evt.wait(timeout=8.0)
 
-    final_cid = str(run_rec.get("display_cid") or run_rec.get("cid") or resume_cli_cid or f"pending-{run_id}")
+    final_cid = str(run_rec.get("display_cid") or run_rec.get("cid") or resume_cli_cid or pending_key)
+    if (not run_rec["running"]) and (not run_rec.get("canceled")) and (proc.returncode not in (0, None)) and (not run_rec.get("chunks")):
+        return {
+            "ok": False,
+            "error": (run_rec.get("stderr") or f"agy CLI 执行失败 (exit code {proc.returncode})")[:400],
+            "conversation_id": final_cid,
+            "run_id": run_id,
+        }
     return {
         "ok": True,
         "conversation_id": final_cid,
@@ -2353,7 +2746,7 @@ def _check_auth(request: web.Request) -> bool:
     cfg = load_or_create_config()
     expected = str(cfg.get("token") or "").strip()
     if not expected:
-        return True
+        return False
     auth_h = str(request.headers.get("Authorization") or "").strip()
     if auth_h.startswith("Bearer ") and secrets.compare_digest(auth_h[7:].strip(), expected):
         return True
@@ -2364,51 +2757,72 @@ def _check_auth(request: web.Request) -> bool:
 
 
 _PUBLIC_API_PATHS = {"/api/pair/claim", "/api/local-auth"}
+_NO_CORS_PATHS = {"/api/local-auth", "/pair"}
+_PREVIEW_IMAGE_MIMES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+}
+_MAX_IMAGE_PREVIEW_BYTES = 25 * 1024 * 1024
 
 
-def _is_strict_loopback_request(request: web.Request) -> bool:
-    """Only allow direct localhost/127.0.0.1 same-origin requests (never via proxy/tunnel/cross-site)."""
+def _is_strict_loopback_request(request: web.Request, *, allow_same_origin_iframe: bool = False) -> bool:
+    """Only allow direct localhost/127.0.0.1 same-origin requests (never via proxy/tunnel/LAN/cross-site)."""
     if _is_via_public_tunnel(request):
         return False
-    for proxy_hdr in ("X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Forwarded"):
-        if request.headers.get(proxy_hdr):
-            return False
-    remote = str(request.remote or "").strip()
-    try:
-        if not ipaddress.ip_address(remote).is_loopback:
-            return False
-    except ValueError:
+    if not _is_loopback_ip(request.remote):
         return False
-    host_hdr = str(request.headers.get("Host") or "").strip().lower()
-    try:
-        host_only = str(urllib.parse.urlparse(f"http://{host_hdr}").hostname or "").lower()
-    except Exception:
+    host_hdr = str(request.headers.get("Host") or "").strip()
+    m_host = _LOOPBACK_HOST_RE.match(host_hdr)
+    if not m_host:
         return False
-    if host_only not in ("127.0.0.1", "localhost", "::1"):
-        return False
-    sfd = str(request.headers.get("Sec-Fetch-Dest") or "").strip().lower()
-    if sfd in ("iframe", "frame", "object", "embed"):
+    host_port = int(m_host.group(1)) if m_host.group(1) else 80
+    if host_port != PORT:
         return False
     sfs = str(request.headers.get("Sec-Fetch-Site") or "").strip().lower()
     if sfs and sfs not in ("same-origin", "none"):
         return False
-    origin = str(request.headers.get("Origin") or "").strip().lower()
+    sfd = str(request.headers.get("Sec-Fetch-Dest") or "").strip().lower()
+    if sfd in ("iframe", "frame", "object", "embed"):
+        if not (allow_same_origin_iframe and sfd == "iframe" and sfs == "same-origin"):
+            return False
+    origin = str(request.headers.get("Origin") or "").strip()
     if origin:
+        if origin.lower() == "null":
+            return False
         try:
             po = urllib.parse.urlparse(origin)
-            if po.hostname not in ("127.0.0.1", "localhost", "::1") or (po.port or 80) != PORT:
+            if (
+                po.scheme != "http"
+                or (po.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1")
+                or (po.port or 80) != PORT
+                or po.path not in ("", "/")
+            ):
                 return False
         except Exception:
             return False
     return True
 
 
+def _apply_common_sec_headers(resp: web.StreamResponse) -> None:
+    if not resp.prepared:
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+
+
 @web.middleware
 async def cors_and_auth_middleware(request: web.Request, handler):
-    is_local_auth = request.path == "/api/local-auth"
+    norm_path = request.path.rstrip("/") or "/"
+    is_no_cors = norm_path in _NO_CORS_PATHS
     if request.method == "OPTIONS":
-        if is_local_auth:
-            return web.Response(status=403)
+        if is_no_cors:
+            return web.Response(
+                status=403,
+                headers={"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"},
+            )
         return web.Response(
             status=204,
             headers={
@@ -2416,21 +2830,30 @@ async def cors_and_auth_middleware(request: web.Request, handler):
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With",
                 "Access-Control-Max-Age": "86400",
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
             },
         )
     path = request.path
     if (path.startswith("/api/") and path not in _PUBLIC_API_PATHS) or path == "/ws":
         if not _check_auth(request):
+            err_headers = {
+                "X-Content-Type-Options": "nosniff",
+                "Referrer-Policy": "no-referrer",
+            }
+            if not is_no_cors:
+                err_headers["Access-Control-Allow-Origin"] = "*"
             return web.json_response(
                 {"ok": False, "error": "Unauthorized: invalid or missing token"},
                 status=401,
-                headers={"Access-Control-Allow-Origin": "*"},
+                headers=err_headers,
             )
     try:
         resp = await handler(request)
     except web.HTTPException as ex:
         resp = ex
-    if not resp.prepared and not is_local_auth:
+    _apply_common_sec_headers(resp)
+    if not resp.prepared and not is_no_cors:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Requested-With"
     return resp
@@ -2441,7 +2864,7 @@ async def handle_local_auth(request: web.Request) -> web.Response:
     sec_headers = {"Cache-Control": "no-store", "Vary": "Origin", "X-Frame-Options": "DENY"}
     if not _is_strict_loopback_request(request):
         return web.json_response(
-            {"ok": False, "error": "本机自动登录仅允许在电脑本机 http://127.0.0.1 访问"},
+            {"ok": False, "error": f"本机自动登录仅允许在电脑本机 http://127.0.0.1:{PORT} 访问"},
             status=403,
             headers=sec_headers,
         )
@@ -2465,14 +2888,16 @@ async def handle_local_auth(request: web.Request) -> web.Response:
 # HTTP & WebSocket Handlers
 # ---------------------------------------------------------------------------
 
-async def handle_health(_request: web.Request) -> web.Response:
-    return web.json_response({
+async def handle_health(request: web.Request) -> web.Response:
+    payload: dict[str, Any] = {
         "ok": True,
         "app": APP_NAME,
         "version": APP_VERSION,
         "port": PORT,
-        "hostname": socket.gethostname(),
-    })
+    }
+    if not _is_via_public_tunnel(request):
+        payload["hostname"] = socket.gethostname()
+    return web.json_response(payload)
 
 
 async def handle_server_info(_request: web.Request) -> web.Response:
@@ -2484,7 +2909,7 @@ async def handle_server_info(_request: web.Request) -> web.Response:
     tun = get_tunnel_snapshot()
     apk_p = DIST_DIR / APK_FILENAME
     with _ACTIVE_RUNS_LOCK:
-        running_cnt = sum(1 for v in _ACTIVE_RUNS.values() if v.get("running"))
+        running_cnt = len({id(v) for v in _ACTIVE_RUNS.values() if v.get("running")})
     return web.json_response({
         "ok": True,
         "app": APP_NAME,
@@ -2512,7 +2937,7 @@ async def handle_pair_claim(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": f"配对尝试过于频繁，请 {retry_after} 秒后再试"},
             status=429,
-            headers={"Retry-After": str(retry_after)},
+            headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
         )
     try:
         body = await request.json()
@@ -2524,31 +2949,41 @@ async def handle_pair_claim(request: web.Request) -> web.Response:
     raw_pin = re.sub(r"[\s-]+", "", str(body.get("pin") or "").strip())
     expected_pin = get_pair_pin()
     if not raw_pin or not secrets.compare_digest(raw_pin, expected_pin):
+        rotated = _record_pair_pin_failure()
+        await asyncio.sleep(0.25)
+        msg = "配对码错误次数过多，电脑端已自动刷新为新 6 位配对码，请重新核对" if rotated else "配对码错误，请核对电脑端 /pair 页面显示的 6 位数字"
         return web.json_response(
-            {"ok": False, "error": "配对码错误，请核对电脑端 /pair 页面显示的 6 位数字"},
+            {"ok": False, "error": msg},
             status=403,
+            headers={"Cache-Control": "no-store"},
         )
+
+    # Rotate PIN immediately after successful claim (single-use PIN)
+    init_or_rotate_pair_pin()
 
     cfg = load_or_create_config()
     lans, qqbot_ok = await asyncio.gather(
         asyncio.to_thread(detect_connect_endpoints),
         asyncio.to_thread(check_qqbot_available),
     )
-    return web.json_response({
-        "ok": True,
-        "token": str(cfg.get("token") or ""),
-        "hostname": socket.gethostname(),
-        "default_model": cfg.get("default_model", "gemini-4-neon-medium"),
-        "port": PORT,
-        "lan_urls": lans,
-        "tunnel_url": get_tunnel_snapshot().get("url", ""),
-        "qqbot_available": bool(qqbot_ok),
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "token": str(cfg.get("token") or ""),
+            "hostname": socket.gethostname(),
+            "default_model": cfg.get("default_model", "gemini-4-neon-medium"),
+            "port": PORT,
+            "lan_urls": lans,
+            "tunnel_url": get_tunnel_snapshot().get("url", ""),
+            "qqbot_available": bool(qqbot_ok),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def handle_pair_rotate(_request: web.Request) -> web.Response:
     new_pin = init_or_rotate_pair_pin()
-    return web.json_response({"ok": True, "pin": new_pin, "pair_pin": new_pin})
+    return web.json_response({"ok": True, "pin": new_pin, "pair_pin": new_pin}, headers={"Cache-Control": "no-store"})
 
 
 async def handle_tunnel_restart(_request: web.Request) -> web.Response:
@@ -2564,15 +2999,18 @@ async def handle_pair_info(_request: web.Request) -> web.Response:
     token = str(cfg.get("token") or "")
     main_url = lans[0]["url"] if lans else f"http://127.0.0.1:{PORT}"
     pin = get_pair_pin()
-    return web.json_response({
-        "ok": True,
-        "hostname": hostname,
-        "lan_urls": lans,
-        "tunnel": tun,
-        "pin": pin,
-        "pair_uri": build_pair_uri(main_url, token, hostname),
-        "token_preview": _mask_token(token),
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "hostname": hostname,
+            "lan_urls": lans,
+            "tunnel": tun,
+            "pin": pin,
+            "pair_uri": build_pair_uri(main_url, token, hostname),
+            "token_preview": _mask_token(token),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def handle_models(_request: web.Request) -> web.Response:
@@ -2590,16 +3028,18 @@ async def handle_conversations(request: web.Request) -> web.Response:
     except ValueError:
         limit = 80
     source_filter = str(request.query.get("source") or "all").strip().lower()
-    if source_filter not in ("all", "desktop", "mobile"):
+    if source_filter not in ("all", "desktop", "mobile", "external"):
         source_filter = "all"
-    items = await asyncio.to_thread(list_all_conversations, limit, source_filter)
+    inc_ext_raw = str(request.query.get("include_external_cli") or "").strip().lower()
+    include_external_cli = inc_ext_raw in ("1", "true", "yes", "on")
+    items = await asyncio.to_thread(list_all_conversations, limit, source_filter, include_external_cli)
     return web.json_response({"ok": True, "conversations": items})
 
 
 async def handle_conversation_detail(request: web.Request) -> web.Response:
     cid = str(request.match_info.get("cid") or "").strip()
-    if not cid:
-        return web.json_response({"ok": False, "error": "missing cid"}, status=400)
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
     detail = await asyncio.to_thread(load_conversation_detail, cid)
     return web.json_response({"ok": True, "conversation": detail})
 
@@ -2609,9 +3049,15 @@ async def handle_chat_send(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
     cid = str(body.get("conversation_id") or "").strip()
+    if cid and cid != "__new__" and not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid conversation_id"}, status=400)
     prompt = str(body.get("prompt") or "")
     model = str(body.get("model") or "").strip()
+    if model and not _is_valid_model_id(model):
+        return web.json_response({"ok": False, "error": "invalid model"}, status=400)
     attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
     swarm_mode = bool(body.get("swarm_mode", False))
     if model:
@@ -2622,6 +3068,8 @@ async def handle_chat_send(request: web.Request) -> web.Response:
 
 async def handle_chat_cancel(request: web.Request) -> web.Response:
     cid = str(request.match_info.get("cid") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
     proc = None
     with _ACTIVE_RUNS_LOCK:
         rec = _ACTIVE_RUNS.get(cid)
@@ -2647,6 +3095,7 @@ async def handle_upload(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "no file"}, status=400)
     orig_name = pathlib.Path(field.filename or "upload.bin").name
     safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", orig_name).strip(" ._") or "upload.bin"
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     dest = UPLOAD_DIR / f"{int(time.time() * 1000)}_{safe_name[:100]}"
     size = 0
     max_bytes = 50 * 1024 * 1024
@@ -2662,7 +3111,7 @@ async def handle_upload(request: web.Request) -> web.Response:
                 return web.json_response({"ok": False, "error": "文件超过 50MB 限制"}, status=413)
             fh.write(chunk)
     ext = dest.suffix.lower()
-    is_img = ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+    is_img = ext in _IMAGE_EXTS
     return web.json_response({
         "ok": True,
         "name": orig_name,
@@ -2674,15 +3123,21 @@ async def handle_upload(request: web.Request) -> web.Response:
 
 
 async def handle_files_list(request: web.Request) -> web.Response:
-    raw_dir = str(request.query.get("dir") or WORKSPACE_ROOT.as_posix()).strip()
-    try:
-        target = pathlib.Path(raw_dir).resolve()
-        if not target.is_dir():
-            target = WORKSPACE_ROOT.resolve()
-        if _is_sensitive_path(target):
-            return web.json_response({"ok": False, "error": "禁止访问敏感目录"}, status=403)
-    except Exception:
+    raw_dir = str(request.query.get("dir") or "").strip()
+    allowed_roots = _get_allowed_file_roots()
+    if not raw_dir:
         target = WORKSPACE_ROOT.resolve()
+    else:
+        if _has_unsafe_raw_path(raw_dir, allow_absolute=True):
+            return web.json_response({"ok": False, "error": "非法目录路径"}, status=403)
+        try:
+            target = pathlib.Path(raw_dir).resolve()
+        except Exception:
+            return web.json_response({"ok": False, "error": "目录路径无效"}, status=400)
+        if not _is_within_allowed_roots(target, allowed_roots) or _is_sensitive_path(target):
+            return web.json_response({"ok": False, "error": "禁止访问工作区之外或受保护的目录"}, status=403)
+        if not target.is_dir():
+            return web.json_response({"ok": False, "error": "目录不存在"}, status=404)
 
     dirs: list[dict[str, Any]] = []
     files: list[dict[str, Any]] = []
@@ -2690,23 +3145,27 @@ async def handle_files_list(request: web.Request) -> web.Response:
         with os.scandir(target) as it:
             for e in it:
                 p = pathlib.Path(e.path)
-                if e.name.startswith(".") or e.name in ("__pycache__", "node_modules", "qq_env", "qq_appdata", "qq_data", "qq_local", "qq_roaming"):
+                if e.name.startswith(".") or e.name in ("__pycache__", "node_modules", ".venv", "venv"):
                     continue
-                if _is_sensitive_path(p):
+                try:
+                    rp = p.resolve()
+                except Exception:
+                    continue
+                if not _is_within_allowed_roots(rp, allowed_roots) or _is_sensitive_path(rp):
                     continue
                 try:
                     st = e.stat()
                 except OSError:
                     continue
                 if e.is_dir():
-                    dirs.append({"name": e.name, "path": p.resolve().as_posix(), "is_dir": True, "mtime": st.st_mtime})
+                    dirs.append({"name": e.name, "path": rp.as_posix(), "is_dir": True, "mtime": st.st_mtime})
                 else:
                     files.append({
                         "name": e.name,
-                        "path": p.resolve().as_posix(),
+                        "path": rp.as_posix(),
                         "is_dir": False,
                         "size": st.st_size,
-                        "ext": p.suffix.lower(),
+                        "ext": rp.suffix.lower(),
                         "mtime": st.st_mtime,
                     })
     except Exception as exc:
@@ -2714,7 +3173,14 @@ async def handle_files_list(request: web.Request) -> web.Response:
 
     dirs.sort(key=lambda x: x["name"].lower())
     files.sort(key=lambda x: -float(x["mtime"]))
-    parent = target.parent.resolve().as_posix() if target.parent != target else ""
+    parent = ""
+    if target.parent != target:
+        try:
+            p_res = target.parent.resolve()
+            if _is_within_allowed_roots(p_res, allowed_roots) and not _is_sensitive_path(p_res):
+                parent = p_res.as_posix()
+        except Exception:
+            parent = ""
     return web.json_response({
         "ok": True,
         "dir": target.as_posix(),
@@ -2723,49 +3189,85 @@ async def handle_files_list(request: web.Request) -> web.Response:
     })
 
 
-async def handle_file_preview(request: web.Request) -> web.Response:
+async def handle_file_preview(request: web.Request) -> web.StreamResponse:
     raw_p = str(request.query.get("path") or "").strip()
     if not raw_p:
         return web.json_response({"ok": False, "error": "missing path"}, status=400)
+    if _has_unsafe_raw_path(raw_p, allow_absolute=True):
+        return web.json_response({"ok": False, "error": "非法文件路径"}, status=403)
     try:
         p = pathlib.Path(raw_p).resolve()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid path"}, status=400)
-    if not p.is_file() or _is_sensitive_path(p):
-        return web.json_response({"ok": False, "error": "文件不存在或受保护"}, status=404)
-    ext = p.suffix.lower()
-    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"):
-        mime, _ = mimetypes.guess_type(p.name)
-        return web.Response(body=p.read_bytes(), content_type=mime or "image/png")
+    if not _is_within_allowed_roots(p) or _is_sensitive_path(p):
+        return web.json_response({"ok": False, "error": "禁止访问工作区之外或受保护的文件"}, status=403)
+    if not p.is_file():
+        return web.json_response({"ok": False, "error": "文件不存在"}, status=404)
+
     try:
-        raw_b = p.read_bytes()[:65536]
+        fsize = p.stat().st_size
+    except OSError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    ext = p.suffix.lower()
+    # Never serve .svg inline as image/svg+xml (falls through to safe UTF-8 text preview JSON below)
+    if ext in _PREVIEW_IMAGE_MIMES:
+        if fsize > _MAX_IMAGE_PREVIEW_BYTES:
+            return web.json_response({"ok": False, "error": "图片文件超过 25MB 预览限制，请直接下载"}, status=413)
+        resp = web.FileResponse(p)
+        resp.headers["Content-Type"] = _PREVIEW_IMAGE_MIMES[ext]
+        resp.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        return resp
+    try:
+        with p.open("rb") as fh:
+            raw_b = fh.read(65536)
+        sandbox_hdrs = {
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        }
         if b"\x00" in raw_b[:512]:
-            return web.json_response({"ok": True, "binary": True, "name": p.name, "size": p.stat().st_size, "content": ""})
-        return web.json_response({
-            "ok": True,
-            "binary": False,
-            "name": p.name,
-            "size": p.stat().st_size,
-            "truncated": p.stat().st_size > 65536,
-            "content": raw_b.decode("utf-8", errors="replace"),
-        })
+            return web.json_response(
+                {"ok": True, "binary": True, "name": p.name, "size": fsize, "content": ""},
+                headers=sandbox_hdrs,
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "binary": False,
+                "name": p.name,
+                "size": fsize,
+                "truncated": fsize > 65536,
+                "content": raw_b.decode("utf-8", errors="replace"),
+            },
+            headers=sandbox_hdrs,
+        )
     except Exception as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
-async def handle_file_download(request: web.Request) -> web.Response:
+async def handle_file_download(request: web.Request) -> web.StreamResponse:
     raw_p = str(request.query.get("path") or "").strip()
     if not raw_p:
         return web.Response(status=400, text="missing path")
+    if _has_unsafe_raw_path(raw_p, allow_absolute=True):
+        return web.Response(status=403, text="forbidden")
     try:
         p = pathlib.Path(raw_p).resolve()
     except Exception:
         return web.Response(status=400, text="invalid path")
-    if not p.is_file() or _is_sensitive_path(p):
+    if not _is_within_allowed_roots(p) or _is_sensitive_path(p):
+        return web.Response(status=403, text="forbidden")
+    if not p.is_file():
         return web.Response(status=404, text="not found")
     resp = web.FileResponse(p)
     qname = urllib.parse.quote(p.name)
     resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{qname}"
+    resp.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
     return resp
 
 
@@ -2802,8 +3304,17 @@ async def handle_qqbot_switch(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
     model = str(body.get("model") or "").strip()
+    if not _is_valid_model_id(model):
+        return web.json_response({"ok": False, "error": "invalid model"}, status=400)
     target = str(body.get("target") or "group").strip()
+    if target not in ("group", "private", "all", "default", "active"):
+        return web.json_response({"ok": False, "error": "invalid target"}, status=400)
+
+    if not await asyncio.to_thread(check_qqbot_available):
+        return web.json_response({"ok": False, "qqbot_available": False, "error": "本机未启用 QQ Bot 服务"}, status=503)
 
     def _post() -> dict[str, Any]:
         req = urllib.request.Request(
@@ -2821,7 +3332,12 @@ async def handle_qqbot_switch(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
-async def handle_ws(request: web.Request) -> web.WebSocketResponse:
+async def handle_ws(request: web.Request) -> web.StreamResponse:
+    for w in list(_WS_CLIENTS):
+        if w.closed:
+            _WS_CLIENTS.discard(w)
+    if len(_WS_CLIENTS) >= _MAX_WS_CLIENTS:
+        return web.json_response({"ok": False, "error": "WebSocket 连接数已达上限"}, status=503)
     ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
     _WS_CLIENTS.add(ws)
@@ -2831,7 +3347,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
             if msg.type == WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
-                    if data.get("type") == "ping":
+                    if isinstance(data, dict) and data.get("type") == "ping":
                         await ws.send_str(json.dumps({"type": "pong", "ts": time.time()}))
                 except Exception:
                     pass
@@ -2850,12 +3366,23 @@ async def handle_download_apk(_request: web.Request) -> web.StreamResponse:
     return resp
 
 
+def _js_lit(val: Any) -> str:
+    """Safely serialize a Python value into an inline <script> JS literal."""
+    return (
+        json.dumps(val, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
 async def handle_pair_page(request: web.Request) -> web.Response:
-    if _is_via_public_tunnel(request):
+    if not _is_strict_loopback_request(request, allow_same_origin_iframe=True):
         return web.Response(
             status=403,
-            text="为保护您的访问令牌安全，/pair 配对页面仅允许在电脑本机或局域网打开，请在电脑浏览器访问 http://127.0.0.1:18795/pair",
+            text=f"为保护您的访问令牌安全，/pair 配对页面仅允许在电脑本机打开，请在电脑浏览器访问 http://127.0.0.1:{PORT}/pair",
             content_type="text/plain",
+            headers={"Cache-Control": "no-store", "Vary": "Origin", "X-Frame-Options": "DENY"},
         )
     cfg = load_or_create_config()
     lans = await asyncio.to_thread(detect_connect_endpoints)
@@ -2896,15 +3423,31 @@ async def handle_pair_page(request: web.Request) -> web.Response:
         "vpn": "电脑 VPN 网卡（手机通常不可直连）",
         "other": "网络接口",
     }
-    tun_status = tun.get("status", "disabled")
+    tun_status = str(tun.get("status") or "disabled")
+    tun_error = str(tun.get("error") or "").strip()
+    tun_hint_html = ""
     if tun_status == "online" and tun.get("url"):
         tun_pill_html = '<span class="pill pill-green"><span class="dot"></span>公网隧道在线（免VPN）</span>'
     elif tun_status == "starting":
         tun_pill_html = '<span class="pill pill-host">公网隧道建连中…</span>'
-    elif tun_status == "error":
-        tun_pill_html = '<span class="pill pill-host">公网隧道重连中…</span>'
+    elif tun_status == "missing":
+        tun_pill_html = '<span class="pill pill-warn">未安装 cloudflared · 仅局域网</span>'
+        tun_hint_html = (
+            '<div class="tun-hint">未检测到 <code>cloudflared</code>，当前已自动回退为同 Wi-Fi 局域网配对。'
+            '如需 5G / 校园网免 VPN 公网直连，请将 <code>cloudflared.exe</code>（或 macOS/Linux 二进制）'
+            '放入项目 <code>bin/</code> 目录或系统 PATH 后点击右上角「重连隧道」。</div>'
+        )
+    elif tun_status == "disabled":
+        tun_pill_html = '<span class="pill pill-host">公网隧道已关闭 · 局域网模式</span>'
+        tun_hint_html = (
+            '<div class="tun-hint">公网隧道当前已通过配置或环境变量关闭，请确保手机与电脑处于同一局域网后扫码或输入 6 位配对码。</div>'
+        )
     else:
-        tun_pill_html = ''
+        tun_pill_html = '<span class="pill pill-warn">公网隧道未就绪</span>'
+        err_desc = html_lib.escape(tun_error) if tun_error else "连接 Cloudflare 边缘节点失败"
+        tun_hint_html = (
+            f'<div class="tun-hint">公网隧道暂不可用：{err_desc}。可先使用下方局域网地址扫码，或点击右上角「重连隧道」重试。</div>'
+        )
     chips_html_parts: list[str] = []
     addrs_html_parts: list[str] = []
     for item in lans:
@@ -2944,6 +3487,8 @@ async def handle_pair_page(request: web.Request) -> web.Response:
     esc_active_url = html_lib.escape(active_url)
     esc_token = html_lib.escape(token)
     esc_apk_name = html_lib.escape(APK_FILENAME)
+    js_token = _js_lit(token)
+    js_tun_status = _js_lit(tun_status)
 
     page_html = f"""<!doctype html>
 <html lang="zh-CN" data-theme="dark">
@@ -3073,6 +3618,26 @@ body {{
 }}
 .pill-green {{ background: var(--green-bg); color: var(--green-fg); }}
 .pill-host {{ background: var(--surface-container); color: var(--text); }}
+.pill-warn {{ background: rgba(251, 188, 5, 0.16); color: #F5B400; border: 1px solid rgba(251, 188, 5, 0.35); }}
+[data-theme="light"] .pill-warn {{ background: #FEF7E0; color: #B06000; border-color: #F6D88C; }}
+.tun-hint {{
+  margin: 0 0 18px;
+  padding: 12px 16px;
+  border-radius: 16px;
+  background: var(--surface-container);
+  border: 1px solid var(--outline);
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.55;
+}}
+.tun-hint code {{
+  background: var(--surface);
+  padding: 1px 6px;
+  border-radius: 6px;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}}
 .theme-toggle {{
   background: var(--surface-container);
   color: var(--text);
@@ -3368,6 +3933,8 @@ details.adv summary {{
     </div>
   </header>
 
+  {tun_hint_html}
+
   <main class="grid">
     <section class="card">
       <span class="card-eyebrow">方式一 · 推荐</span>
@@ -3430,18 +3997,20 @@ details.adv summary {{
 
   <footer class="footer-links">
     <span>工作区：{html_lib.escape(WORKSPACE_ROOT.as_posix())}</span>
-    <a href="/">在浏览器打开 Web 工作台 →</a>
+    <a href="/" target="_top">在浏览器打开 Web 工作台 →</a>
   </footer>
 </div>
 <div class="toast" id="toast">已复制</div>
 <script>
+const AUTH_TOKEN = {js_token};
+const TUN_STATUS = {js_tun_status};
 const toastEl = document.getElementById('toast');
 let toastTimer = null;
 function showToast(msg) {{
   toastEl.textContent = msg;
   toastEl.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2600);
 }}
 const themeBtn = document.getElementById('themeToggleBtn');
 function syncThemeBtn() {{
@@ -3483,7 +4052,7 @@ if (rotateBtn) {{
     try {{
       const res = await fetch('/api/pair/rotate', {{
         method: 'POST',
-        headers: {{ 'Authorization': 'Bearer {esc_token}' }}
+        headers: {{ 'Authorization': 'Bearer ' + AUTH_TOKEN }}
       }});
       const data = await res.json();
       if (data && data.ok && data.pin) {{
@@ -3510,12 +4079,21 @@ if (restartTunnelBtn) {{
     try {{
       const res = await fetch('/api/tunnel/restart', {{
         method: 'POST',
-        headers: {{ 'Authorization': 'Bearer {esc_token}' }}
+        headers: {{ 'Authorization': 'Bearer ' + AUTH_TOKEN }}
       }});
       const data = await res.json();
-      if (data && data.ok && data.tunnel && data.tunnel.url) {{
+      const tun = data && data.tunnel ? data.tunnel : null;
+      if (data && data.ok && tun && tun.url && tun.status === 'online') {{
         showToast('公网隧道已就绪，正在刷新二维码…');
         setTimeout(() => location.replace('/pair?ip=tunnel'), 400);
+      }} else if (tun && tun.error) {{
+        showToast(tun.error);
+        restartTunnelBtn.disabled = false;
+        restartTunnelBtn.textContent = '重连隧道';
+      }} else if (tun && tun.status === 'disabled') {{
+        showToast('公网隧道已关闭，请在 mobile_config.json 开启 tunnel_enabled');
+        restartTunnelBtn.disabled = false;
+        restartTunnelBtn.textContent = '重连隧道';
       }} else {{
         showToast('隧道重连中，请稍候刷新');
         restartTunnelBtn.disabled = false;
@@ -3528,7 +4106,7 @@ if (restartTunnelBtn) {{
     }}
   }});
 }}
-if ('{tun_status}' === 'starting') {{
+if (TUN_STATUS === 'starting') {{
   setTimeout(() => location.reload(), 3500);
 }}
 </script>
@@ -3537,16 +4115,32 @@ if ('{tun_status}' === 'starting') {{
     return web.Response(
         text=page_html,
         content_type="text/html",
-        headers={"Cache-Control": "no-store", "X-Frame-Options": "SAMEORIGIN"},
+        headers={
+            "Cache-Control": "no-store",
+            "Vary": "Origin",
+            "X-Frame-Options": "SAMEORIGIN",
+            "Content-Security-Policy": "frame-ancestors 'self'",
+        },
     )
 
 
 async def handle_static_www(request: web.Request) -> web.StreamResponse:
-    name = request.path.lstrip("/") or "index.html"
-    if ".." in name:
+    raw_path = str(request.path or "")
+    raw_url_path = str(request.raw_path or "")
+    # Reject UNC/backslash/traversal/drive tricks BEFORE joining with WWW_DIR or calling .resolve()
+    if (
+        raw_path.startswith(("//", "/\\"))
+        or "\\" in raw_path
+        or "%5c" in raw_url_path.lower()
+        or "%2f%2f" in raw_url_path.lower()
+    ):
         return web.Response(status=400, text="bad path")
-    p = (WWW_DIR / name).resolve()
-    if not p.is_file() or not p.is_relative_to(WWW_DIR.resolve()):
+    name = raw_path.lstrip("/") or "index.html"
+    if _has_unsafe_raw_path(name, allow_absolute=False):
+        return web.Response(status=400, text="bad path")
+    www_root = WWW_DIR.resolve()
+    p = (www_root / name).resolve()
+    if not p.is_file() or not p.is_relative_to(www_root):
         return web.Response(status=404, text="not found")
     resp = web.FileResponse(p)
     if p.name.lower() == "manifest.json":
@@ -3699,7 +4293,9 @@ if __name__ == "__main__":
     pin = init_or_rotate_pair_pin()
     tun_snap = start_cloudflared_tunnel(wait_sec=10.0)
     lans = detect_connect_endpoints()
-    pair_url = f"{lans[0]['url']}/pair" if lans else f"http://127.0.0.1:{PORT}/pair"
+    lan_only = [ep for ep in lans if ep.get("kind") != "tunnel"]
+    lan_url = lan_only[0]["url"] if lan_only else f"http://127.0.0.1:{PORT}"
+    pair_url = f"http://127.0.0.1:{PORT}/pair"
     print(f"[{APP_NAME}] Listening on http://{HOST}:{PORT}", flush=True)
     print(f"[{APP_NAME}] Workspace : {WORKSPACE_ROOT.as_posix()}", flush=True)
     print(f"[{APP_NAME}] agy CLI   : {_find_agy_bin() or 'NOT FOUND'}", flush=True)
@@ -3707,8 +4303,8 @@ if __name__ == "__main__":
         print(f"[{APP_NAME}] Public URL: {tun_snap['url']} (Zero-VPN Cloudflare Tunnel)", flush=True)
     else:
         print(f"[{APP_NAME}] Tunnel    : {tun_snap.get('status')} {tun_snap.get('error', '')}", flush=True)
-    print(f"[{APP_NAME}] Pair URL  : {pair_url}", flush=True)
-    print(f"[{APP_NAME}] Local Pair: http://127.0.0.1:{PORT}/pair", flush=True)
+    print(f"[{APP_NAME}] LAN URL   : {lan_url}", flush=True)
+    print(f"[{APP_NAME}] Pair URL  : {pair_url} (Localhost only)", flush=True)
     print(f"[{APP_NAME}] Pair PIN  : {pin}", flush=True)
     print(f"[{APP_NAME}] Token     : {_mask_token(str(cfg.get('token') or ''))}", flush=True)
     web.run_app(create_app(), host=HOST, port=PORT, print=None)

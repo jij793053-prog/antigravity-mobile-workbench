@@ -25,6 +25,8 @@
     connectEpoch: 0,
 
     conversations: [],
+    filter: "all",           // "all" | "mobile" | "desktop" | "external"
+    showExternalCli: false,
     search: "",
     currentCid: "",
     currentConv: null,
@@ -142,6 +144,11 @@
 
   // Exposed native back button hook
   window.__handleAndroidBack = () => {
+    const confirmDlg = $("pair-confirm-dialog");
+    if (confirmDlg && !confirmDlg.classList.contains("hidden")) {
+      closePairConfirmDialog(true);
+      return true;
+    }
     for (const mid of ["preview-modal", "pair-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
       const el = $(mid);
       if (el && !el.classList.contains("hidden")) {
@@ -210,12 +217,6 @@
   // =========================================================================
   // 2. THEME ENGINE (Light Default + Google Dark + Follow System)
   // =========================================================================
-  function themeLabel(pref) {
-    if (pref === "dark") return "深色";
-    if (pref === "system") return "跟随系统";
-    return "浅色";
-  }
-
   function applyTheme(pref, persist = false) {
     const valid = ["light", "dark", "system"].includes(pref) ? pref : "light";
     state.themePref = valid;
@@ -226,9 +227,6 @@
     syncSystemBars(isDark);
 
     // Update theme labels & icons
-    const navLbl = $("nav-theme-label");
-    if (navLbl) navLbl.textContent = themeLabel(valid);
-
     const wLbl = $("welcome-theme-label");
     if (wLbl) wLbl.textContent = isDark ? "深色" : "浅色";
 
@@ -245,14 +243,6 @@
     if (persist) {
       persistConfig();
     }
-  }
-
-  function cycleTheme() {
-    haptic("light");
-    const order = ["light", "dark", "system"];
-    const next = order[(order.indexOf(state.themePref) + 1) % order.length];
-    applyTheme(next, true);
-    showToast(`外观已切换为：${themeLabel(next)}`);
   }
 
   if (darkMedia && darkMedia.addEventListener) {
@@ -273,11 +263,19 @@
   function normalizeServerUrl(raw) {
     let s = String(raw || "").trim();
     if (!s) return "";
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s) && !/^https?:\/\//i.test(s)) {
+      return "";
+    }
+    if (/^(javascript|data|vbscript|file|blob|about):/i.test(s)) {
+      return "";
+    }
     if (!/^https?:\/\//i.test(s)) {
       s = "http://" + s;
     }
     try {
       const u = new URL(s);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+      if (!u.hostname) return "";
       // If user omitted port on a plain LAN/Tailscale IPv4 or localhost over http, default to :18795
       if (
         u.protocol === "http:" &&
@@ -288,7 +286,7 @@
       }
       return `${u.protocol}//${u.host}${u.pathname === "/" ? "" : u.pathname}`.replace(/\/+$/, "");
     } catch (_) {
-      return s.replace(/\/+$/, "");
+      return "";
     }
   }
 
@@ -364,6 +362,13 @@
       if (parsed.selectedModel) state.selectedModel = String(parsed.selectedModel);
       if (parsed.downloadSubdir !== undefined) state.downloadSubdir = String(parsed.downloadSubdir);
       if (parsed.downloadAskFolder !== undefined) state.downloadAskFolder = Boolean(parsed.downloadAskFolder);
+      if (parsed.showExternalCli !== undefined) state.showExternalCli = Boolean(parsed.showExternalCli);
+      if (typeof parsed.filter === "string" && ["all", "mobile", "desktop", "external"].includes(parsed.filter)) {
+        state.filter = parsed.filter;
+      }
+      if (!state.showExternalCli && state.filter === "external") {
+        state.filter = "all";
+      }
     }
 
     // Optional URL theme override (?theme=dark or ?theme=light) for quick testing
@@ -385,6 +390,8 @@
       selectedModel: state.selectedModel,
       downloadSubdir: state.downloadSubdir,
       downloadAskFolder: state.downloadAskFolder,
+      showExternalCli: state.showExternalCli,
+      filter: state.filter,
     };
     const jsonStr = JSON.stringify(payload);
     try {
@@ -556,21 +563,77 @@
   function parsePairUri(rawUri) {
     const trimmed = String(rawUri || "").trim();
     if (!trimmed) return null;
+    if (!/^(agylink|https?):\/\//i.test(trimmed)) return null;
     try {
       // Support agylink://pair?u=...&t=...&n=... (or http(s)://... with query params)
-      const normalized = trimmed.startsWith("agylink://")
+      const normalized = /^agylink:\/\//i.test(trimmed)
         ? trimmed.replace(/^agylink:\/\//i, "https://")
         : trimmed;
       const parsed = new URL(normalized);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
       const q = parsed.searchParams;
       const u = (q.get("u") || q.get("url") || q.get("host") || "").trim();
       const t = (q.get("t") || q.get("token") || "").trim();
       const n = (q.get("n") || q.get("name") || "").trim();
       if (!u || !t) return null;
-      return { url: normalizeServerUrl(u), token: t, name: n };
+      if (!/^https?:\/\//i.test(u)) return null;
+      const target = new URL(u);
+      if (target.protocol !== "http:" && target.protocol !== "https:") return null;
+      if (!target.hostname) return null;
+      const normUrl = normalizeServerUrl(u);
+      if (!normUrl) return null;
+      return { url: normUrl, token: t, name: n };
     } catch (_) {
       return null;
     }
+  }
+
+  let _pendingPairConfirm = null;
+
+  function closePairConfirmDialog(cancelled = false) {
+    const dlg = $("pair-confirm-dialog");
+    if (dlg) dlg.classList.add("hidden");
+    const prev = _pendingPairConfirm;
+    _pendingPairConfirm = null;
+    if (cancelled && prev) {
+      if (prev.opts?.bannerEl) {
+        showBanner(prev.opts.bannerEl, "info", "已取消导入主机");
+      } else {
+        showToast("已取消导入主机");
+      }
+    }
+  }
+
+  function applyConfirmedPair(parsed, opts = {}) {
+    const host = upsertHost(parsed, true);
+    haptic("success");
+    if (opts.bannerEl) showBanner(opts.bannerEl, "ok", `已导入主机：${host.name}`);
+    $("settings-modal").classList.add("hidden");
+    showWorkspaceScreen();
+    activateCurrentHost();
+    showToast(`已配对并连接：${host.name}`);
+    return true;
+  }
+
+  function promptPairConfirm(parsed, opts = {}) {
+    const dlg = $("pair-confirm-dialog");
+    const displayName = parsed.name || hostDisplayFallback(parsed.url);
+    if (!dlg) {
+      const ok = window.confirm(`确认导入并切换到此主机？\n\n名称：${displayName}\n地址：${parsed.url}`);
+      if (!ok) {
+        showToast("已取消导入主机");
+        return false;
+      }
+      return applyConfirmedPair(parsed, opts);
+    }
+    _pendingPairConfirm = { parsed, opts };
+    const nameEl = $("pair-confirm-name");
+    const urlEl = $("pair-confirm-url");
+    if (nameEl) nameEl.textContent = displayName;
+    if (urlEl) urlEl.textContent = parsed.url;
+    dlg.classList.remove("hidden");
+    $("btn-pair-confirm-ok")?.focus();
+    return false;
   }
 
   function handlePairUri(rawUri, opts = {}) {
@@ -581,31 +644,30 @@
       if (/^https?:\/\//i.test(trimmed)) {
         try {
           const u = new URL(trimmed);
-          const hostAddr = `${u.protocol}//${u.host}`;
-          const wHost = $("welcome-host-input");
-          const sHost = $("add-pin-host");
-          if (wHost) wHost.value = hostAddr;
-          if (sHost) sHost.value = hostAddr;
-          showToast("已识别电脑地址，请继续输入 6 位配对码");
-          return false;
+          if (u.protocol === "http:" || u.protocol === "https:") {
+            const hostAddr = `${u.protocol}//${u.host}`;
+            const wHost = $("welcome-host-input");
+            const sHost = $("add-pin-host");
+            if (wHost) wHost.value = hostAddr;
+            if (sHost) sHost.value = hostAddr;
+            showToast("已识别电脑地址，请继续输入 6 位配对码");
+            return false;
+          }
         } catch (_) {}
       }
       if (opts.bannerEl) {
         showBanner(opts.bannerEl, "err", "配对链接格式无效，请扫描电脑 /pair 页面上的二维码");
-      } else if (opts.source === "deeplink") {
+      } else if (opts.source === "deeplink" || opts.source === "qr") {
         showToast("未识别到有效的 Antigravity 配对二维码");
       }
       return false;
     }
 
-    const host = upsertHost(parsed, true);
-    haptic("success");
-    if (opts.bannerEl) showBanner(opts.bannerEl, "ok", `已导入主机：${host.name}`);
-    $("settings-modal").classList.add("hidden");
-    showWorkspaceScreen();
-    activateCurrentHost();
-    showToast(`已自动配对：${host.name}`);
-    return true;
+    const source = opts.source || "";
+    if (source === "deeplink" || source === "qr" || source === "query") {
+      return promptPairConfirm(parsed, opts);
+    }
+    return applyConfirmedPair(parsed, opts);
   }
 
   async function pairManual(rawName, rawUrl, rawToken, bannerEl, btnEl) {
@@ -1073,23 +1135,34 @@
       refreshConversationsThrottled(400);
     } else if (ev.type === "run_canceled") {
       adoptPendingCid();
-      if (cid === state.currentCid) {
+      const matchesCurrent =
+        (cid && cid === state.currentCid) ||
+        (ev.run_id && state.currentCid === `pending-${ev.run_id}`);
+      if (matchesCurrent) {
         state.streaming = false;
         renderConversation({ preserveScroll: true });
       }
       refreshConversationsThrottled(400);
     } else if (ev.type === "run_error") {
       adoptPendingCid();
-      if (cid === state.currentCid) {
+      const matchesCurrent =
+        (cid && cid === state.currentCid) ||
+        (ev.run_id && state.currentCid === `pending-${ev.run_id}`) ||
+        (!state.currentCid && state.streaming);
+      if (matchesCurrent) {
         state.streaming = false;
+        state.streamBuffer = "";
+        state.streamTools = [];
+        const errText = String(ev.error || "未知错误");
         if (state.currentConv) {
           state.currentConv.messages.push({
             role: "assistant",
-            text: `执行发生错误：\n\`\`\`\n${ev.error || "未知错误"}\n\`\`\``,
+            text: `执行发生错误：\n\`\`\`\n${errText}\n\`\`\``,
             model: state.selectedModel,
           });
         }
         renderConversation({ preserveScroll: true });
+        showToast(`执行失败：${errText.slice(0, 80)}`);
       }
       refreshConversationsThrottled(400);
     } else if (ev.type === "desktop_update") {
@@ -1108,26 +1181,72 @@
   // 7. MARKDOWN RENDERER & FORMATTING HELPERS
   // =========================================================================
   function escHtml(s) {
-    return String(s || "")
+    return String(s ?? "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function unescHtml(s) {
+    return String(s ?? "")
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/&gt;/g, ">")
+      .replace(/&lt;/g, "<")
+      .replace(/&amp;/g, "&");
+  }
+
+  function makeRenderNonce() {
+    try {
+      if (window.crypto && window.crypto.getRandomValues) {
+        const buf = new Uint32Array(2);
+        window.crypto.getRandomValues(buf);
+        return buf[0].toString(36) + buf[1].toString(36);
+      }
+    } catch (_) {}
+    return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+  }
+
+  function applyEmphasis(str) {
+    let out = str;
+    out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+    out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    return out;
   }
 
   function renderInline(text) {
+    const nonce = makeRenderNonce();
     let s = escHtml(text);
-    // Inline code first (protect content inside backticks)
+
+    // 1. Inline code first (protect content inside backticks with per-render nonce)
     const inlineCodes = [];
     s = s.replace(/`([^`\n]+)`/g, (_, c) => {
       const idx = inlineCodes.length;
-      inlineCodes.push(`<code class="inline-code">${c}</code>`);
-      return `@@IC_${idx}@@`;
+      inlineCodes.push({ raw: "`" + c + "`", html: `<code class="inline-code">${c}</code>` });
+      return `@@IC_${nonce}_${idx}@@`;
     });
 
-    // Markdown links including file:///
-    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, lbl, href) => {
-      const cleanHref = href.replace(/&amp;/g, "&");
+    const icRe = new RegExp(`@@IC_${nonce}_(\\d+)@@`, "g");
+    const restoreIcRaw = (str) =>
+      str.replace(icRe, (_, idx) => {
+        const item = inlineCodes[Number(idx)];
+        return item ? item.raw : "";
+      });
+    const restoreIcHtml = (str) =>
+      str.replace(icRe, (_, idx) => {
+        const item = inlineCodes[Number(idx)];
+        return item ? item.html : "";
+      });
+
+    // 2. Tokenize Markdown links [text](url) into placeholders BEFORE emphasis
+    //    Never restore inline-code HTML tags inside href attributes!
+    const linkTokens = [];
+    s = s.replace(/\[([^\]]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g, (_, lbl, href) => {
+      const cleanHref = unescHtml(restoreIcRaw(href)).trim();
+      const renderedLbl = restoreIcHtml(applyEmphasis(lbl));
       if (cleanHref.startsWith("file:///")) {
         let fp = "";
         try {
@@ -1136,41 +1255,75 @@
           fp = cleanHref.replace(/^file:\/\//, "").split("#")[0];
         }
         if (/^\/[A-Za-z]:\//.test(fp)) fp = fp.slice(1);
-        return `<a href="#" class="file-link" data-filepath="${escHtml(fp)}">${lbl}</a>`;
+        const idx = linkTokens.length;
+        linkTokens.push(`<a href="#" class="file-link" data-filepath="${escHtml(fp)}">${renderedLbl}</a>`);
+        return `@@LK_${nonce}_${idx}@@`;
       }
       if (/^https?:\/\//i.test(cleanHref)) {
-        return `<a href="${escHtml(cleanHref)}" target="_blank" rel="noopener">${lbl}</a>`;
+        const idx = linkTokens.length;
+        linkTokens.push(`<a href="${escHtml(cleanHref)}" target="_blank" rel="noopener">${renderedLbl}</a>`);
+        return `@@LK_${nonce}_${idx}@@`;
       }
-      return lbl;
+      return renderedLbl;
     });
 
-    // Bold, strikethrough, italic
-    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    // 3. Tokenize bare http(s):// URLs into placeholders BEFORE emphasis
+    s = s.replace(/(^|[\s(（【\[>])(https?:\/\/[^\s<>"'\]）】]+)/gi, (m, lead, rawUrl) => {
+      let urlPart = rawUrl;
+      let trail = "";
+      while (/[.,;:!?。，；：！？]$/.test(urlPart)) {
+        trail = urlPart.slice(-1) + trail;
+        urlPart = urlPart.slice(0, -1);
+      }
+      while (urlPart.endsWith(")")) {
+        const opens = (urlPart.match(/\(/g) || []).length;
+        const closes = (urlPart.match(/\)/g) || []).length;
+        if (closes > opens) {
+          trail = ")" + trail;
+          urlPart = urlPart.slice(0, -1);
+        } else {
+          break;
+        }
+      }
+      const cleanUrl = unescHtml(restoreIcRaw(urlPart)).trim();
+      if (!/^https?:\/\/\S+$/i.test(cleanUrl)) return m;
+      const safeUrl = escHtml(cleanUrl);
+      const idx = linkTokens.length;
+      linkTokens.push(`<a href="${safeUrl}" target="_blank" rel="noopener">${safeUrl}</a>`);
+      return `${lead}@@LK_${nonce}_${idx}@@${trail}`;
+    });
 
-    // Restore inline code
-    s = s.replace(/@@IC_(\d+)@@/g, (_, idx) => inlineCodes[Number(idx)] || "");
+    // 4. Bold, strikethrough, italic (cannot corrupt tokenized URLs or inline code)
+    s = applyEmphasis(s);
+
+    // 5. Restore inline code FIRST, then links (so inline code can never touch <a> attributes)
+    s = restoreIcHtml(s);
+    const lkRe = new RegExp(`@@LK_${nonce}_(\\d+)@@`, "g");
+    s = s.replace(lkRe, (_, idx) => linkTokens[Number(idx)] || "");
     return s;
   }
 
   function renderMarkdown(md) {
+    const nonce = makeRenderNonce();
     const src = String(md || "").replace(/\r\n/g, "\n");
     const blocks = [];
     const codeTokens = [];
 
-    // Extract fenced code blocks (supports both closed and trailing open fence while streaming)
-    let stripped = src.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    // Extract fenced code blocks (supports c#, c++, trailing spaces, and streaming open fences)
+    let stripped = src.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_, rawLang, code) => {
       const idx = codeTokens.length;
-      codeTokens.push({ lang: lang || "code", code: code.replace(/\n$/, "") });
-      return `\n@@CODEBLOCK_${idx}@@\n`;
+      const lang = String(rawLang || "").trim().slice(0, 32) || "code";
+      codeTokens.push({ lang, code: code.replace(/\n$/, "") });
+      return `\n@@CB_${nonce}_${idx}@@\n`;
     });
-    stripped = stripped.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]+)$/, (_, lang, code) => {
+    stripped = stripped.replace(/```([^\n`]*)\n([\s\S]+)$/, (_, rawLang, code) => {
       const idx = codeTokens.length;
-      codeTokens.push({ lang: lang || "code", code: code.replace(/\n$/, "") });
-      return `\n@@CODEBLOCK_${idx}@@\n`;
+      const lang = String(rawLang || "").trim().slice(0, 32) || "code";
+      codeTokens.push({ lang, code: code.replace(/\n$/, "") });
+      return `\n@@CB_${nonce}_${idx}@@\n`;
     });
 
+    const codeLineRe = new RegExp(`^@@CB_${nonce}_(\\d+)@@$`);
     const lines = stripped.split("\n");
     let i = 0;
     while (i < lines.length) {
@@ -1178,18 +1331,20 @@
       const trim = ln.trim();
       if (!trim) { i++; continue; }
 
-      const mCode = trim.match(/^@@CODEBLOCK_(\d+)@@$/);
+      const mCode = trim.match(codeLineRe);
       if (mCode) {
         const cb = codeTokens[Number(mCode[1])];
-        blocks.push(
-          `<div class="code-block">` +
-            `<div class="code-head"><span>${escHtml(cb.lang)}</span>` +
-            `<button class="code-copy-btn" type="button" data-copy="${encodeURIComponent(cb.code)}">复制</button></div>` +
-            `<pre><code>${escHtml(cb.code)}</code></pre>` +
-          `</div>`
-        );
-        i++;
-        continue;
+        if (cb) {
+          blocks.push(
+            `<div class="code-block">` +
+              `<div class="code-head"><span>${escHtml(cb.lang)}</span>` +
+              `<button class="code-copy-btn" type="button" data-copy="${encodeURIComponent(cb.code)}">复制</button></div>` +
+              `<pre><code>${escHtml(cb.code)}</code></pre>` +
+            `</div>`
+          );
+          i++;
+          continue;
+        }
       }
 
       if (/^---+$/.test(trim) || /^\*\*\*+$/.test(trim)) {
@@ -1198,7 +1353,7 @@
         continue;
       }
 
-      const mH = trim.match(/^(#{1,4})\s+(.+)$/);
+      const mH = trim.match(/^(#{1,6})\s+(.+)$/);
       if (mH) {
         const lvl = mH[1].length;
         blocks.push(`<h${lvl}>${renderInline(mH[2])}</h${lvl}>`);
@@ -1259,8 +1414,8 @@
       while (
         i < lines.length &&
         lines[i].trim() &&
-        !/^@@CODEBLOCK_\d+@@$/.test(lines[i].trim()) &&
-        !/^(#{1,4}\s+|[-*•]\s+|\d+\.\s+|>\s|---+$|\*\*\*+$)/.test(lines[i].trim())
+        !codeLineRe.test(lines[i].trim()) &&
+        !/^(#{1,6}\s+|[-*•]\s+|\d+\.\s+|>\s|---+$|\*\*\*+$)/.test(lines[i].trim())
       ) {
         pLines.push(lines[i]);
         i++;
@@ -1599,10 +1754,34 @@
     }, wait);
   }
 
+  function syncFilterUi() {
+    if (!state.showExternalCli && state.filter === "external") {
+      state.filter = "all";
+    }
+    const extPill = $("filter-pill-external");
+    if (extPill) {
+      extPill.classList.toggle("hidden", !state.showExternalCli);
+    }
+    document.querySelectorAll("#conv-filter-bar [data-filter]").forEach((btn) => {
+      const isAct = btn.dataset.filter === state.filter;
+      btn.classList.toggle("active", isAct);
+      btn.setAttribute("aria-selected", String(isAct));
+    });
+    document.querySelectorAll(".ext-cli-opt[data-ext-cli]").forEach((btn) => {
+      btn.classList.toggle("active", (btn.dataset.extCli === "on") === Boolean(state.showExternalCli));
+    });
+  }
+
   async function refreshConversations() {
     _lastRefreshConvsAt = Date.now();
+    const reqFilter = state.filter || "all";
+    const reqExt = Boolean(state.showExternalCli);
     try {
-      const data = await apiFetch("/api/conversations?limit=80");
+      const qs = `limit=80&source=${encodeURIComponent(reqFilter)}&include_external_cli=${reqExt ? "1" : "0"}`;
+      const data = await apiFetch(`/api/conversations?${qs}`);
+      if (reqFilter !== (state.filter || "all") || reqExt !== Boolean(state.showExternalCli)) {
+        return;
+      }
       state.conversations = data.conversations || [];
       renderConvList();
       const anyRunning = state.conversations.some((c) => c.status === "running");
@@ -1629,7 +1808,16 @@
     el.innerHTML = filtered
       .map((c) => {
         const act = c.id === state.currentCid ? "active" : "";
-        const badge = c.status === "running" ? `<span class="ci-badge run">运行中</span>` : "";
+        let badge = "";
+        if (c.status === "running") {
+          badge = `<span class="ci-badge run">运行中</span>`;
+        } else if (c.source === "external") {
+          badge = `<span class="ci-badge ext">外部</span>`;
+        } else if (c.source === "mobile") {
+          badge = `<span class="ci-badge mob">移动</span>`;
+        } else if (c.hasMobile && c.source === "desktop") {
+          badge = `<span class="ci-badge sync">同步</span>`;
+        }
         const draft = state.drafts[c.id];
         let prevHtml = escHtml(c.preview || c.shortId);
         if (hasDraftContent(draft)) {
@@ -1752,7 +1940,8 @@
     const prevAttachments = state.attachments.slice();
     const attPaths = prevAttachments.map((a) => a.path);
 
-    if (!state.currentConv) {
+    const createdNewConv = !state.currentConv;
+    if (createdNewConv) {
       state.currentConv = {
         id: "",
         title: text.slice(0, 36) || (prevAttachments[0]?.name || "新对话"),
@@ -1761,12 +1950,14 @@
         deliverables: [],
       };
     }
-    state.currentConv.messages.push({
+    const targetConv = state.currentConv;
+    const optimisticMsg = {
       role: "user",
       text: text,
       attachments: prevAttachments,
       time: new Date().toISOString(),
-    });
+    };
+    targetConv.messages.push(optimisticMsg);
     delete state.drafts[sendDraftKey];
     persistHostDrafts();
     inp.value = "";
@@ -1774,7 +1965,7 @@
     state.attachments = [];
     renderAttachTray();
 
-    state.openConvSeq += 1;
+    const sendSeq = ++state.openConvSeq;
     state.streaming = true;
     state.streamBuffer = "";
     state.streamTools = [];
@@ -1791,11 +1982,30 @@
           swarm_mode: state.swarmMode,
         }),
       });
-      state.currentCid = res.conversation_id;
-      if (state.currentConv) state.currentConv.id = res.conversation_id;
+      if (sendSeq === state.openConvSeq) {
+        const nextCid = res.conversation_id;
+        if (
+          nextCid &&
+          !(String(nextCid).startsWith("pending-") && state.currentCid && !state.currentCid.startsWith("pending-"))
+        ) {
+          state.currentCid = nextCid;
+          if (state.currentConv) state.currentConv.id = nextCid;
+        }
+      }
       refreshConversations();
     } catch (e) {
-      state.streaming = false;
+      const msgIdx = targetConv.messages.lastIndexOf(optimisticMsg);
+      if (msgIdx !== -1) {
+        targetConv.messages.splice(msgIdx, 1);
+      }
+      if (sendSeq === state.openConvSeq) {
+        state.streaming = false;
+        state.streamBuffer = "";
+        state.streamTools = [];
+        if (createdNewConv && targetConv.messages.length === 0) {
+          state.currentConv = null;
+        }
+      }
       if (currentDraftKey() === sendDraftKey) {
         inp.value = rawText;
         resizePromptInput();
@@ -1806,7 +2016,11 @@
         state.drafts[sendDraftKey] = { text: rawText, attachments: prevAttachments };
         persistHostDrafts();
       }
-      updateSendButton();
+      if (sendSeq === state.openConvSeq) {
+        renderConversation({ preserveScroll: true });
+      } else {
+        updateSendButton();
+      }
       showToast(`发送失败：${e.message}`);
     }
   }
@@ -2115,21 +2329,33 @@
     closeAllSheets();
     haptic("light");
 
+    let succeeded = 0;
+    let lastSucceededName = "";
     for (let i = 0; i < picked.length; i++) {
       const p = picked[i];
       showToast(picked.length > 1 ? `正在上传原图 (${i + 1}/${picked.length})...` : `正在上传原图 ${p.name}...`);
       try {
         const res = await uploadNativeMediaPhoto(p);
         appendUploadedAttachment(res, targetKey);
+        succeeded += 1;
+        lastSucceededName = p.name || "";
         haptic("light");
       } catch (err) {
         showToast(`上传 ${p.name} 失败：${err.message}`);
       }
     }
-    if (picked.length > 1) {
-      showToast(`已添加 ${picked.length} 张无损原图`);
-    } else if (picked.length === 1) {
-      showToast(`已添加无损原图 ${picked[0].name}`);
+    if (succeeded > 1) {
+      showToast(
+        succeeded === picked.length
+          ? `已添加 ${succeeded} 张无损原图`
+          : `已添加 ${succeeded}/${picked.length} 张无损原图`
+      );
+    } else if (succeeded === 1) {
+      showToast(
+        picked.length === 1
+          ? `已添加无损原图 ${lastSucceededName}`
+          : `已添加 1/${picked.length} 张无损原图`
+      );
     }
   }
 
@@ -2181,7 +2407,7 @@
     $("preview-modal").classList.remove("hidden");
 
     const ext = (path.split(".").pop() || "").toLowerCase();
-    if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg"].includes(ext)) {
+    if (["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext)) {
       const imgUrl = `${host.url}/api/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`;
       $("preview-body").innerHTML = `<img src="${escHtml(imgUrl)}" alt="${escHtml(name || "")}" />`;
       return;
@@ -2189,7 +2415,10 @@
 
     try {
       const data = await apiFetch(`/api/files/preview?path=${encodeURIComponent(path)}`);
-      if (data.binary) {
+      if (typeof Response !== "undefined" && data instanceof Response) {
+        const txt = await data.text();
+        $("preview-body").innerHTML = `<pre>${escHtml(txt.slice(0, 65536) || "(空文件)")}</pre>`;
+      } else if (data.binary) {
         $("preview-body").innerHTML = `<div class="m3-card"><p class="info-text">该文件为二进制格式（${formatSize(data.size)}），请点击右上角「下载」保存到手机查看。</p></div>`;
       } else {
         $("preview-body").innerHTML = `<pre>${escHtml(data.content || "(空文件)")}</pre>`;
@@ -2278,7 +2507,7 @@
           </div>
           <div class="stat-box">
             <div class="stat-k">DeepSeek 余额</div>
-            <div class="stat-v">¥${d.deepseek_cny ?? "--"}</div>
+            <div class="stat-v">¥${escHtml(d.deepseek_cny ?? "--")}</div>
           </div>
           <div class="stat-box">
             <div class="stat-k">群聊模型</div>
@@ -2286,7 +2515,7 @@
           </div>
           <div class="stat-box">
             <div class="stat-k">累计调用</div>
-            <div class="stat-v">${d.total_calls || 0} 次</div>
+            <div class="stat-v">${escHtml(d.total_calls ?? 0)} 次</div>
           </div>
         </div>
         <div class="m3-card">
@@ -2295,9 +2524,9 @@
             ${quickModels
               .map(
                 (m) => `
-              <button class="m-option qq-sw-btn ${m === d.group_chat_model ? "selected" : ""}" type="button" data-qmodel="${m}">
-                <span class="ml">${shortModelLabel(m)}</span>
-                <span class="md">${m}</span>
+              <button class="m-option qq-sw-btn ${m === d.group_chat_model ? "selected" : ""}" type="button" data-qmodel="${escHtml(m)}">
+                <span class="ml">${escHtml(shortModelLabel(m))}</span>
+                <span class="md">${escHtml(m)}</span>
               </button>`
               )
               .join("")}
@@ -2348,6 +2577,7 @@
     closeAllSheets();
     renderSettingsHosts();
     syncDownloadSettingsUi();
+    syncFilterUi();
     $("settings-open-qqbot")?.classList.toggle("hidden", !state.qqbotAvailable);
     showBanner($("settings-hosts-msg"), "", "");
     showBanner($("settings-add-msg"), "", "");
@@ -2478,10 +2708,39 @@
 
     $("btn-host-sheet-add").addEventListener("click", openSettingsModal);
 
-    // --- Conversation Search & Foreground Visibility Sync ---
+    // --- Conversation Search, Source Filter Bar & Foreground Visibility Sync ---
     $("conv-search").addEventListener("input", (e) => {
       state.search = e.target.value;
       renderConvList();
+    });
+
+    $("conv-filter-bar")?.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-filter]");
+      if (!btn) return;
+      const nextFilter = btn.dataset.filter;
+      if (!["all", "mobile", "desktop", "external"].includes(nextFilter)) return;
+      if (nextFilter === "external" && !state.showExternalCli) return;
+      if (nextFilter === state.filter) return;
+      haptic("light");
+      state.filter = nextFilter;
+      persistConfig();
+      syncFilterUi();
+      refreshConversations();
+    });
+
+    // --- Host Pair Import Confirmation Dialog ---
+    $("btn-pair-confirm-cancel")?.addEventListener("click", () => closePairConfirmDialog(true));
+    $("btn-pair-confirm-ok")?.addEventListener("click", () => {
+      const pending = _pendingPairConfirm;
+      closePairConfirmDialog(false);
+      if (pending) {
+        applyConfirmedPair(pending.parsed, pending.opts);
+      }
+    });
+    $("pair-confirm-dialog")?.addEventListener("click", (e) => {
+      if (e.target === $("pair-confirm-dialog")) {
+        closePairConfirmDialog(true);
+      }
     });
 
     document.addEventListener("visibilitychange", () => {
@@ -2660,6 +2919,12 @@
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
+        const confirmDlg = $("pair-confirm-dialog");
+        if (confirmDlg && !confirmDlg.classList.contains("hidden")) {
+          closePairConfirmDialog(true);
+          e.preventDefault();
+          return;
+        }
         for (const mid of ["preview-modal", "pair-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
           const el = $(mid);
           if (el && !el.classList.contains("hidden")) {
@@ -2825,6 +3090,25 @@
       });
     });
 
+    document.querySelectorAll(".ext-cli-opt[data-ext-cli]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const nextShow = btn.dataset.extCli === "on";
+        haptic("light");
+        state.showExternalCli = nextShow;
+        if (!state.showExternalCli && state.filter === "external") {
+          state.filter = "all";
+        }
+        persistConfig();
+        syncFilterUi();
+        refreshConversations();
+        showToast(
+          nextShow
+            ? "已开启：侧栏可查看「外部/QQ」独立会话"
+            : "已关闭：侧栏仅显示桌面端与手机/工作台会话"
+        );
+      });
+    });
+
     document.querySelectorAll("[data-add-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const tab = btn.dataset.addTab;
@@ -2905,27 +3189,34 @@
     try {
       const nativeUri = window.AndroidBridge?.getInitialPairUri?.();
       if (nativeUri && String(nativeUri).trim()) {
-        return handlePairUri(String(nativeUri), { source: "deeplink" });
+        handlePairUri(String(nativeUri), { source: "deeplink" });
+        return false;
       }
     } catch (_) {}
+
+    // Never auto-import hosts from URL query params on Desktop localhost workbench
+    if (isLocalDesktopBrowser()) {
+      return false;
+    }
 
     // 2. Browser URL query (?pair=agylink://... or ?u=...&t=...)
     try {
       const qs = new URLSearchParams(location.search);
       const qPair = qs.get("pair");
       if (qPair) {
-        const ok = handlePairUri(qPair, { source: "query" });
-        if (ok && history.replaceState) {
+        if (history.replaceState) {
           history.replaceState(null, "", location.pathname);
         }
-        return ok;
+        handlePairUri(qPair, { source: "query" });
+        return false;
       }
       if (qs.get("u") && qs.get("t")) {
-        const ok = handlePairUri(location.href, { source: "query" });
-        if (ok && history.replaceState) {
+        const hrefSnapshot = location.href;
+        if (history.replaceState) {
           history.replaceState(null, "", location.pathname);
         }
-        return ok;
+        handlePairUri(hrefSnapshot, { source: "query" });
+        return false;
       }
     } catch (_) {}
 
@@ -2936,7 +3227,7 @@
     if (window.AndroidBridge) return false;
     if (location.protocol !== "http:") return false;
     const h = String(location.hostname || "").toLowerCase();
-    return h === "127.0.0.1" || h === "localhost" || h === "::1";
+    return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]";
   }
 
   async function tryLocalAutoBootstrap() {
@@ -2984,6 +3275,7 @@
       state.themePref = "dark";
     }
     applyTheme(state.themePref, false);
+    syncFilterUi();
     updateModelPill();
     bindEvents();
 

@@ -7,7 +7,7 @@ if defined AGY_MOBILE_PORT set "PORT_NUM=%AGY_MOBILE_PORT%"
 set "TARGET_URL=http://127.0.0.1:%PORT_NUM%/%~1"
 set "HEALTH_URL=http://127.0.0.1:%PORT_NUM%/health"
 
-powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri $env:HEALTH_URL -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
+powershell -NoProfile -Command "[System.Net.WebRequest]::DefaultWebProxy = $null; try { $r = Invoke-WebRequest -UseBasicParsing -Uri $env:HEALTH_URL -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
 if %errorlevel%==0 goto :open_app
 
 set "PY_EXE="
@@ -42,16 +42,21 @@ exit /b 1
 set "AGY_LAUNCH_PY=%PY_EXE%"
 set "AGY_LAUNCH_SERVER=%SERVER_PY%"
 set "AGY_LAUNCH_CWD=%PROJ_DIR%"
-powershell -NoProfile -Command "$q = [char]34; $cmd = $q + $env:AGY_LAUNCH_PY + $q + ' ' + $q + $env:AGY_LAUNCH_SERVER + $q; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; CurrentDirectory = $env:AGY_LAUNCH_CWD } | Out-Null"
+set "AGY_MOBILE_PORT=%PORT_NUM%"
+powershell -NoProfile -Command "$q = [char]34; Start-Process -FilePath $env:AGY_LAUNCH_PY -ArgumentList ($q + $env:AGY_LAUNCH_SERVER + $q) -WorkingDirectory $env:AGY_LAUNCH_CWD -WindowStyle Hidden"
 
 set /a WAIT_TRY=0
 :wait_health
 set /a WAIT_TRY+=1
-powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri $env:HEALTH_URL -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
+powershell -NoProfile -Command "[System.Net.WebRequest]::DefaultWebProxy = $null; try { $r = Invoke-WebRequest -UseBasicParsing -Uri $env:HEALTH_URL -TimeoutSec 1; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"
 if %errorlevel%==0 goto :open_app
-if %WAIT_TRY% GEQ 20 goto :open_app
+if %WAIT_TRY% GEQ 20 goto :start_timeout
 ping -n 2 127.0.0.1 >nul
 goto :wait_health
+
+:start_timeout
+powershell -NoProfile -Command "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('Antigravity backend server failed to respond on port ' + $env:PORT_NUM + '. Run start_link_server.bat to inspect startup logs.', 'Antigravity Workbench', 'OK', 'Error') | Out-Null"
+exit /b 1
 
 :open_app
 set "BROWSER_EXE="

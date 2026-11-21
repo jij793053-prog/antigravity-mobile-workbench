@@ -93,7 +93,7 @@ public class QrScannerActivity extends Activity {
     private int previewH = 720;
     private int cameraDisplayOrientation = 90;
     private boolean hasTorch = false;
-    private boolean torchOn = false;
+    private volatile boolean torchOn = false;
 
     private HandlerThread workerThread;
     private Handler workerHandler;
@@ -123,6 +123,8 @@ public class QrScannerActivity extends Activity {
     protected void onResume() {
         super.onResume();
         isResumed.set(true);
+        torchOn = false;
+        updateTorchButtonStyle();
         try {
             startThreads();
             if (activeHolder != null && activeHolder.getSurface() != null && activeHolder.getSurface().isValid()) {
@@ -136,6 +138,8 @@ public class QrScannerActivity extends Activity {
     @Override
     protected void onPause() {
         isResumed.set(false);
+        torchOn = false;
+        updateTorchButtonStyle();
         releaseCameraSync();
         stopThreads();
         super.onPause();
@@ -647,6 +651,7 @@ public class QrScannerActivity extends Activity {
             try {
                 if (activity.torchBtn != null) {
                     activity.torchBtn.setVisibility(showTorch ? View.VISIBLE : View.INVISIBLE);
+                    activity.updateTorchButtonStyle();
                 }
                 if (activity.statusBanner != null) {
                     activity.statusBanner.setVisibility(View.GONE);
