@@ -51,6 +51,8 @@
 
     currentDir: "",
     previewFile: null,
+    usageData: null,
+    usageWindow: "5h",
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -149,7 +151,7 @@
       closePairConfirmDialog(true);
       return true;
     }
-    for (const mid of ["preview-modal", "pair-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
+    for (const mid of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
       const el = $(mid);
       if (el && !el.classList.contains("hidden")) {
         el.classList.add("hidden");
@@ -1165,6 +1167,15 @@
         showToast(`执行失败：${errText.slice(0, 80)}`);
       }
       refreshConversationsThrottled(400);
+    } else if (ev.type === "tunnel_status" && ev.tunnel) {
+      if (isLocalDesktopBrowser()) {
+        const ts = String(ev.tunnel.status || "");
+        if (ts === "reconnecting") {
+          showToast("检测到公网隧道断连，后台正在自动自愈重连...");
+        } else if (ts === "online" && ev.tunnel.url) {
+          showToast("公网隧道已恢复在线，可点右上角「供手机扫码」刷新二维码");
+        }
+      }
     } else if (ev.type === "desktop_update") {
       const aliasedCid = ev.aliased_cid || "";
       const matchesCurrent = Boolean(state.currentCid) && (
@@ -2486,6 +2497,211 @@
     window.open(url, "_blank", "noopener");
   }
 
+  function fmtTokens(n) {
+    const v = Number(n) || 0;
+    if (v >= 1e8) return `${(v / 1e8).toFixed(2)} 亿`;
+    if (v >= 1e4) return `${(v / 1e4).toFixed(1)} 万`;
+    if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+    return String(Math.round(v));
+  }
+
+  function fmtLocalTime(isoStr) {
+    if (!isoStr) return "";
+    try {
+      const d = new Date(isoStr);
+      if (isNaN(d.getTime())) return "";
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      return `${hh}:${mm}`;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function openUsageModal() {
+    closeDrawer();
+    $("settings-modal")?.classList.add("hidden");
+    $("usage-modal")?.classList.remove("hidden");
+    loadUsageData();
+  }
+
+  async function loadUsageData() {
+    const body = $("usage-body");
+    if (!body) return;
+    body.innerHTML = `<div class="empty-placeholder">正在核算本机对话日志用量...</div>`;
+    try {
+      const qs = state.currentCid ? `?cid=${encodeURIComponent(state.currentCid)}` : "";
+      const data = await apiFetch(`/api/usage${qs}`);
+      state.usageData = data;
+      const sub = $("usage-subtitle");
+      if (sub) {
+        const cnt = Number(data.scanned_conversations || 0);
+        const tStr = fmtLocalTime(data.generated_at);
+        sub.textContent = `已核算近 7 天 ${cnt} 个会话 · 更新于 ${tStr || "刚刚"}`;
+      }
+      renderUsageView();
+    } catch (e) {
+      body.innerHTML = `<div class="m3-card"><p class="info-text">查询用量失败：${escHtml(e.message || "未知错误")}</p></div>`;
+    }
+  }
+
+  function renderUsageView() {
+    const body = $("usage-body");
+    const data = state.usageData;
+    if (!body || !data) return;
+
+    const win = state.usageWindow || "5h";
+    document.querySelectorAll("[data-usage-win]").forEach((btn) => {
+      const active = btn.dataset.usageWin === win;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+    });
+
+    const bucket =
+      win === "5h"
+        ? data.window_5h
+        : win === "24h"
+        ? data.window_24h
+        : win === "7d"
+        ? data.window_7d
+        : data.current_conversation;
+
+    const parts = [];
+
+    // Optional user-configured external quota percentages (empty by default)
+    if (data.external_quota && Array.isArray(data.external_quota.pools) && data.external_quota.pools.length) {
+      const extRows = data.external_quota.pools
+        .map((p) => {
+          const pct = p.remaining_pct !== null && p.remaining_pct !== undefined ? Math.max(0, Math.min(100, Number(p.remaining_pct))) : null;
+          const barCls = pct === null ? "" : pct <= 20 ? "low" : pct <= 50 ? "warn" : "ok";
+          const pctTxt = pct !== null ? `剩余 ${pct.toFixed(1)}%` : "--";
+          const rst = p.reset_at ? ` · 重置 ${escHtml(p.reset_at)}` : "";
+          const note = p.note ? ` · ${escHtml(p.note)}` : "";
+          return `
+            <div class="usage-pool-row">
+              <div class="usage-pool-top">
+                <span class="usage-pool-name">${escHtml(p.name || "模型池")}</span>
+                <span class="usage-pool-meta">${pctTxt}${rst}${note}</span>
+              </div>
+              <div class="usage-bar-track"><div class="usage-bar-fill ${barCls}" style="width:${pct !== null ? pct : 0}%"></div></div>
+            </div>`;
+        })
+        .join("");
+      parts.push(`
+        <div class="m3-card">
+          <div class="section-heading">云端参考额度（${escHtml(data.external_quota.source || "自定义桥接")}）</div>
+          <div class="usage-pool-list">${extRows}</div>
+        </div>`);
+    }
+
+    if (!bucket) {
+      parts.push(`<div class="m3-card"><div class="empty-placeholder">${win === "conv" ? "请先打开一个会话再查看「当前会话」统计" : "该时间窗口内暂无 Token 消耗记录"}</div></div>`);
+      body.innerHTML = parts.join("");
+      return;
+    }
+
+    const totalTok = Number(bucket.total_tokens || 0);
+    const inTok = Number(bucket.input_tokens || 0);
+    const caTok = Number(bucket.cache_read_tokens || 0);
+    const outTok = Number(bucket.output_tokens || 0);
+    const steps = Number(bucket.steps || 0);
+    const hitPct = Number(bucket.cache_hit_pct || 0);
+    const reliefTxt = win === "5h" && bucket.relief_at ? ` · 最早批次预计 ${fmtLocalTime(bucket.relief_at)} 滑出 5h 窗口` : "";
+
+    parts.push(`
+      <div class="stat-grid">
+        <div class="stat-box">
+          <div class="stat-k">总 Token 消耗</div>
+          <div class="stat-v">${escHtml(fmtTokens(totalTok))}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-k">缓存命中率</div>
+          <div class="stat-v" style="color:var(--md-success)">${hitPct.toFixed(1)}%</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-k">模型推理步数${win === "conv" && bucket.turns ? " / 轮次" : ""}</div>
+          <div class="stat-v">${steps} 步${win === "conv" && bucket.turns ? ` · ${bucket.turns} 轮` : ""}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-k">净输入 / 输出</div>
+          <div class="stat-v" style="font-size:13.5px">${escHtml(fmtTokens(inTok))} / ${escHtml(fmtTokens(outTok))}</div>
+        </div>
+      </div>`);
+
+    const pools = Array.isArray(bucket.pools) ? bucket.pools : [];
+    if (pools.length) {
+      const poolHtml = pools
+        .map((p) => {
+          const share = Math.max(2, Math.min(100, Number(p.share_pct || 0)));
+          return `
+            <div class="usage-pool-row">
+              <div class="usage-pool-top">
+                <span class="usage-pool-name">${escHtml(p.label || p.id)}</span>
+                <span class="usage-pool-meta">${escHtml(fmtTokens(p.total_tokens))} · ${Number(p.steps || 0)} 步 · 缓存 ${Number(p.cache_hit_pct || 0).toFixed(0)}%</span>
+              </div>
+              <div class="usage-bar-track"><div class="usage-bar-fill" style="width:${share}%"></div></div>
+            </div>`;
+        })
+        .join("");
+      parts.push(`
+        <div class="m3-card">
+          <div class="section-heading">分模型池消耗明细</div>
+          <div class="usage-pool-list">${poolHtml}</div>
+        </div>`);
+    } else {
+      parts.push(`<div class="m3-card"><div class="empty-placeholder">该周期内暂无模型调用记录</div></div>`);
+    }
+
+    if (win === "7d" && Array.isArray(bucket.daily) && bucket.daily.length) {
+      const maxDay = Math.max(1, ...bucket.daily.map((d) => Number(d.total_tokens || 0)));
+      const cols = bucket.daily
+        .map((d) => {
+          const v = Number(d.total_tokens || 0);
+          const pct = v > 0 ? Math.max(6, Math.round((v * 100) / maxDay)) : 0;
+          return `
+            <div class="usage-daily-col" title="${escHtml(d.date)}: ${escHtml(fmtTokens(v))} (${Number(d.steps || 0)} 步)">
+              <span class="usage-daily-val">${v > 0 ? escHtml(fmtTokens(v)) : "0"}</span>
+              <div class="usage-daily-bar-wrap"><div class="usage-daily-bar" style="height:${pct}%"></div></div>
+              <span class="usage-daily-lbl">${escHtml(d.date)}</span>
+            </div>`;
+        })
+        .join("");
+      parts.push(`
+        <div class="m3-card">
+          <div class="section-heading">近 7 天每日趋势</div>
+          <div class="usage-daily-chart">${cols}</div>
+        </div>`);
+    }
+
+    const models = Array.isArray(bucket.models) ? bucket.models : [];
+    if (models.length) {
+      const chips = models
+        .map(
+          (m) => `
+          <span class="usage-model-chip">
+            <strong>${escHtml(shortModelLabel(m.model))}</strong>
+            <span class="m-sub">${escHtml(fmtTokens(m.total_tokens))} · ${Number(m.steps || 0)}步</span>
+          </span>`
+        )
+        .join("");
+      parts.push(`
+        <div class="m3-card">
+          <div class="section-heading">具体模型调用分布</div>
+          <div class="usage-model-chips">${chips}</div>
+        </div>`);
+    }
+
+    parts.push(`
+      <div class="m3-card tonal-info-card">
+        <p class="info-text">
+          统计口径：汇总本机官方桌面端（<code>antigravity/brain</code>）与 CLI（<code>antigravity-cli/brain</code>）完整对话日志（缓存读取 ${escHtml(fmtTokens(caTok))}${reliefTxt}）。<br />
+          谷歌官方 CLI 暂未提供云端剩余百分比接口；如需接入自定义额度桥接，可在服务端环境变量设置 <code>AGY_QUOTA_API_URL</code>。
+        </p>
+      </div>`);
+
+    body.innerHTML = parts.join("");
+  }
+
   async function loadQqBotStatus() {
     const body = $("qqbot-body");
     body.innerHTML = `<div class="empty-placeholder">正在查询本机 QQ Bot 状态...</div>`;
@@ -2925,7 +3141,7 @@
           e.preventDefault();
           return;
         }
-        for (const mid of ["preview-modal", "pair-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
+        for (const mid of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
           const el = $(mid);
           if (el && !el.classList.contains("hidden")) {
             el.classList.add("hidden");
@@ -2935,7 +3151,16 @@
         }
       }
     });
+    $("nav-usage")?.addEventListener("click", openUsageModal);
     $("nav-settings")?.addEventListener("click", openSettingsModal);
+    $("btn-usage-refresh")?.addEventListener("click", loadUsageData);
+    document.querySelectorAll("[data-usage-win]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        haptic("light");
+        state.usageWindow = btn.dataset.usageWin || "5h";
+        renderUsageView();
+      });
+    });
 
     // --- Desktop Drag & Drop Lossless File/Image Upload + Ctrl+V Paste ---
     const dropOverlay = $("drop-overlay");
@@ -3003,6 +3228,8 @@
         uploadFiles(pastedFiles);
       }
     });
+
+    $("settings-open-usage")?.addEventListener("click", openUsageModal);
 
     $("settings-open-files")?.addEventListener("click", () => {
       $("settings-modal").classList.add("hidden");

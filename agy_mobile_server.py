@@ -31,6 +31,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -39,7 +40,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -211,9 +212,19 @@ _TUNNEL_STATE: dict[str, Any] = {
     "error": "",
     "bin": "",
     "started_at": 0.0,
+    "metrics_port": 0,
+    "ready_connections": 0,
+    "last_healthy_at": 0.0,
+    "unhealthy_streak": 0,
+    "auto_heals": 0,
+    "last_heal_at": 0.0,
     "proc": None,
 }
 _CF_QUICK_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+_USAGE_CACHE_LOCK = threading.Lock()
+_USAGE_FILE_CACHE: dict[str, tuple[int, int, list[tuple[float, str, int, int, int]], int]] = {}
+_USAGE_CACHE_MAX = 512
 
 
 # ---------------------------------------------------------------------------
@@ -1184,6 +1195,38 @@ def _find_cloudflared_bin() -> str:
     return str(shutil.which("cloudflared") or shutil.which("cloudflared.exe") or "")
 
 
+def _pick_free_loopback_port() -> int:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return int(s.getsockname()[1])
+    except Exception:
+        return 0
+
+
+def _probe_cloudflared_ready(metrics_port: int) -> tuple[bool, int]:
+    """Query cloudflared's documented local --metrics /ready endpoint (never via proxy)."""
+    if metrics_port <= 0:
+        return False, 0
+    url = f"http://127.0.0.1:{metrics_port}/ready"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with _DIRECT_OPENER.open(req, timeout=2.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw) if raw.strip().startswith("{") else {}
+            cnt = int(data.get("readyConnections") or 0)
+            return (resp.status == 200 and cnt >= 1), cnt
+    except urllib.error.HTTPError as he:
+        try:
+            raw = he.read().decode("utf-8", errors="replace")
+            data = json.loads(raw) if raw.strip().startswith("{") else {}
+            return False, int(data.get("readyConnections") or 0)
+        except Exception:
+            return False, 0
+    except Exception:
+        return False, 0
+
+
 def get_tunnel_snapshot() -> dict[str, Any]:
     with _TUNNEL_LOCK:
         return {
@@ -1194,6 +1237,9 @@ def get_tunnel_snapshot() -> dict[str, Any]:
             "error": str(_TUNNEL_STATE.get("error") or ""),
             "bin": str(_TUNNEL_STATE.get("bin") or ""),
             "started_at": float(_TUNNEL_STATE.get("started_at") or 0.0),
+            "ready_connections": int(_TUNNEL_STATE.get("ready_connections") or 0),
+            "last_healthy_at": float(_TUNNEL_STATE.get("last_healthy_at") or 0.0),
+            "auto_heals": int(_TUNNEL_STATE.get("auto_heals") or 0),
         }
 
 
@@ -1298,13 +1344,15 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
     def _runner(my_stop_evt: threading.Event, gen_id: int) -> None:
         while not my_stop_evt.is_set():
             proc_env = dict(os.environ)
+            metrics_port = _pick_free_loopback_port()
+            metrics_args = ["--metrics", f"127.0.0.1:{metrics_port}"] if metrics_port > 0 else []
             if mode == "named":
                 # Pass secret via TUNNEL_TOKEN env var instead of --token CLI argv
                 proc_env["TUNNEL_TOKEN"] = named_token
-                cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "run"]
+                cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", *metrics_args, "run"]
             else:
                 proc_env.pop("TUNNEL_TOKEN", None)
-                cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "--url", f"http://127.0.0.1:{PORT}"]
+                cmd = [cf_bin, "tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", *metrics_args, "--url", f"http://127.0.0.1:{PORT}"]
             last_lines: collections.deque[str] = collections.deque(maxlen=8)
             proc = None
             try:
@@ -1327,6 +1375,10 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                             pass
                         break
                     _TUNNEL_STATE["proc"] = proc
+                    _TUNNEL_STATE["metrics_port"] = metrics_port
+                    _TUNNEL_STATE["ready_connections"] = 0
+                    _TUNNEL_STATE["unhealthy_streak"] = 0
+                    _TUNNEL_STATE["started_at"] = time.time()
                     if mode != "named":
                         _TUNNEL_STATE["status"] = "starting"
                         _TUNNEL_STATE["url"] = ""
@@ -1356,10 +1408,18 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                             if _TUNNEL_GEN == gen_id and not my_stop_evt.is_set():
                                 if mode == "named" and named_url:
                                     _TUNNEL_STATE["url"] = named_url
+                                _TUNNEL_STATE["ready_connections"] = max(1, int(_TUNNEL_STATE.get("ready_connections") or 0))
+                                _TUNNEL_STATE["unhealthy_streak"] = 0
+                                _TUNNEL_STATE["last_healthy_at"] = time.time()
                                 if _TUNNEL_STATE.get("url"):
                                     _TUNNEL_STATE["status"] = "online"
                                     _TUNNEL_STATE["error"] = ""
                         ready_evt.set()
+                    elif "Unregistered tunnel connection" in ln:
+                        with _TUNNEL_LOCK:
+                            if _TUNNEL_GEN == gen_id and not my_stop_evt.is_set():
+                                cur_c = int(_TUNNEL_STATE.get("ready_connections") or 0)
+                                _TUNNEL_STATE["ready_connections"] = max(0, cur_c - 1)
                 proc.wait(timeout=5.0)
             except Exception as exc:
                 last_lines.append(str(exc))
@@ -2921,6 +2981,8 @@ async def handle_server_info(_request: web.Request) -> web.Response:
         "tunnel_url": tun.get("url", ""),
         "tunnel_status": tun.get("status", "disabled"),
         "tunnel_mode": tun.get("mode", "quick"),
+        "tunnel_ready_connections": int(tun.get("ready_connections") or 0),
+        "tunnel_auto_heals": int(tun.get("auto_heals") or 0),
         "agy_cli_ready": bool(_find_agy_bin()),
         "qqbot_available": bool(qqbot_ok),
         "default_model": cfg.get("default_model", "gemini-4-neon-medium"),
@@ -3332,6 +3394,298 @@ async def handle_qqbot_switch(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
+def _classify_usage_pool(model_id: str) -> tuple[str, str]:
+    m = str(model_id or "").strip().lower()
+    if "orchestrator" in m:
+        return ("orchestrator", "Orchestrator 智能编排")
+    if "neon" in m:
+        return ("neon", "Gemini 4 Neon")
+    if "hydrogen" in m:
+        return ("hydrogen", "Gemini 4 Hydrogen")
+    if "carbon" in m:
+        return ("carbon", "Gemini 4 Carbon")
+    if "argon" in m or "flash" in m:
+        return ("argon_flash", "Gemini 4 Argon & Flash")
+    if "claude" in m or "opus" in m or "sonnet" in m:
+        return ("claude", "Claude 5.5")
+    if "gpt" in m:
+        return ("oss", "GPT-OSS / 开源")
+    return ("other", "其他模型")
+
+
+def _parse_transcript_usage_file(tf: pathlib.Path) -> tuple[list[tuple[float, str, int, int, int]], int]:
+    """Read-only mtime-cached extraction of (ts, model, input_tok, cache_tok, output_tok) + explicit user turns."""
+    try:
+        st = tf.stat()
+    except OSError:
+        return ([], 0)
+    if st.st_size <= 0:
+        return ([], 0)
+    key = tf.as_posix()
+    with _USAGE_CACHE_LOCK:
+        cached = _USAGE_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return (cached[2], cached[3])
+
+    records: list[tuple[float, str, int, int, int]] = []
+    turns = 0
+    try:
+        with tf.open("r", encoding="utf-8", errors="ignore") as fh:
+            for ln in fh:
+                if '"PLANNER_RESPONSE"' in ln:
+                    try:
+                        obj = json.loads(ln)
+                    except Exception:
+                        continue
+                    if obj.get("type") != "PLANNER_RESPONSE":
+                        continue
+                    in_t = int(obj.get("input_tokens") or 0)
+                    ca_t = int(obj.get("cache_read_tokens") or 0)
+                    out_t = int(obj.get("output_tokens") or 0)
+                    if in_t <= 0 and ca_t <= 0 and out_t <= 0:
+                        continue
+                    ts = _parse_iso_ts(str(obj.get("created_at") or ""))
+                    if ts <= 0.0:
+                        ts = float(st.st_mtime)
+                    mod = str(obj.get("model") or "unknown").strip()
+                    records.append((ts, mod, max(0, in_t), max(0, ca_t), max(0, out_t)))
+                elif '"USER_INPUT"' in ln and '"USER_EXPLICIT"' in ln:
+                    turns += 1
+    except OSError:
+        return ([], 0)
+
+    with _USAGE_CACHE_LOCK:
+        if len(_USAGE_FILE_CACHE) >= _USAGE_CACHE_MAX:
+            # Drop oldest inserted quarter
+            for drop_k in list(_USAGE_FILE_CACHE.keys())[: _USAGE_CACHE_MAX // 4]:
+                _USAGE_FILE_CACHE.pop(drop_k, None)
+        _USAGE_FILE_CACHE[key] = (st.st_mtime_ns, st.st_size, records, turns)
+    return (records, turns)
+
+
+def _aggregate_usage_bucket(
+    records: list[tuple[float, str, int, int, int]],
+    turns: int = 0,
+    *,
+    window_sec: float | None = None,
+    include_daily: bool = False,
+) -> dict[str, Any]:
+    total_in = 0
+    total_cache = 0
+    total_out = 0
+    steps = 0
+    oldest_ts = 0.0
+    pools_acc: dict[str, dict[str, Any]] = {}
+    models_acc: dict[str, dict[str, Any]] = {}
+    daily_acc: dict[str, dict[str, Any]] = {}
+
+    for ts, mod, in_t, ca_t, out_t in records:
+        steps += 1
+        total_in += in_t
+        total_cache += ca_t
+        total_out += out_t
+        tot = in_t + ca_t + out_t
+        if ts > 0.0 and (oldest_ts == 0.0 or ts < oldest_ts):
+            oldest_ts = ts
+
+        pid, plabel = _classify_usage_pool(mod)
+        pa = pools_acc.get(pid)
+        if pa is None:
+            pa = {"id": pid, "label": plabel, "steps": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            pools_acc[pid] = pa
+        pa["steps"] += 1
+        pa["input_tokens"] += in_t
+        pa["cache_read_tokens"] += ca_t
+        pa["output_tokens"] += out_t
+        pa["total_tokens"] += tot
+
+        ma = models_acc.get(mod)
+        if ma is None:
+            ma = {"model": mod, "steps": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            models_acc[mod] = ma
+        ma["steps"] += 1
+        ma["input_tokens"] += in_t
+        ma["cache_read_tokens"] += ca_t
+        ma["output_tokens"] += out_t
+        ma["total_tokens"] += tot
+
+        if include_daily and ts > 0.0:
+            day_key = datetime.fromtimestamp(ts).strftime("%m-%d")
+            da = daily_acc.get(day_key)
+            if da is None:
+                da = {"date": day_key, "steps": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+                daily_acc[day_key] = da
+            da["steps"] += 1
+            da["total_tokens"] += tot
+            da["input_tokens"] += in_t
+            da["output_tokens"] += out_t
+
+    total_all = total_in + total_cache + total_out
+    prompt_total = total_in + total_cache
+    cache_hit_pct = round((total_cache * 100.0 / prompt_total), 1) if prompt_total > 0 else 0.0
+
+    pools_list = sorted(pools_acc.values(), key=lambda x: x["total_tokens"], reverse=True)
+    for p_item in pools_list:
+        p_in_ca = p_item["input_tokens"] + p_item["cache_read_tokens"]
+        p_item["cache_hit_pct"] = round((p_item["cache_read_tokens"] * 100.0 / p_in_ca), 1) if p_in_ca > 0 else 0.0
+        p_item["share_pct"] = round((p_item["total_tokens"] * 100.0 / total_all), 1) if total_all > 0 else 0.0
+
+    models_list = sorted(models_acc.values(), key=lambda x: x["total_tokens"], reverse=True)[:12]
+
+    out_dict: dict[str, Any] = {
+        "steps": steps,
+        "turns": turns,
+        "input_tokens": total_in,
+        "cache_read_tokens": total_cache,
+        "output_tokens": total_out,
+        "total_tokens": total_all,
+        "cache_hit_pct": cache_hit_pct,
+        "pools": pools_list,
+        "models": models_list,
+    }
+    if window_sec is not None and oldest_ts > 0.0:
+        relief_ts = oldest_ts + window_sec
+        out_dict["oldest_ts"] = oldest_ts
+        out_dict["relief_at"] = datetime.fromtimestamp(relief_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if include_daily:
+        now_dt = datetime.now()
+        daily_series: list[dict[str, Any]] = []
+        for off in range(6, -1, -1):
+            d_key = datetime.fromtimestamp(now_dt.timestamp() - off * 86400.0).strftime("%m-%d")
+            daily_series.append(daily_acc.get(d_key, {"date": d_key, "steps": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0}))
+        out_dict["daily"] = daily_series
+    return out_dict
+
+
+def _fetch_optional_external_quota() -> dict[str, Any] | None:
+    """Strictly opt-in external quota JSON fetch (ONLY when user sets AGY_QUOTA_API_URL or mobile_config.json['quota_api_url'])."""
+    cfg = load_or_create_config()
+    raw_url = str(os.environ.get("AGY_QUOTA_API_URL") or cfg.get("quota_api_url") or "").strip()
+    if not raw_url:
+        return None
+    try:
+        pu = urllib.parse.urlparse(raw_url)
+        host_lc = (pu.hostname or "").lower()
+        is_local = pu.scheme == "http" and host_lc in ("127.0.0.1", "localhost", "::1")
+        is_https = pu.scheme == "https" and bool(host_lc)
+        if not (is_local or is_https):
+            return None
+        req = urllib.request.Request(raw_url, headers={"Accept": "application/json"}, method="GET")
+        opener = _DIRECT_OPENER if is_local else urllib.request.build_opener()
+        with opener.open(req, timeout=3.0) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read(262144).decode("utf-8", errors="replace"))
+            if isinstance(data, dict) and isinstance(data.get("pools"), list):
+                clean_pools: list[dict[str, Any]] = []
+                for p in data["pools"][:16]:
+                    if not isinstance(p, dict):
+                        continue
+                    clean_pools.append({
+                        "name": str(p.get("name") or p.get("label") or "")[:48],
+                        "remaining_pct": float(p["remaining_pct"]) if p.get("remaining_pct") is not None else None,
+                        "reset_at": str(p.get("reset_at") or "")[:48],
+                        "note": str(p.get("note") or "")[:80],
+                    })
+                return {"source": str(data.get("source") or "custom")[:48], "pools": clean_pools}
+    except Exception:
+        return None
+    return None
+
+
+def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
+    now = time.time()
+    cut_7d = now - 7.0 * 86400.0
+    cut_24h = now - 86400.0
+    cut_5h = now - 5.0 * 3600.0
+
+    rec_5h: list[tuple[float, str, int, int, int]] = []
+    rec_24h: list[tuple[float, str, int, int, int]] = []
+    rec_7d: list[tuple[float, str, int, int, int]] = []
+    scanned_convs = 0
+    seen_paths: set[str] = set()
+
+    for root in (DESKTOP_BRAIN, CLI_BRAIN):
+        if not root.is_dir():
+            continue
+        try:
+            with os.scandir(root) as it:
+                for e in it:
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    tf = pathlib.Path(e.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                    try:
+                        st = tf.stat()
+                    except OSError:
+                        continue
+                    if st.st_size <= 0 or st.st_mtime < cut_7d:
+                        continue
+                    norm_p = tf.as_posix()
+                    if norm_p in seen_paths:
+                        continue
+                    seen_paths.add(norm_p)
+                    recs, _ = _parse_transcript_usage_file(tf)
+                    if not recs:
+                        continue
+                    scanned_convs += 1
+                    for r in recs:
+                        ts = r[0]
+                        if ts >= cut_7d:
+                            rec_7d.append(r)
+                            if ts >= cut_24h:
+                                rec_24h.append(r)
+                                if ts >= cut_5h:
+                                    rec_5h.append(r)
+        except OSError:
+            continue
+
+    conv_usage: dict[str, Any] | None = None
+    if current_cid and _is_valid_cid(current_cid):
+        conv_recs: list[tuple[float, str, int, int, int]] = []
+        conv_turns = 0
+        conv_files: list[pathlib.Path] = []
+        tf_main, src_main = _locate_transcript(current_cid)
+        if tf_main is not None:
+            conv_files.append(tf_main)
+        if src_main == "desktop":
+            aliased = get_desktop_cli_alias(current_cid)
+            if aliased and aliased != current_cid:
+                tf_cli = CLI_BRAIN / aliased / ".system_generated" / "logs" / "transcript.jsonl"
+                if tf_cli.is_file():
+                    conv_files.append(tf_cli)
+        elif src_main == "mobile":
+            parent_d = get_desktop_parent_for_cli(current_cid)
+            if parent_d and parent_d != current_cid:
+                tf_d = DESKTOP_BRAIN / parent_d / ".system_generated" / "logs" / "transcript.jsonl"
+                if tf_d.is_file():
+                    conv_files.append(tf_d)
+        for cf in conv_files:
+            r_list, t_cnt = _parse_transcript_usage_file(cf)
+            conv_recs.extend(r_list)
+            conv_turns += t_cnt
+        conv_usage = _aggregate_usage_bucket(conv_recs, turns=conv_turns)
+        conv_usage["conversation_id"] = current_cid
+
+    return {
+        "ok": True,
+        "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "scanned_conversations": scanned_convs,
+        "window_5h": _aggregate_usage_bucket(rec_5h, window_sec=5.0 * 3600.0),
+        "window_24h": _aggregate_usage_bucket(rec_24h, window_sec=86400.0),
+        "window_7d": _aggregate_usage_bucket(rec_7d, window_sec=7.0 * 86400.0, include_daily=True),
+        "current_conversation": conv_usage,
+        "external_quota": _fetch_optional_external_quota(),
+    }
+
+
+async def handle_usage(request: web.Request) -> web.Response:
+    cid = str(request.query.get("cid") or "").strip()
+    if cid and not _is_valid_cid(cid):
+        cid = ""
+    summary = await asyncio.to_thread(compute_usage_summary, cid)
+    return web.json_response(summary)
+
+
 async def handle_ws(request: web.Request) -> web.StreamResponse:
     for w in list(_WS_CLIENTS):
         if w.closed:
@@ -3425,9 +3779,17 @@ async def handle_pair_page(request: web.Request) -> web.Response:
     }
     tun_status = str(tun.get("status") or "disabled")
     tun_error = str(tun.get("error") or "").strip()
+    tun_ready_cnt = int(tun.get("ready_connections") or 0)
     tun_hint_html = ""
     if tun_status == "online" and tun.get("url"):
-        tun_pill_html = '<span class="pill pill-green"><span class="dot"></span>公网隧道在线（免VPN）</span>'
+        ready_lbl = f" · {tun_ready_cnt} 通道" if tun_ready_cnt > 0 else ""
+        tun_pill_html = f'<span class="pill pill-green"><span class="dot"></span>公网隧道在线（免VPN{ready_lbl}）</span>'
+    elif tun_status == "reconnecting":
+        tun_pill_html = '<span class="pill pill-warn">公网隧道断连 · 自动自愈中…</span>'
+        tun_hint_html = (
+            '<div class="tun-hint">检测到 Cloudflare 边缘连接已断开（常见于电脑休眠醒来或代理切换），'
+            '后台守护正在自动自愈重连，页面将在数秒后自动刷新出新二维码；也可直接点右上角「重连隧道」立即刷新。</div>'
+        )
     elif tun_status == "starting":
         tun_pill_html = '<span class="pill pill-host">公网隧道建连中…</span>'
     elif tun_status == "missing":
@@ -4106,7 +4468,7 @@ if (restartTunnelBtn) {{
     }}
   }});
 }}
-if (TUN_STATUS === 'starting') {{
+if (TUN_STATUS === 'starting' || TUN_STATUS === 'reconnecting') {{
   setTimeout(() => location.reload(), 3500);
 }}
 </script>
@@ -4232,18 +4594,85 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
             pass
 
 
+async def _tunnel_health_watchdog_loop(_app: web.Application) -> None:
+    """Detect zombie cloudflared processes (readyConnections == 0 after sleep/proxy reset) and auto-heal."""
+    while True:
+        await asyncio.sleep(15.0)
+        try:
+            with _TUNNEL_LOCK:
+                enabled = bool(_TUNNEL_STATE.get("enabled"))
+                status = str(_TUNNEL_STATE.get("status") or "disabled")
+                proc = _TUNNEL_STATE.get("proc")
+                m_port = int(_TUNNEL_STATE.get("metrics_port") or 0)
+                started_at = float(_TUNNEL_STATE.get("started_at") or 0.0)
+                last_heal_at = float(_TUNNEL_STATE.get("last_heal_at") or 0.0)
+            if not enabled or status in ("disabled", "missing") or proc is None or proc.poll() is not None:
+                continue
+            now = time.time()
+            # Startup grace period so fresh cloudflared has time to establish edge HTTP/2 connections
+            if m_port <= 0 or (now - started_at) < 25.0:
+                continue
+
+            ok, ready_cnt = await asyncio.to_thread(_probe_cloudflared_ready, m_port)
+            need_heal_proc = None
+            broadcast_snap = None
+            with _TUNNEL_LOCK:
+                if _TUNNEL_STATE.get("proc") is not proc:
+                    continue
+                if ok:
+                    prev_status = str(_TUNNEL_STATE.get("status") or "")
+                    _TUNNEL_STATE["ready_connections"] = ready_cnt
+                    _TUNNEL_STATE["unhealthy_streak"] = 0
+                    _TUNNEL_STATE["last_healthy_at"] = now
+                    if prev_status == "reconnecting" and _TUNNEL_STATE.get("url"):
+                        _TUNNEL_STATE["status"] = "online"
+                        _TUNNEL_STATE["error"] = ""
+                        broadcast_snap = True
+                else:
+                    streak = int(_TUNNEL_STATE.get("unhealthy_streak") or 0) + 1
+                    _TUNNEL_STATE["unhealthy_streak"] = streak
+                    _TUNNEL_STATE["ready_connections"] = 0
+                    if streak == 1 and _TUNNEL_STATE.get("status") == "online":
+                        _TUNNEL_STATE["status"] = "reconnecting"
+                        _TUNNEL_STATE["error"] = "检测到公网隧道出站断连（readyConnections=0），正在自愈重连…"
+                        broadcast_snap = True
+                    elif streak >= 3 and (now - last_heal_at) >= 60.0:
+                        _TUNNEL_STATE["unhealthy_streak"] = 0
+                        _TUNNEL_STATE["last_heal_at"] = now
+                        _TUNNEL_STATE["auto_heals"] = int(_TUNNEL_STATE.get("auto_heals") or 0) + 1
+                        _TUNNEL_STATE["status"] = "reconnecting"
+                        _TUNNEL_STATE["error"] = "僵尸隧道已触发自动自愈，正在重新建连…"
+                        need_heal_proc = proc
+                        broadcast_snap = True
+
+            if need_heal_proc is not None:
+                print(f"[{APP_NAME}] Zombie cloudflared detected (readyConnections=0 for >=45s), auto-healing...", flush=True)
+                try:
+                    need_heal_proc.terminate()
+                except Exception:
+                    pass
+            if broadcast_snap:
+                _broadcast_ws({"type": "tunnel_status", "tunnel": get_tunnel_snapshot(), "ts": now})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+
 async def _on_startup(app: web.Application) -> None:
     global _LOOP
     _LOOP = asyncio.get_running_loop()
     get_pair_pin()
     app["desktop_watch_task"] = asyncio.create_task(_desktop_transcript_push_loop(app))
+    app["tunnel_watchdog_task"] = asyncio.create_task(_tunnel_health_watchdog_loop(app))
 
 
 async def _on_cleanup(app: web.Application) -> None:
     _stop_cloudflared_tunnel()
-    t = app.get("desktop_watch_task")
-    if t:
-        t.cancel()
+    for key in ("desktop_watch_task", "tunnel_watchdog_task"):
+        t = app.get(key)
+        if t:
+            t.cancel()
     with _ACTIVE_RUNS_LOCK:
         for rec in list(_ACTIVE_RUNS.values()):
             p = rec.get("proc")
@@ -4280,6 +4709,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/files", handle_files_list)
     app.router.add_get("/api/files/preview", handle_file_preview)
     app.router.add_get("/api/files/download", handle_file_download)
+    app.router.add_get("/api/usage", handle_usage)
     app.router.add_get("/api/qqbot/status", handle_qqbot_status)
     app.router.add_post("/api/qqbot/switch-model", handle_qqbot_switch)
 

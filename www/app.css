@@ -2460,6 +2460,121 @@ button {
   font-size: 12px;
 }
 
+/* Usage & Quota Dashboard */
+.usage-body-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.usage-pool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.usage-pool-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.usage-pool-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.usage-pool-name {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--md-text);
+}
+.usage-pool-meta {
+  font-size: 12px;
+  color: var(--md-text-secondary);
+  white-space: nowrap;
+}
+.usage-bar-track {
+  height: 8px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--md-surface-highest);
+  overflow: hidden;
+}
+.usage-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--md-primary);
+  transition: width 240ms var(--md-motion);
+}
+.usage-bar-fill.ok {
+  background: var(--md-success);
+}
+.usage-bar-fill.warn {
+  background: #F9AB00;
+}
+.usage-bar-fill.low {
+  background: var(--md-error);
+}
+.usage-daily-chart {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+  align-items: end;
+  height: 132px;
+  padding-top: 12px;
+}
+.usage-daily-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  height: 100%;
+}
+.usage-daily-val {
+  font-size: 10.5px;
+  color: var(--md-text-muted);
+  white-space: nowrap;
+}
+.usage-daily-bar-wrap {
+  flex: 1;
+  width: 100%;
+  max-width: 28px;
+  display: flex;
+  align-items: flex-end;
+  background: var(--md-surface-high);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.usage-daily-bar {
+  width: 100%;
+  border-radius: 8px 8px 0 0;
+  background: var(--md-primary);
+  min-height: 2px;
+}
+.usage-daily-lbl {
+  font-size: 11px;
+  color: var(--md-text-secondary);
+}
+.usage-model-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.usage-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  font-size: 12px;
+  color: var(--md-text);
+}
+.usage-model-chip span.m-sub {
+  color: var(--md-text-muted);
+}
+
 /* QQ Bot Stat Grid */
 .stat-grid {
   display: grid;

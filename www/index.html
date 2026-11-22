@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.6.4" />
+  <link rel="stylesheet" href="./app.css?v=1.6.5" />
 </head>
 <body>
   <!-- =========================================================
@@ -427,6 +427,17 @@
           <polyline points="9 18 15 12 9 6"></polyline>
         </svg>
       </button>
+      <button id="nav-usage" class="drawer-util-item" type="button">
+        <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 20V10"></path>
+          <path d="M12 20V4"></path>
+          <path d="M6 20v-6"></path>
+        </svg>
+        <span>额度与用量</span>
+        <svg class="drawer-util-meta" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      </button>
       <button id="nav-settings" class="drawer-util-item" type="button">
         <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="3"></circle>
@@ -583,6 +594,23 @@
       <div class="m3-card">
         <div class="section-heading">工具箱</div>
         <div class="settings-tools-list">
+          <button id="settings-open-usage" class="settings-tool-row" type="button">
+            <span class="settings-tool-ic">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 20V10"></path>
+                <path d="M12 20V4"></path>
+                <path d="M6 20v-6"></path>
+              </svg>
+            </span>
+            <span class="settings-tool-text">
+              <span class="settings-tool-title">额度与用量统计</span>
+              <span class="settings-tool-desc">5 小时 / 今日 / 近 7 天 / 本会话 Token 与模型池消耗</span>
+            </span>
+            <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </button>
+
           <button id="settings-open-files" class="settings-tool-row" type="button">
             <span class="settings-tool-ic">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -792,6 +820,37 @@
     <iframe id="pair-iframe" class="pair-iframe" title="手机扫码配对"></iframe>
   </section>
 
+  <!-- Usage & Quota Dashboard Full-Screen View -->
+  <section id="usage-modal" class="m3-full-view hidden" aria-label="额度与用量统计">
+    <header class="m3-topbar">
+      <button class="m3-icon-btn close-modal" type="button" data-target="usage-modal" aria-label="返回">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="19" y1="12" x2="5" y2="12"></line>
+          <polyline points="12 19 5 12 12 5"></polyline>
+        </svg>
+      </button>
+      <div class="topbar-center">
+        <div class="conv-title">额度与用量统计</div>
+        <div id="usage-subtitle" class="conv-subtitle">基于本机完整对话日志核算</div>
+      </div>
+      <button id="btn-usage-refresh" class="m3-icon-btn" type="button" aria-label="刷新用量" title="刷新统计">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+        </svg>
+      </button>
+    </header>
+    <div class="view-body settings-body">
+      <div id="usage-window-tabs" class="m3-segmented" role="tablist" aria-label="统计周期">
+        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-usage-win="5h">近 5 小时</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="24h">今日 24h</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="7d">近 7 天</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="conv">当前会话</button>
+      </div>
+      <div id="usage-body" class="usage-body-wrap"></div>
+    </div>
+  </section>
+
   <!-- Desktop Drag & Drop Lossless Upload Overlay -->
   <div id="drop-overlay" class="drop-overlay hidden" aria-hidden="true">
     <div class="drop-overlay-card">
@@ -832,6 +891,6 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=1.6.4"></script>
+  <script src="./app.js?v=1.6.5"></script>
 </body>
 </html>

@@ -39,8 +39,8 @@ ZXING_JAR = Path(os.environ.get("ZXING_CORE_JAR", str(ANDROID_DIR / "libs" / "zx
 
 MIN_SDK = "26"
 TARGET_SDK = "34"
-VERSION_CODE = "9"
-VERSION_NAME = "1.6.1"
+VERSION_CODE = "10"
+VERSION_NAME = "1.6.2"
 
 
 def _version_tuple(name: str) -> tuple[int, ...]:
