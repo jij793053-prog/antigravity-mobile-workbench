@@ -6,6 +6,42 @@
   const DRAFTS_STORAGE_KEY = "agy_mobile_drafts_v1";
   const NEW_DRAFT_KEY = "__new__";
   const DEFAULT_MODEL = "gemini-4-neon-medium";
+  const SIDECAR = (window.__AGY_SIDECAR__ && window.__AGY_SIDECAR__.active) ? window.__AGY_SIDECAR__ : null;
+  const SIDECAR_CID_RE = /^[A-Za-z0-9_-]{6,80}$/;
+
+  function withSidecarToken(url) {
+    if (!SIDECAR || !url) return url;
+    try {
+      if (typeof SIDECAR.withToken === "function") {
+        return SIDECAR.withToken(url);
+      }
+      const token = String(SIDECAR.token || "").trim();
+      if (!token) return url;
+      const u = new URL(String(url), location.origin);
+      if (u.origin === location.origin && !u.searchParams.has("sidecar_token")) {
+        u.searchParams.set("sidecar_token", token);
+        return u.toString();
+      }
+    } catch (_) {}
+    return url;
+  }
+
+  function getSidecarConversationId() {
+    if (!SIDECAR) return "";
+    const raw = String(SIDECAR.conversationId || window.sidecar?.conversationId || "").trim();
+    return SIDECAR_CID_RE.test(raw) ? raw : "";
+  }
+
+  function resolveSidecarHostTheme(themeHint) {
+    const candidate = String(
+      themeHint ||
+      document.documentElement.dataset.agyTheme ||
+      (SIDECAR && typeof SIDECAR.getTheme === "function" ? SIDECAR.getTheme() : "") ||
+      ""
+    ).toLowerCase();
+    if (candidate === "dark" || candidate === "light") return candidate;
+    return (darkMedia && darkMedia.matches) ? "dark" : "light";
+  }
 
   const state = {
     themePref: "light", // "light" | "dark" | "system"
@@ -18,6 +54,8 @@
     serverInfo: null,
     qqbotAvailable: false,
     workspaceRoot: "",
+    sidecarAutoFollowed: false,
+    sidecarUserPicked: false,
 
     ws: null,
     wsConnected: false,
@@ -217,12 +255,24 @@
   };
 
   // =========================================================================
-  // 2. THEME ENGINE (Light Default + Google Dark + Follow System)
+  // 2. THEME ENGINE (Light Default + Google Dark + Follow System / Sidecar)
   // =========================================================================
+  function syncSidecarTheme(themeHint) {
+    if (!SIDECAR) return;
+    const hostTheme = resolveSidecarHostTheme(themeHint);
+    document.documentElement.dataset.agyTheme = hostTheme;
+    if (state.themePref === "system") {
+      applyTheme("system", false);
+    }
+  }
+
   function applyTheme(pref, persist = false) {
     const valid = ["light", "dark", "system"].includes(pref) ? pref : "light";
     state.themePref = valid;
-    const isDark = valid === "dark" || (valid === "system" && Boolean(darkMedia && darkMedia.matches));
+    const isDark =
+      valid === "dark" ||
+      (valid === "system" &&
+        (SIDECAR ? resolveSidecarHostTheme() === "dark" : Boolean(darkMedia && darkMedia.matches)));
     state.resolvedDark = isDark;
 
     document.documentElement.setAttribute("data-theme", isDark ? "dark" : "light");
@@ -252,6 +302,13 @@
       if (state.themePref === "system") {
         applyTheme("system", false);
       }
+    });
+  }
+
+  if (SIDECAR) {
+    window.addEventListener("agy-sidecar-theme", (ev) => {
+      const nextTheme = ev && ev.detail && ev.detail.theme ? String(ev.detail.theme) : "";
+      syncSidecarTheme(nextTheme);
     });
   }
 
@@ -956,10 +1013,13 @@
     state.qqbotAvailable = false;
     state.workspaceRoot = "";
     state.currentDir = "";
+    state.sidecarAutoFollowed = false;
+    state.sidecarUserPicked = false;
     $("settings-open-qqbot")?.classList.add("hidden");
 
     restoreDraftFor(NEW_DRAFT_KEY);
     updateHostDisplays();
+    updateSidecarHeaderActions();
     renderConversation();
     renderConvList();
     connectWs();
@@ -1055,6 +1115,7 @@
         if (prevCid && prevCid !== cid) {
           migrateDraftKey(prevCid, cid);
         }
+        updateSidecarHeaderActions();
       }
     };
 
@@ -1271,8 +1332,27 @@
         return `@@LK_${nonce}_${idx}@@`;
       }
       if (/^https?:\/\//i.test(cleanHref)) {
+        let finalHref = cleanHref;
+        if (SIDECAR) {
+          try {
+            const u = new URL(cleanHref);
+            if (
+              u.origin === location.origin &&
+              (u.pathname === "/download-apk" ||
+                u.pathname === "/pair" ||
+                u.pathname.startsWith("/api/files/"))
+            ) {
+              finalHref = withSidecarToken(cleanHref);
+            }
+          } catch (_) {}
+        }
         const idx = linkTokens.length;
-        linkTokens.push(`<a href="${escHtml(cleanHref)}" target="_blank" rel="noopener">${renderedLbl}</a>`);
+        linkTokens.push(`<a href="${escHtml(finalHref)}" target="_blank" rel="noopener">${renderedLbl}</a>`);
+        return `@@LK_${nonce}_${idx}@@`;
+      }
+      if (SIDECAR && /^\/(download-apk|pair|api\/files\/)/i.test(cleanHref)) {
+        const idx = linkTokens.length;
+        linkTokens.push(`<a href="${escHtml(withSidecarToken(cleanHref))}" target="_blank" rel="noopener">${renderedLbl}</a>`);
         return `@@LK_${nonce}_${idx}@@`;
       }
       return renderedLbl;
@@ -1552,6 +1632,7 @@
       $("deliverables-box").classList.add("hidden");
       $("conv-title").textContent = "Antigravity";
       updateHostDisplays();
+      updateSidecarHeaderActions();
       updateSendButton();
       return;
     }
@@ -1581,9 +1662,10 @@
           if (imgs.length) {
             const imgCards = imgs
               .map((a) => {
-                const srcUrl = host
+                const rawSrcUrl = host
                   ? `${host.url}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path)}`}&token=${encodeURIComponent(host.token)}`
                   : "";
+                const srcUrl = rawSrcUrl ? withSidecarToken(rawSrcUrl) : "";
                 return `<button class="msg-img-thumb msg-att-btn" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "image")}" aria-label="查看原图 ${escHtml(a.name || "")}">` +
                   `<img src="${escHtml(srcUrl)}" alt="${escHtml(a.name || "")}" loading="lazy" />` +
                 `</button>`;
@@ -1692,6 +1774,7 @@
     }
 
     state.lastRenderedConvFp = computeConvFingerprint(conv, state.streaming);
+    updateSidecarHeaderActions();
     updateSendButton();
     if (!preserveScroll || wasNearBottom) {
       scrollToBottom(true);
@@ -1783,6 +1866,64 @@
     });
   }
 
+  function isDesktopBackedConversation(cid, conv) {
+    if (!cid || String(cid).startsWith("pending-")) return false;
+    if (conv && conv.source === "desktop") return true;
+    const hostCid = getSidecarConversationId();
+    if (hostCid && cid === hostCid) return true;
+    const listed = state.conversations.find((c) => c && c.id === cid);
+    return Boolean(listed && listed.source === "desktop");
+  }
+
+  function updateSidecarHeaderActions() {
+    const followBtn = $("sidecar-follow-btn");
+    const followTxt = $("sidecar-follow-text");
+    const openMainBtn = $("sidecar-open-main-btn");
+    if (!followBtn && !openMainBtn) return;
+
+    if (!SIDECAR) {
+      followBtn?.classList.add("hidden");
+      openMainBtn?.classList.add("hidden");
+      return;
+    }
+
+    const hostCid = getSidecarConversationId();
+    const activeCid = state.currentCid || (state.currentConv && state.currentConv.id) || "";
+    const hasValidActiveCid = Boolean(activeCid && !String(activeCid).startsWith("pending-"));
+
+    if (followBtn) {
+      if (!hostCid) {
+        followBtn.classList.add("hidden");
+      } else {
+        followBtn.classList.remove("hidden");
+        const isFollowing = hasValidActiveCid && activeCid === hostCid;
+        followBtn.classList.toggle("following", isFollowing);
+        followBtn.setAttribute("aria-disabled", isFollowing ? "true" : "false");
+        if (followTxt) {
+          followTxt.textContent = isFollowing ? "已跟随主窗口" : "回到主窗口对话";
+        }
+        followBtn.title = isFollowing
+          ? "当前正跟随 Antigravity 主窗口对话"
+          : "点击跳回 Antigravity 主窗口正在查看的对话";
+      }
+    }
+
+    if (openMainBtn) {
+      const canToggle = typeof SIDECAR.toggleConversation === "function";
+      const isDesktopBacked = hasValidActiveCid && isDesktopBackedConversation(activeCid, state.currentConv);
+      openMainBtn.classList.toggle("hidden", !(canToggle && isDesktopBacked));
+    }
+  }
+
+  function maybeAutoFollowSidecarConversation() {
+    if (!SIDECAR || state.sidecarAutoFollowed || state.sidecarUserPicked) return;
+    if (state.currentCid || state.streaming) return;
+    const hostCid = getSidecarConversationId();
+    if (!hostCid) return;
+    state.sidecarAutoFollowed = true;
+    openConversation(hostCid, { silent: true, autoFollow: true });
+  }
+
   async function refreshConversations() {
     _lastRefreshConvsAt = Date.now();
     const reqFilter = state.filter || "all";
@@ -1795,6 +1936,8 @@
       }
       state.conversations = data.conversations || [];
       renderConvList();
+      maybeAutoFollowSidecarConversation();
+      updateSidecarHeaderActions();
       const anyRunning = state.conversations.some((c) => c.status === "running");
       $("running-badge").classList.toggle("hidden", !anyRunning);
     } catch (_) {}
@@ -1849,8 +1992,11 @@
   }
 
   async function openConversation(cid, opts = {}) {
-    const { silent = false } = opts || {};
+    const { silent = false, autoFollow = false, userPicked = false } = opts || {};
     if (!cid) return;
+    if (userPicked) {
+      state.sidecarUserPicked = true;
+    }
     const prevKey = currentDraftKey();
     const switching = cid !== state.currentCid;
     if (switching) {
@@ -1859,6 +2005,7 @@
       state.lastRenderedConvFp = "";
       restoreDraftFor(cid);
       renderConvList();
+      updateSidecarHeaderActions();
     }
     if (!silent) {
       closeDrawer();
@@ -1890,6 +2037,7 @@
         if (nextRunning) {
           updateStreamingRow();
         }
+        updateSidecarHeaderActions();
         return;
       }
 
@@ -1899,6 +2047,12 @@
       }
     } catch (e) {
       if (reqSeq !== state.openConvSeq) return;
+      if (autoFollow && !state.currentConv && state.currentCid === cid) {
+        state.currentCid = "";
+        restoreDraftFor(NEW_DRAFT_KEY);
+        renderConvList();
+        updateSidecarHeaderActions();
+      }
       if (!silent) {
         showToast(`加载会话失败：${e.message}`);
       }
@@ -1907,6 +2061,7 @@
 
   function startNewChat() {
     haptic("light");
+    state.sidecarUserPicked = true;
     const prevKey = currentDraftKey();
     closeDrawer();
     if (prevKey !== NEW_DRAFT_KEY) {
@@ -1921,6 +2076,8 @@
       restoreDraftFor(NEW_DRAFT_KEY);
       renderConversation();
       renderConvList();
+    } else {
+      updateSidecarHeaderActions();
     }
     $("prompt-input").focus();
   }
@@ -1953,6 +2110,7 @@
 
     const createdNewConv = !state.currentConv;
     if (createdNewConv) {
+      state.sidecarUserPicked = true;
       state.currentConv = {
         id: "",
         title: text.slice(0, 36) || (prevAttachments[0]?.name || "新对话"),
@@ -2001,6 +2159,7 @@
         ) {
           state.currentCid = nextCid;
           if (state.currentConv) state.currentConv.id = nextCid;
+          updateSidecarHeaderActions();
         }
       }
       refreshConversations();
@@ -2064,10 +2223,13 @@
     tray.classList.remove("hidden");
     tray.innerHTML = state.attachments
       .map((a, idx) => {
-        const imgTag =
+        const rawThumb =
           a.is_image && host
-            ? `<img src="${escHtml(host.url + a.preview_url)}&token=${encodeURIComponent(host.token)}" alt="" />`
+            ? `${host.url}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path || "")}`}&token=${encodeURIComponent(host.token)}`
             : "";
+        const imgTag = rawThumb
+          ? `<img src="${escHtml(withSidecarToken(rawThumb))}" alt="" />`
+          : "";
         return `
           <div class="attach-chip">
             ${imgTag}
@@ -2419,7 +2581,9 @@
 
     const ext = (path.split(".").pop() || "").toLowerCase();
     if (["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext)) {
-      const imgUrl = `${host.url}/api/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`;
+      const imgUrl = withSidecarToken(
+        `${host.url}/api/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
+      );
       $("preview-body").innerHTML = `<img src="${escHtml(imgUrl)}" alt="${escHtml(name || "")}" />`;
       return;
     }
@@ -2473,7 +2637,9 @@
     const host = getActiveHost();
     if (!host) return;
     const filename = name || path.split("/").pop() || "download";
-    const url = `${host.url}/api/files/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`;
+    const url = withSidecarToken(
+      `${host.url}/api/files/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
+    );
     const subdir = sanitizeSubdirInput(state.downloadSubdir);
     const ask = Boolean(state.downloadAskFolder);
     haptic("light");
@@ -2875,6 +3041,31 @@
     $("drawer-backdrop").addEventListener("click", closeDrawer);
     $("btn-new-top").addEventListener("click", startNewChat);
     $("btn-new-chat").addEventListener("click", startNewChat);
+
+    $("sidecar-follow-btn")?.addEventListener("click", () => {
+      if (!SIDECAR) return;
+      const hostCid = getSidecarConversationId();
+      if (!hostCid) return;
+      if (state.currentCid === hostCid) {
+        if (!state.streaming) {
+          openConversation(hostCid, { silent: true });
+        }
+        return;
+      }
+      openConversation(hostCid, { userPicked: true });
+    });
+
+    $("sidecar-open-main-btn")?.addEventListener("click", () => {
+      if (!SIDECAR || typeof SIDECAR.toggleConversation !== "function") return;
+      const activeCid = state.currentCid || (state.currentConv && state.currentConv.id) || "";
+      if (!activeCid || String(activeCid).startsWith("pending-")) return;
+      try {
+        SIDECAR.toggleConversation(activeCid);
+        showToast("已在 Antigravity 主窗口打开此对话");
+      } catch (err) {
+        showToast(`打开主窗口失败：${err?.message || "未知错误"}`);
+      }
+    });
     $("btn-drawer-host").addEventListener("click", () => {
       closeDrawer();
       if (isLocalDesktopBrowser()) {
@@ -2967,12 +3158,13 @@
 
     $("conv-list").addEventListener("click", (e) => {
       const item = e.target.closest(".conv-item");
-      if (item && item.dataset.cid) openConversation(item.dataset.cid);
+      if (item && item.dataset.cid) openConversation(item.dataset.cid, { userPicked: true });
     });
 
     // --- Quick Suggestion Cards ---
     document.querySelectorAll(".quick-card").forEach((c) => {
       c.addEventListener("click", () => {
+        state.sidecarUserPicked = true;
         $("prompt-input").value = c.dataset.prompt || "";
         updateSendButton();
         handleSendOrStop();
@@ -3051,7 +3243,7 @@
       updateSendButton();
     });
     inp.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && window.innerWidth > 768) {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (window.innerWidth > 768 || Boolean(SIDECAR))) {
         e.preventDefault();
         handleSendOrStop();
       }
@@ -3114,10 +3306,10 @@
       const modal = $("pair-modal");
       const iframe = $("pair-iframe");
       if (!modal || !iframe) {
-        window.open(`${location.origin}/pair`, "_blank", "noopener");
+        window.open(withSidecarToken(`${location.origin}/pair`), "_blank", "noopener");
         return;
       }
-      iframe.src = `${location.origin}/pair?_t=${Date.now()}`;
+      iframe.src = withSidecarToken(`${location.origin}/pair?_t=${Date.now()}`);
       modal.classList.remove("hidden");
     }
     $("nav-pair-qr")?.addEventListener("click", openPairModal);
@@ -3128,10 +3320,10 @@
     });
     $("btn-pair-refresh")?.addEventListener("click", () => {
       const iframe = $("pair-iframe");
-      if (iframe) iframe.src = `${location.origin}/pair?_t=${Date.now()}`;
+      if (iframe) iframe.src = withSidecarToken(`${location.origin}/pair?_t=${Date.now()}`);
     });
     $("btn-pair-external")?.addEventListener("click", () => {
-      window.open(`${location.origin}/pair`, "_blank", "noopener");
+      window.open(withSidecarToken(`${location.origin}/pair`), "_blank", "noopener");
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
@@ -3451,14 +3643,19 @@
   }
 
   function isLocalDesktopBrowser() {
+    if (SIDECAR) return true;
     if (window.AndroidBridge) return false;
     if (location.protocol !== "http:") return false;
     const h = String(location.hostname || "").toLowerCase();
     return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]";
   }
 
+  function isDesktopHostMode() {
+    return Boolean(SIDECAR) || isLocalDesktopBrowser();
+  }
+
   async function tryLocalAutoBootstrap() {
-    if (!isLocalDesktopBrowser()) return false;
+    if (!isDesktopHostMode()) return false;
     $("nav-pair-qr")?.classList.remove("hidden");
     $("btn-top-pair")?.classList.remove("hidden");
     try {
@@ -3486,9 +3683,15 @@
   }
 
   async function boot() {
-    const isDesktopHost = isLocalDesktopBrowser();
+    const isDesktopHost = isDesktopHostMode();
     if (isDesktopHost) {
       document.body.classList.add("desktop-host-mode");
+    }
+    if (SIDECAR) {
+      document.body.classList.add(
+        "agy-sidecar-mode",
+        SIDECAR.view === "sidebar" ? "agy-sidecar-sidebar" : "agy-sidecar-auxpane"
+      );
     }
     const hadSavedCfg = (() => {
       try {
@@ -3498,19 +3701,29 @@
       }
     })();
     loadConfig();
-    if (isDesktopHost && !hadSavedCfg && state.themePref === "light") {
+    if (SIDECAR) {
+      if (!hadSavedCfg) {
+        state.themePref = "system";
+      }
+      document.documentElement.dataset.agyTheme = resolveSidecarHostTheme();
+    } else if (isDesktopHost && !hadSavedCfg && state.themePref === "light") {
       state.themePref = "dark";
     }
     applyTheme(state.themePref, false);
     syncFilterUi();
     updateModelPill();
     bindEvents();
+    updateSidecarHeaderActions();
 
     const wantPairOpen = (() => {
       try {
         const qs = new URLSearchParams(location.search);
         if (qs.get("open") === "pair") {
-          if (history.replaceState) history.replaceState(null, "", location.pathname);
+          qs.delete("open");
+          const cleanQs = qs.toString();
+          if (history.replaceState) {
+            history.replaceState(null, "", location.pathname + (cleanQs ? `?${cleanQs}` : ""));
+          }
           return true;
         }
       } catch (_) {}

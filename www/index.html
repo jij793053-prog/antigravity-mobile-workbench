@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.6.5" />
+  <link rel="stylesheet" href="./app.css?v=1.7.0" />
 </head>
 <body>
   <!-- =========================================================
@@ -193,6 +193,17 @@
       </div>
 
       <div class="topbar-actions">
+        <button id="sidecar-follow-btn" class="sidecar-header-pill hidden" type="button" aria-label="跟随主窗口对话" title="跟随或回到 Antigravity 主窗口当前对话">
+          <span class="sidecar-follow-dot" aria-hidden="true"></span>
+          <span id="sidecar-follow-text">已跟随主窗口</span>
+        </button>
+        <button id="sidecar-open-main-btn" class="m3-icon-btn sidecar-open-main-btn hidden" type="button" aria-label="在 Antigravity 主窗口打开此对话" title="在 Antigravity 主窗口中打开此对话">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </button>
         <button id="btn-top-pair" class="topbar-pair-pill hidden" type="button" aria-label="出示配对二维码供手机扫描" title="出示本机二维码与 6 位配对码，供手机 App 扫码连接">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
@@ -891,6 +902,6 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=1.6.5"></script>
+  <script src="./app.js?v=1.7.0"></script>
 </body>
 </html>

@@ -1,0 +1,17 @@
+{
+  "name": "antigravity-sync",
+  "displayName": "Mobile Sync",
+  "version": "1.7.0",
+  "description": "Live two-way Mobile & Desktop Sync Workbench inside Antigravity's side pane and sidebar: unified conversation timeline, real-time WebSocket streaming, model/Swarm controls, Usage Dashboard, and Phone QR Pairing.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open the Mobile Sync side pane to view and continue my phone & desktop synced conversations",
+    "Check whether the local Antigravity Link Server on 127.0.0.1:18795 is healthy and its tunnel is online",
+    "Guide me through pairing my Android phone with Mobile Sync using QR code or 6-digit PIN"
+  ],
+  "author": {
+    "name": "Antigravity Mobile Workbench Contributors"
+  },
+  "homepage": "https://github.com/jij793053-prog/antigravity-mobile-workbench",
+  "repository": "https://github.com/jij793053-prog/antigravity-mobile-workbench"
+}

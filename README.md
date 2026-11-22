@@ -1,18 +1,19 @@
 # Antigravity Mobile & Desktop Sync Workbench
 
-一套轻量、开源、零隐私硬编码的 **Antigravity 手机 App（Android 原生 APK） + 电脑宽屏同步工作台 + 通用伴侣服务端（Antigravity Link Server）**。
+一套轻量、开源、零隐私硬编码的 **Antigravity 手机 App（Android 原生 APK） + 官方 Antigravity 侧边栏原生插件（Mobile Sync Sidecar） + 电脑宽屏同步工作台 + 通用伴侣服务端（Antigravity Link Server）**。
 
-让你在 **手机** 与 **电脑同步工作台** 之间实现 **100% 实时逐字双向流式同步**：随时随地指挥电脑本机谷歌官方 Antigravity CLI（`agy`）、实时查看并续聊桌面 Antigravity IDE 历史会话、切换模型（含 Orchestrator 智能编排）、无损原图直传、在线浏览/预览/下载电脑工作区文件，并内置 **Cloudflare 免 VPN 公网加密隧道**（手机可一直挂着梯子/代理，校园网、公司网、Wi-Fi、5G 通吃）。
+让你在 **手机**、**官方 Antigravity IDE 侧边栏插件** 与 **电脑同步工作台** 之间实现 **100% 实时逐字双向流式同步**：随时随地指挥电脑本机谷歌官方 Antigravity CLI（`agy`）、实时查看并续聊桌面 Antigravity IDE 历史会话、切换模型（含 Orchestrator 智能编排）、无损原图直传、在线浏览/预览/下载电脑工作区文件，并内置 **Cloudflare 免 VPN 公网加密隧道**（手机可一直挂着梯子/代理，校园网、公司网、Wi-Fi、5G 通吃）。
 
 > [!IMPORTANT]
 > **使用前必读（同步范围提前说明，避免误会）：**
-> - **手机 App 发出的消息，不会显示在电脑「谷歌官方 Antigravity 客户端（IDE）」的聊天窗口里**：谷歌官方桌面端（`44.9.1+`）出于安全隔离已彻底封死外部程序写入接口，本项目仅调用合规的官方 `agy` CLI，不做任何客户端破解或进程注入。
-> - **想在电脑上实时看到手机发出的对话并双向续聊，请直接使用本项目自带的「电脑同步工作台」窗口**（双击桌面图标或访问 `http://127.0.0.1:18795/`）：它与手机 App **100% 实时逐字双向同步**，并会按真实时间轴自动合并展示「官方桌面客户端历史 + 手机新对话 + 工作台对话」（续聊时还会自动增量同步官方桌面端的新上下文给 AI）；同时电脑硬盘上的代码/文件三端实时共享。
+> - **手机 App 发出的消息，不会写入电脑「谷歌官方 Antigravity 客户端（IDE）」原生主聊天框里**：谷歌官方桌面端（`44.9.1+`）出于安全隔离已封死外部程序写入接口，本项目仅调用合规的官方 `agy` CLI 与官方 Sidecar 插件机制，不做任何客户端破解、ASAR 篡改或进程注入。
+> - **想在官方 Antigravity IDE 内同屏实时查看并续聊手机对话**：安装本仓库内置的 **官方 Antigravity 侧边栏插件（`Mobile Sync`）**，即可直接在 IDE 右侧辅助栏或左侧全屏边栏内打开同步工作台，自动跟随当前主窗口对话并同步浅色/深色主题！
+> - **也支持独立窗口打开**：双击桌面「Antigravity 同步工作台」图标或访问 `http://127.0.0.1:18795/`，与手机 App **100% 实时逐字双向同步**，并按真实时间轴自动合并展示「官方桌面客户端历史 + 手机新对话 + 工作台对话」（续聊时还会自动增量同步官方桌面端的新上下文给 AI）；同时电脑硬盘上的代码/文件三端实时共享。
 
 ```text
-  [Android 手机 App (~520 KB)]              [电脑同步工作台 (宽屏独立窗口)]
+  [Android 手机 App (~530 KB)]        [官方 Antigravity 侧边栏插件 / 独立工作台]
                │                                           │
-   Cloudflare 免 VPN 隧道 / 局域网 / Tailscale     127.0.0.1 本机免配对直连
+   Cloudflare 免 VPN 隧道 / 局域网 / Tailscale     127.0.0.1 回环直连 (Sidecar 令牌代理)
                └──────────────► [Antigravity Link Server] ◄┘
                                     (本机 :18795)
                                      │         │
@@ -41,7 +42,44 @@
 | **电脑磁盘代码 / 项目文件** | **三端 100% 实时共享** | 官方 IDE、电脑同步工作台与手机 App 操作的是同一台电脑的磁盘工作区；无论哪一端新建或修改了代码、脚本或图片，另两端立即可见。 |
 
 > [!TIP]
-> 最佳实践：在电脑上用官方 IDE 写代码或查阅工程，需要和手机无缝接力对话时，双击桌面唯一的 **「Antigravity 同步工作台」** 图标即可——离开工位拿起手机就能紧接着上一秒的流式输出继续聊。
+> 最佳实践：安装内置的 **官方 Antigravity 侧边栏插件（`Mobile Sync`）** 后，直接在官方 IDE 右侧辅助栏或左侧边栏即可同屏阅读并续聊手机 + 桌面合并时间轴；也可双击桌面 **「Antigravity 同步工作台」** 图标以独立宽屏窗口打开——离开工位拿起手机就能紧接着上一秒的流式输出继续聊。
+
+---
+
+## 官方 Antigravity 侧边栏插件（`plugin/` / `antigravity-sync`）
+
+不想在官方 Antigravity IDE 和独立浏览器窗口之间来回切换？本项目提供符合官方插件规范的原生 Sidecar UI 插件 **`Mobile Sync`（`antigravity-sync`）**，将完整的同步工作台无缝嵌入官方 Antigravity IDE：
+
+- **IDE 内同屏阅读与双向续聊**：直接在 Antigravity 右侧辅助栏（Auxiliary Pane）或左侧全屏边栏（Sidebar）中查看并续聊「桌面 + 手机」合并时间轴，实时流式输出、切换模型/蜂群、查看用量看板、出示手机扫码二维码，一切都在 IDE 内完成。
+- **零 ASAR 篡改 · 官方更新免疫**：基于 Antigravity 官方 Sidecar Plugin 机制构建，不修改客户端安装包、不注入核心进程，Antigravity 客户端版本升级后依然保持可用。
+- **自动跟随当前主窗口对话**：在侧边栏打开时自动读取当前主窗口正在查看的对话 ID 并直接加载合并时间轴；顶栏提供 **「已跟随主窗口 / 回到主窗口对话」** 状态胶囊与 **「在 Antigravity 主窗口打开此对话」** 快捷跳转按钮。
+- **自动同步浅色 / 深色主题**：实时接收 Antigravity 宿主主题变量并自动适配浅色与深色界面；右侧窄辅助栏自动启用可折叠会话抽屉与紧凑排版，左侧全屏视图（`>= 780px`）自动展开完整双栏宽屏布局。
+
+### 插件安装步骤（需要 Node.js 18+）
+
+1. **Windows**：
+   - 双击项目根目录的 [`install_antigravity_plugin.bat`](install_antigravity_plugin.bat) 即可一键安装；
+   - 或在 PowerShell 中运行：
+     ```powershell
+     powershell -ExecutionPolicy Bypass -File .\install_antigravity_plugin.ps1
+     ```
+2. **macOS / Linux**：
+   ```bash
+   chmod +x ./install_antigravity_plugin.sh
+   ./install_antigravity_plugin.sh
+   ```
+3. **手动安装（全平台通用）**：
+   - 将仓库中的 `plugin/` 目录完整复制到 `~/.gemini/config/plugins/antigravity-sync/` 即可（安装脚本不会改动 `~/.gemini/config/config.json`）。
+
+### 在 Antigravity IDE 中打开
+
+安装完成后（如 IDE 未立即发现，可在 Antigravity 中重载或重启一次），任选以下入口打开 **Mobile Sync**：
+- **右侧辅助栏（推荐，边写代码边同步）**：点击主窗口右侧辅助栏顶部的 **`+`** 菜单，选择 **`Mobile Sync`**。
+- **左侧全屏边栏（宽屏双栏视图）**：在 Antigravity 左侧边栏点击 **`Mobile Sync`**。
+- **插件管理页**：进入 **Customizations > Installed** 确认 `Mobile Sync`（`antigravity-sync`）已启用，也可在对话中让 Agent 直接唤出侧边栏面板。
+
+> [!NOTE]
+> **插件安全设计说明**：Sidecar 插件内置零第三方依赖的 Node.js 本地代理（`plugin/sidecars/workbench/server.mjs`），严格仅监听 `127.0.0.1` 回环地址，所有 API、配对页、媒体与 WebSocket 转发均执行**常量时间 `X-Sidecar-Token` 令牌校验**与同源检查，绝不放宽上游服务端任何 CORS 或鉴权策略。
 
 ---
 
@@ -358,7 +396,11 @@ python3 android/build_apk.py
 ```text
 .
 ├── agy_mobile_server.py                 # 伴侣服务端核心（API / WebSocket / 桌面镜像 / 隧道守护）
-├── www/                                 # 电脑同步工作台 & 手机端共用前端界面（Material 3）
+├── www/                                 # 电脑同步工作台 / IDE 插件视图 / 手机端共用前端界面（Material 3）
+├── plugin/                              # 官方 Antigravity 侧边栏插件（antigravity-sync / Mobile Sync Sidecar）
+├── install_antigravity_plugin.bat       # Windows 双击一键安装官方 Antigravity 侧边栏插件
+├── install_antigravity_plugin.ps1       # Windows PowerShell 插件安装脚本
+├── install_antigravity_plugin.sh        # macOS / Linux 插件安装脚本
 ├── android/                             # Android 原生壳源码与零 Gradle 构建脚本（build_apk.py）
 ├── dist/Antigravity-Mobile-Universal-v1.6.apk  # 预构建通用签名 Android 安装包
 ├── assets/antigravity_mobile.ico        # Windows 桌面快捷方式四色 A 图标

@@ -1,0 +1,26 @@
+{
+  "command": "node",
+  "args": ["server.mjs"],
+  "restart_policy": "always",
+  "display_name": "Mobile Sync",
+  "description": "Live two-way Mobile & Desktop Sync Workbench inside Antigravity: unified timeline, streaming chat, Usage Dashboard, and Phone QR Pairing.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "Mobile Sync",
+    "views": [
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/",
+        "title": "Mobile Sync"
+      },
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_SIDEBAR",
+        "path": "/?view=sidebar",
+        "title": "Mobile Sync"
+      }
+    ]
+  }
+}

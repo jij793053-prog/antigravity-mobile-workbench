@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <title>Antigravity Mobile Sync</title>
+  <defs>
+    <linearGradient id="bg-grad" x1="16" y1="14" x2="112" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="55%" stop-color="#4F46E5"/>
+      <stop offset="100%" stop-color="#3730A3"/>
+    </linearGradient>
+    <linearGradient id="accent-grad" x1="64" y1="30" x2="102" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67E8F9"/>
+      <stop offset="100%" stop-color="#A5B4FC"/>
+    </linearGradient>
+  </defs>
+  <!-- Outer badge with ~10% empty margin baked in (13px padding on 128x128 canvas) -->
+  <rect x="13" y="13" width="102" height="102" rx="24" fill="url(#bg-grad)"/>
+  <rect x="14.5" y="14.5" width="99" height="99" rx="22.5" stroke="#FFFFFF" stroke-opacity="0.24" stroke-width="3"/>
+
+  <!-- Desktop display (top-left) -->
+  <rect x="27" y="32" width="52" height="36" rx="6" fill="#FFFFFF" fill-opacity="0.16" stroke="#FFFFFF" stroke-width="4.5"/>
+  <path d="M43 76H61" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M52 68V76" stroke="#FFFFFF" stroke-width="4.5" stroke-linecap="round"/>
+
+  <!-- Two-way sync arcs -->
+  <path d="M36 86C42 93 52 96 62 93" stroke="url(#accent-grad)" stroke-width="4.2" stroke-linecap="round"/>
+  <path d="M57.5 87.5L63.5 93L57 98.5" stroke="url(#accent-grad)" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M90 42C84 35 74 32 64 35" stroke="url(#accent-grad)" stroke-width="4.2" stroke-linecap="round"/>
+  <path d="M68.5 40.5L62.5 35L69 29.5" stroke="url(#accent-grad)" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Smartphone (bottom-right) -->
+  <rect x="70" y="51" width="31" height="49" rx="7" fill="#1E1B4B" stroke="#FFFFFF" stroke-width="4.5"/>
+  <rect x="76" y="58" width="19" height="28" rx="2.5" fill="#67E8F9" fill-opacity="0.28"/>
+  <circle cx="85.5" cy="92.5" r="2.2" fill="#FFFFFF"/>
+</svg>

@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mobile Sync · Link Server Offline</title>
+  <script src="/preload.js"></script>
+  <script src="/sidecar-bridge.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --s-bg: var(--background, #f6f7fb);
+      --s-card: var(--card, #ffffff);
+      --s-fg: var(--foreground, #181b20);
+      --s-muted-fg: var(--muted-foreground, #5a6472);
+      --s-muted: var(--muted, #eef1f6);
+      --s-border: var(--border, rgba(15, 23, 42, 0.11));
+      --s-primary: var(--primary, #3b6ef6);
+      --s-primary-fg: var(--primary-foreground, #ffffff);
+      --s-font: var(--font-family, "Google Sans Flex", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+      --s-mono: var(--editor-font-family, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+      --s-warn: #d97706;
+      --s-ok: #16a34a;
+      --s-err: #dc2626;
+    }
+    :root[data-agy-theme="dark"] {
+      color-scheme: dark;
+      --s-bg: var(--background, #14161a);
+      --s-card: var(--card, #1c1f26);
+      --s-fg: var(--foreground, #e8ecf3);
+      --s-muted-fg: var(--muted-foreground, #9aa4b2);
+      --s-muted: var(--muted, #242934);
+      --s-border: var(--border, rgba(255, 255, 255, 0.12));
+      --s-primary: var(--primary, #5b8cff);
+      --s-primary-fg: var(--primary-foreground, #ffffff);
+      --s-warn: #f59e0b;
+      --s-ok: #22c55e;
+      --s-err: #f87171;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      background: var(--s-bg);
+      color: var(--s-fg);
+      font-family: var(--s-font);
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px 14px;
+    }
+    .card {
+      width: 100%;
+      max-width: 440px;
+      background: var(--s-card);
+      border: 1px solid var(--s-border);
+      border-radius: 14px;
+      padding: 20px 18px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+    }
+    .head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .icon-box {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--s-primary) 14%, transparent);
+      color: var(--s-primary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--s-fg);
+    }
+    .status-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--s-muted-fg);
+      margin-top: 2px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--s-warn);
+      display: inline-block;
+      animation: pulse 1.8s ease-in-out infinite;
+    }
+    .dot.online {
+      background: var(--s-ok);
+      animation: none;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    .desc {
+      margin: 0 0 14px;
+      color: var(--s-muted-fg);
+      font-size: 12.5px;
+    }
+    .banner {
+      display: none;
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      background: var(--s-muted);
+      color: var(--s-fg);
+      border: 1px solid var(--s-border);
+    }
+    .banner.show {
+      display: block;
+    }
+    .banner.ok {
+      border-color: color-mix(in srgb, var(--s-ok) 45%, transparent);
+      color: var(--s-ok);
+    }
+    .banner.err {
+      border-color: color-mix(in srgb, var(--s-err) 45%, transparent);
+      color: var(--s-err);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .btn {
+      appearance: none;
+      border-radius: 9px;
+      padding: 8px 14px;
+      font-size: 12.5px;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: opacity 0.15s ease, background 0.15s ease;
+    }
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      flex: 1 1 180px;
+      background: var(--s-primary);
+      color: var(--s-primary-fg);
+      border: 1px solid transparent;
+    }
+    .btn-primary:hover:not(:disabled) {
+      opacity: 0.92;
+    }
+    .btn-secondary {
+      background: var(--s-muted);
+      color: var(--s-fg);
+      border: 1px solid var(--s-border);
+    }
+    .btn-secondary:hover:not(:disabled) {
+      opacity: 0.88;
+    }
+    .hidden {
+      display: none !important;
+    }
+    .manual {
+      border-top: 1px solid var(--s-border);
+      padding-top: 12px;
+      margin-top: 4px;
+    }
+    .manual-title {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--s-muted-fg);
+      margin: 0 0 8px;
+    }
+    .cmd-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .cmd-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 9px;
+      border-radius: 7px;
+      background: var(--s-muted);
+      border: 1px solid var(--s-border);
+      font-size: 11.5px;
+    }
+    .cmd-label {
+      color: var(--s-muted-fg);
+      flex-shrink: 0;
+    }
+    .cmd-row code {
+      font-family: var(--s-mono);
+      font-size: 11.5px;
+      color: var(--s-fg);
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .foot {
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11.5px;
+      color: var(--s-muted-fg);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card" aria-live="polite">
+      <div class="head">
+        <div class="icon-box" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="14" height="10" rx="2"></rect>
+            <path d="M8 13v3M5 16h6"></path>
+            <rect x="14" y="10" width="8" height="12" rx="2"></rect>
+            <line x1="18" y1="19" x2="18.01" y2="19"></line>
+          </svg>
+        </div>
+        <div>
+          <h1 class="title">Antigravity Link Server 未运行</h1>
+          <div class="status-line">
+            <span id="status-dot" class="dot" aria-hidden="true"></span>
+            <span id="status-text">正在检测 127.0.0.1:18795...</span>
+          </div>
+        </div>
+      </div>
+
+      <p class="desc">
+        Mobile Sync 侧边工作台通过本机回环连接到 <strong>Antigravity Link Server</strong>，以实现手机与电脑实时双向同步、扫码配对和额度看板。
+      </p>
+
+      <div id="msg-banner" class="banner" role="status"></div>
+
+      <div class="actions">
+        <button id="btn-start-server" class="btn btn-primary hidden" type="button">
+          启动本地 Link Server
+        </button>
+        <button id="btn-retry" class="btn btn-secondary" type="button">
+          立即重试
+        </button>
+      </div>
+
+      <div class="manual">
+        <p class="manual-title">手动启动命令（项目根目录）</p>
+        <div class="cmd-list">
+          <div class="cmd-row">
+            <span class="cmd-label">Windows</span>
+            <code>start_link_server.bat</code>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-label">macOS / Linux</span>
+            <code>./start_link_server.sh</code>
+          </div>
+          <div class="cmd-row">
+            <span class="cmd-label">Python</span>
+            <code>python agy_mobile_server.py</code>
+          </div>
+        </div>
+      </div>
+
+      <div class="foot">
+        <span id="poll-hint">每 3 秒自动检测并进入工作台</span>
+        <span id="port-badge">127.0.0.1:18795</span>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const statusDot = document.getElementById('status-dot');
+      const statusText = document.getElementById('status-text');
+      const portBadge = document.getElementById('port-badge');
+      const msgBanner = document.getElementById('msg-banner');
+      const startBtn = document.getElementById('btn-start-server');
+      const retryBtn = document.getElementById('btn-retry');
+      let busyStarting = false;
+      let redirecting = false;
+
+      function showBanner(text, kind) {
+        if (!text) {
+          msgBanner.className = 'banner';
+          msgBanner.textContent = '';
+          return;
+        }
+        msgBanner.className = 'banner show' + (kind ? ' ' + kind : '');
+        msgBanner.textContent = text;
+      }
+
+      function enterWorkbench() {
+        if (redirecting) return;
+        redirecting = true;
+        statusDot.classList.add('online');
+        statusText.textContent = 'Link Server 已上线，正在进入工作台...';
+        showBanner('连接成功，正在加载 Mobile Sync 工作台...', 'ok');
+        setTimeout(() => {
+          if (window.__AGY_SIDECAR__ && typeof window.__AGY_SIDECAR__.reloadWithToken === 'function') {
+            window.__AGY_SIDECAR__.reloadWithToken();
+          } else {
+            window.location.reload();
+          }
+        }, 250);
+      }
+
+      async function checkHealth(manual) {
+        if (redirecting) return;
+        if (manual) {
+          retryBtn.disabled = true;
+          statusText.textContent = '正在重新检测连接...';
+        }
+        try {
+          const resp = await window.fetch('/__sidecar/health', { cache: 'no-store' });
+          if (!resp.ok) {
+            statusText.textContent = 'Sidecar 鉴权或状态异常 (HTTP ' + resp.status + ')';
+            return;
+          }
+          const data = await resp.json();
+          const port = data && data.upstreamPort ? data.upstreamPort : 18795;
+          portBadge.textContent = '127.0.0.1:' + port;
+
+          if (data && data.canStartServer) {
+            startBtn.classList.remove('hidden');
+          } else {
+            startBtn.classList.add('hidden');
+          }
+
+          if (data && data.upstreamOnline) {
+            enterWorkbench();
+            return;
+          }
+
+          if (!busyStarting) {
+            statusText.textContent = '未检测到 127.0.0.1:' + port + ' 服务';
+          }
+        } catch (_) {
+          if (!busyStarting) {
+            statusText.textContent = '无法连接 Sidecar 健康检查接口';
+          }
+        } finally {
+          if (manual) {
+            retryBtn.disabled = false;
+          }
+        }
+      }
+
+      startBtn.addEventListener('click', async () => {
+        if (busyStarting || redirecting) return;
+        busyStarting = true;
+        startBtn.disabled = true;
+        startBtn.textContent = '正在启动 Link Server...';
+        statusText.textContent = '正在后台拉起本地服务，请稍候...';
+        showBanner('正在启动 agy_mobile_server.py，最长等待 8 秒...', '');
+        try {
+          const res = window.__AGY_SIDECAR__ && typeof window.__AGY_SIDECAR__.startLocalServer === 'function'
+            ? await window.__AGY_SIDECAR__.startLocalServer()
+            : await window.fetch('/__sidecar/start-server', { method: 'POST', cache: 'no-store' }).then((r) => r.json());
+
+          if (res && res.upstreamOnline) {
+            enterWorkbench();
+            return;
+          }
+          if (res && res.started) {
+            showBanner(res.message || '服务进程已启动，正在等待就绪（自动重连中）...', '');
+          } else {
+            showBanner((res && res.message) || '启动失败，请检查 Python 环境或使用下方命令手动启动。', 'err');
+          }
+        } catch (_) {
+          showBanner('启动请求失败，请使用下方命令手动启动 Link Server。', 'err');
+        } finally {
+          busyStarting = false;
+          if (!redirecting) {
+            startBtn.disabled = false;
+            startBtn.textContent = '启动本地 Link Server';
+          }
+        }
+      });
+
+      retryBtn.addEventListener('click', () => {
+        checkHealth(true);
+      });
+
+      checkHealth(false);
+      window.setInterval(() => {
+        if (!busyStarting && !redirecting) {
+          checkHealth(false);
+        }
+      }, 3000);
+    })();
+  </script>
+</body>
+</html>
