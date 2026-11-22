@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const SIDECAR_VERSION = '1.7.0';
+const SIDECAR_VERSION = '1.7.4';
 const BIND_HOST = '127.0.0.1';
 const UPSTREAM_HOST = '127.0.0.1';
 const SIDECAR_TOKEN = String(process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN || '').trim();
@@ -33,6 +33,7 @@ const HEADER_ONLY_AUTH_PATHS = new Set([
   '/api/local-auth',
   '/__sidecar/start-server',
   '/__sidecar/events',
+  '/__sidecar/poll',
 ]);
 
 const STRIP_REQ_HEADER_EXACT = new Set([
@@ -522,6 +523,8 @@ function proxyHtmlWithInjection(req, res, upstreamPath, options) {
   const cleanHeaders = sanitizeUpstreamHeaders(req.headers, {
     'accept-encoding': 'identity',
   });
+  delete cleanHeaders['if-none-match'];
+  delete cleanHeaders['if-modified-since'];
 
   const upReq = http.request(
     {
@@ -537,7 +540,7 @@ function proxyHtmlWithInjection(req, res, upstreamPath, options) {
       const status = upRes.statusCode || 502;
 
       if (req.method === 'HEAD' || status !== 200 || !contentType.toLowerCase().includes('text/html')) {
-        const extra = { 'cache-control': 'no-store' };
+        const extra = { 'cache-control': 'no-store', etag: undefined, 'last-modified': undefined };
         if (!preserveFrameHeaders) {
           extra['x-frame-options'] = undefined;
         }
@@ -561,6 +564,8 @@ function proxyHtmlWithInjection(req, res, upstreamPath, options) {
           'content-encoding': undefined,
           'transfer-encoding': undefined,
           'cache-control': 'no-store',
+          etag: undefined,
+          'last-modified': undefined,
         };
         if (preserveFrameHeaders) {
           extra['x-frame-options'] = upRes.headers['x-frame-options'] || 'SAMEORIGIN';
@@ -602,6 +607,12 @@ function proxyHtmlWithInjection(req, res, upstreamPath, options) {
 
 function proxyStreamingHttp(req, res, upstreamPath) {
   const cleanHeaders = sanitizeUpstreamHeaders(req.headers);
+  const isLongOp =
+    upstreamPath.startsWith('/api/upload') ||
+    upstreamPath.startsWith('/api/chat/send') ||
+    upstreamPath.startsWith('/api/files/download') ||
+    upstreamPath.startsWith('/download-apk');
+  const reqTimeoutMs = isLongOp ? 180000 : 30000;
 
   const upReq = http.request(
     {
@@ -610,13 +621,23 @@ function proxyStreamingHttp(req, res, upstreamPath) {
       method: req.method,
       path: upstreamPath,
       headers: cleanHeaders,
+      timeout: reqTimeoutMs,
     },
     (upRes) => {
-      const respHeaders = sanitizeResponseHeaders(upRes.headers);
+      const respHeaders = sanitizeResponseHeaders(upRes.headers, { 'keep-alive': undefined });
       res.writeHead(upRes.statusCode || 502, respHeaders);
       upRes.pipe(res);
     }
   );
+
+  upReq.on('timeout', () => {
+    upReq.destroy();
+    if (!res.headersSent) {
+      sendJson(res, 504, { ok: false, error: 'Upstream Link Server request timed out' });
+    } else {
+      res.destroy();
+    }
+  });
 
   upReq.on('error', () => {
     if (!res.headersSent) {
@@ -665,7 +686,391 @@ function buildMaskedClientWsFrame(opcode, payloadBuf) {
   return Buffer.concat([header, masked]);
 }
 
-function bridgeUpstreamWsToSse(req, res, urlObj) {
+const MAX_HUB_EVENTS = 500;
+const MAX_SSE_SUBSCRIBERS = 2;
+const SSE_MAX_LIFETIME_MS = 45000;
+const HUB_IDLE_DISCONNECT_MS = 120000;
+
+const upstreamHub = {
+  socket: null,
+  connected: false,
+  token: '',
+  epoch: `hub_${Date.now().toString(36)}_0`,
+  epochSeq: 0,
+  seq: 0,
+  events: [],
+  sseSubscribers: new Set(),
+  connectingPromise: null,
+  connectingToken: '',
+  lastActivityAt: 0,
+  idleTimer: null,
+};
+
+function closeAllSseSubscribers() {
+  for (const sub of Array.from(upstreamHub.sseSubscribers)) {
+    try {
+      sub.close();
+    } catch {}
+  }
+  upstreamHub.sseSubscribers.clear();
+}
+
+function disconnectUpstreamHub(notifySubscribers = false) {
+  if (upstreamHub.idleTimer) {
+    clearInterval(upstreamHub.idleTimer);
+    upstreamHub.idleTimer = null;
+  }
+  const sock = upstreamHub.socket;
+  upstreamHub.socket = null;
+  upstreamHub.connected = false;
+  if (sock && !sock.destroyed) {
+    try {
+      sock.destroy();
+    } catch {}
+  }
+  if (notifySubscribers) {
+    closeAllSseSubscribers();
+  }
+}
+
+function pushHubEvent(text) {
+  const singleLine = String(text || '').replace(/\r?\n/g, ' ');
+  if (!singleLine) return;
+  upstreamHub.seq += 1;
+  upstreamHub.events.push({ seq: upstreamHub.seq, text: singleLine });
+  if (upstreamHub.events.length > MAX_HUB_EVENTS) {
+    upstreamHub.events.splice(0, upstreamHub.events.length - MAX_HUB_EVENTS);
+  }
+  for (const sub of Array.from(upstreamHub.sseSubscribers)) {
+    try {
+      sub.emit(singleLine);
+    } catch {
+      try {
+        sub.close();
+      } catch {}
+    }
+  }
+}
+
+function probeUpstreamBearer(bearerToken, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (!settled) {
+        settled = true;
+        resolve(ok);
+      }
+    };
+    const req = http.request(
+      {
+        hostname: UPSTREAM_HOST,
+        port: UPSTREAM_PORT,
+        path: '/api/server-info',
+        method: 'GET',
+        timeout: timeoutMs,
+        headers: {
+          host: `${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
+          authorization: `Bearer ${bearerToken}`,
+          accept: 'application/json',
+        },
+      },
+      (upRes) => {
+        upRes.resume();
+        done(upRes.statusCode === 200);
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      done(false);
+    });
+    req.on('error', () => done(false));
+    req.end();
+  });
+}
+
+function startHubConnection(bearerToken, timeoutMs = 2500) {
+  disconnectUpstreamHub(false);
+  const promise = new Promise((resolve) => {
+    const wsKey = crypto.randomBytes(16).toString('base64');
+    const upstreamPath = `/ws?token=${encodeURIComponent(bearerToken)}`;
+    const handshake =
+      `GET ${upstreamPath} HTTP/1.1\r\n` +
+      `Host: ${UPSTREAM_HOST}:${UPSTREAM_PORT}\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${wsKey}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n\r\n`;
+
+    const sock = net.connect({ host: UPSTREAM_HOST, port: UPSTREAM_PORT });
+    upstreamHub.socket = sock;
+    let settled = false;
+    let handshakeDone = false;
+    let rxBuf = Buffer.alloc(0);
+    let fragOpcode = 0;
+    let fragChunks = [];
+
+    const finish = (result) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(connectTimer);
+        if (upstreamHub.connectingPromise === promise) {
+          upstreamHub.connectingPromise = null;
+          upstreamHub.connectingToken = '';
+        }
+        resolve(result);
+      }
+    };
+
+    const failAndClose = (status, error) => {
+      if (upstreamHub.socket === sock) {
+        disconnectUpstreamHub(handshakeDone);
+      } else if (!sock.destroyed) {
+        try {
+          sock.destroy();
+        } catch {}
+      }
+      finish({ ok: false, status, error });
+    };
+
+    const connectTimer = setTimeout(() => {
+      failAndClose(502, 'Upstream WS handshake timed out');
+    }, timeoutMs);
+
+    const drainWsFrames = () => {
+      while (upstreamHub.socket === sock && !sock.destroyed && rxBuf.length >= 2) {
+        const b0 = rxBuf[0];
+        const b1 = rxBuf[1];
+        const fin = Boolean(b0 & 0x80);
+        const opcode = b0 & 0x0f;
+        const masked = Boolean(b1 & 0x80);
+        let payloadLen = b1 & 0x7f;
+        let offset = 2;
+
+        if (payloadLen === 126) {
+          if (rxBuf.length < 4) return;
+          payloadLen = rxBuf.readUInt16BE(2);
+          offset = 4;
+        } else if (payloadLen === 127) {
+          if (rxBuf.length < 10) return;
+          const bigLen = rxBuf.readBigUInt64BE(2);
+          if (bigLen > 16n * 1024n * 1024n) {
+            failAndClose(502, 'Upstream WS frame too large');
+            return;
+          }
+          payloadLen = Number(bigLen);
+          offset = 10;
+        }
+
+        const maskLen = masked ? 4 : 0;
+        if (rxBuf.length < offset + maskLen + payloadLen) return;
+
+        let payload = rxBuf.subarray(offset + maskLen, offset + maskLen + payloadLen);
+        if (masked) {
+          const maskKey = rxBuf.subarray(offset, offset + 4);
+          const unmasked = Buffer.allocUnsafe(payloadLen);
+          for (let i = 0; i < payloadLen; i += 1) {
+            unmasked[i] = payload[i] ^ maskKey[i & 3];
+          }
+          payload = unmasked;
+        } else {
+          payload = Buffer.from(payload);
+        }
+
+        rxBuf = rxBuf.subarray(offset + maskLen + payloadLen);
+
+        if (opcode === 0x8) {
+          failAndClose(502, 'Upstream WS closed');
+          return;
+        }
+        if (opcode === 0x9) {
+          try {
+            sock.write(buildMaskedClientWsFrame(0xA, payload));
+          } catch {
+            failAndClose(502, 'Upstream WS pong write failed');
+            return;
+          }
+          continue;
+        }
+        if (opcode === 0xA) {
+          continue;
+        }
+
+        if (opcode === 0x1 || opcode === 0x2) {
+          if (fin) {
+            if (opcode === 0x1) pushHubEvent(payload.toString('utf8'));
+          } else {
+            fragOpcode = opcode;
+            fragChunks = [payload];
+          }
+        } else if (opcode === 0x0 && fragOpcode) {
+          fragChunks.push(payload);
+          if (fin) {
+            if (fragOpcode === 0x1) {
+              pushHubEvent(Buffer.concat(fragChunks).toString('utf8'));
+            }
+            fragOpcode = 0;
+            fragChunks = [];
+          }
+        }
+      }
+    };
+
+    sock.on('connect', () => {
+      if (upstreamHub.socket !== sock) {
+        sock.destroy();
+        return;
+      }
+      sock.write(handshake);
+    });
+
+    sock.on('data', (chunk) => {
+      if (upstreamHub.socket !== sock) return;
+      rxBuf = rxBuf.length ? Buffer.concat([rxBuf, chunk]) : Buffer.from(chunk);
+      if (!handshakeDone) {
+        const sepIdx = rxBuf.indexOf('\r\n\r\n');
+        if (sepIdx === -1) {
+          if (rxBuf.length > 16384) {
+            failAndClose(502, 'Malformed upstream WS handshake');
+          }
+          return;
+        }
+        const headText = rxBuf.subarray(0, sepIdx).toString('latin1');
+        const statusLine = headText.split('\r\n')[0] || '';
+        const statusMatch = /^HTTP\/1\.\d\s+(\d{3})/.exec(statusLine);
+        const upStatus = statusMatch ? Number(statusMatch[1]) : 502;
+        rxBuf = rxBuf.subarray(sepIdx + 4);
+        handshakeDone = true;
+
+        if (upStatus !== 101) {
+          failAndClose(upStatus === 401 ? 401 : 502, `Upstream WS rejected (${upStatus})`);
+          return;
+        }
+
+        upstreamHub.connected = true;
+        upstreamHub.token = bearerToken;
+        upstreamHub.epochSeq += 1;
+        upstreamHub.epoch = `hub_${Date.now().toString(36)}_${upstreamHub.epochSeq}`;
+        upstreamHub.lastActivityAt = Date.now();
+        if (upstreamHub.idleTimer) clearInterval(upstreamHub.idleTimer);
+        upstreamHub.idleTimer = setInterval(() => {
+          if (
+            upstreamHub.connected &&
+            upstreamHub.sseSubscribers.size === 0 &&
+            Date.now() - upstreamHub.lastActivityAt > HUB_IDLE_DISCONNECT_MS
+          ) {
+            disconnectUpstreamHub(false);
+          }
+        }, 30000);
+        if (typeof upstreamHub.idleTimer.unref === 'function') {
+          upstreamHub.idleTimer.unref();
+        }
+        finish({ ok: true, status: 200 });
+      }
+      drainWsFrames();
+    });
+
+    sock.on('error', () => {
+      failAndClose(502, 'Upstream Link Server WS unavailable');
+    });
+    sock.on('close', () => {
+      failAndClose(502, 'Upstream Link Server WS closed');
+    });
+  });
+
+  upstreamHub.connectingPromise = promise;
+  upstreamHub.connectingToken = bearerToken;
+  return promise;
+}
+
+async function ensureUpstreamHub(bearerToken, timeoutMs = 2500) {
+  upstreamHub.lastActivityAt = Date.now();
+  if (upstreamHub.connected && upstreamHub.socket && !upstreamHub.socket.destroyed) {
+    if (safeTokenEqual(bearerToken, upstreamHub.token)) {
+      return { ok: true, status: 200 };
+    }
+    const valid = await probeUpstreamBearer(bearerToken, 2000);
+    if (!valid) {
+      return { ok: false, status: 401, error: 'Upstream WS rejected (401)' };
+    }
+    return startHubConnection(bearerToken, timeoutMs);
+  }
+
+  if (upstreamHub.connectingPromise) {
+    if (safeTokenEqual(bearerToken, upstreamHub.connectingToken)) {
+      return upstreamHub.connectingPromise;
+    }
+    await upstreamHub.connectingPromise;
+    if (upstreamHub.connected && upstreamHub.socket && !upstreamHub.socket.destroyed) {
+      if (safeTokenEqual(bearerToken, upstreamHub.token)) {
+        return { ok: true, status: 200 };
+      }
+      const valid = await probeUpstreamBearer(bearerToken, 2000);
+      if (!valid) {
+        return { ok: false, status: 401, error: 'Upstream WS rejected (401)' };
+      }
+    }
+  }
+
+  return startHubConnection(bearerToken, timeoutMs);
+}
+
+async function handleSidecarPoll(req, res, urlObj) {
+  const authHdr = String(req.headers.authorization || '').trim();
+  const bearerToken = authHdr.toLowerCase().startsWith('bearer ') ? authHdr.slice(7).trim() : '';
+  if (!bearerToken) {
+    sendJson(res, 401, { ok: false, error: 'Missing upstream bearer token' });
+    return;
+  }
+
+  const conn = await ensureUpstreamHub(bearerToken, 2500);
+  if (!conn.ok) {
+    if (conn.status === 401) {
+      sendJson(res, 401, { ok: false, error: conn.error || 'Unauthorized' });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      connected: false,
+      epoch: upstreamHub.epoch,
+      seq: upstreamHub.seq,
+      reset: false,
+      events: [],
+    });
+    return;
+  }
+
+  const sinceRaw = urlObj.searchParams.get('since');
+  let since = -1;
+  if (sinceRaw !== null && sinceRaw !== '') {
+    const parsed = Number.parseInt(sinceRaw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      since = parsed;
+    }
+  }
+
+  let events = [];
+  let reset = false;
+  if (since >= 0) {
+    const oldestSeq = upstreamHub.events.length ? upstreamHub.events[0].seq : upstreamHub.seq + 1;
+    if (since > upstreamHub.seq || (upstreamHub.events.length > 0 && since < oldestSeq - 1)) {
+      events = upstreamHub.events.map((e) => e.text);
+      reset = true;
+    } else if (since < upstreamHub.seq) {
+      events = upstreamHub.events.filter((e) => e.seq > since).map((e) => e.text);
+    }
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    connected: true,
+    epoch: upstreamHub.epoch,
+    seq: upstreamHub.seq,
+    reset,
+    events,
+  });
+}
+
+async function bridgeUpstreamWsToSse(req, res, urlObj) {
   const authHdr = String(req.headers.authorization || '').trim();
   const bearerFromHdr = authHdr.toLowerCase().startsWith('bearer ') ? authHdr.slice(7).trim() : '';
   const bearerToken = bearerFromHdr || String(urlObj.searchParams.get('token') || '').trim();
@@ -674,187 +1079,93 @@ function bridgeUpstreamWsToSse(req, res, urlObj) {
     return;
   }
 
-  const wsKey = crypto.randomBytes(16).toString('base64');
-  const upstreamPath = `/ws?token=${encodeURIComponent(bearerToken)}`;
-  const handshake =
-    `GET ${upstreamPath} HTTP/1.1\r\n` +
-    `Host: ${UPSTREAM_HOST}:${UPSTREAM_PORT}\r\n` +
-    `Upgrade: websocket\r\n` +
-    `Connection: Upgrade\r\n` +
-    `Sec-WebSocket-Key: ${wsKey}\r\n` +
-    `Sec-WebSocket-Version: 13\r\n\r\n`;
+  const conn = await ensureUpstreamHub(bearerToken, 3000);
+  if (res.writableEnded || res.destroyed) return;
+  if (!conn.ok) {
+    sendJson(res, conn.status === 401 ? 401 : 502, {
+      ok: false,
+      error: conn.error || 'Upstream Link Server WS unavailable',
+    });
+    return;
+  }
 
-  const upstream = net.connect({ host: UPSTREAM_HOST, port: UPSTREAM_PORT });
-  let handshakeDone = false;
-  let sseStarted = false;
+  // Cap active SSE streams so legacy/cached clients can NEVER exhaust Chromium's 6-connection HTTP/1.1 pool.
+  while (upstreamHub.sseSubscribers.size >= MAX_SSE_SUBSCRIBERS) {
+    const oldest = upstreamHub.sseSubscribers.values().next().value;
+    if (!oldest) break;
+    oldest.close();
+  }
+
   let closed = false;
-  let rxBuf = Buffer.alloc(0);
-  let fragOpcode = 0;
-  let fragChunks = [];
   let keepaliveTimer = null;
+  let maxLifeTimer = null;
 
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    if (keepaliveTimer) {
-      clearInterval(keepaliveTimer);
-      keepaliveTimer = null;
-    }
-    if (!upstream.destroyed) upstream.destroy();
-    if (sseStarted && !res.writableEnded) {
-      try { res.end(); } catch {}
-    }
-  };
-
-  const emitSseText = (text) => {
-    if (closed || !sseStarted || res.writableEnded) return;
-    const singleLine = String(text || '').replace(/\r?\n/g, ' ');
-    try {
-      res.write(`data: ${singleLine}\n\n`);
-    } catch {
-      cleanup();
-    }
-  };
-
-  const drainWsFrames = () => {
-    while (!closed && rxBuf.length >= 2) {
-      const b0 = rxBuf[0];
-      const b1 = rxBuf[1];
-      const fin = Boolean(b0 & 0x80);
-      const opcode = b0 & 0x0f;
-      const masked = Boolean(b1 & 0x80);
-      let payloadLen = b1 & 0x7f;
-      let offset = 2;
-
-      if (payloadLen === 126) {
-        if (rxBuf.length < 4) return;
-        payloadLen = rxBuf.readUInt16BE(2);
-        offset = 4;
-      } else if (payloadLen === 127) {
-        if (rxBuf.length < 10) return;
-        const bigLen = rxBuf.readBigUInt64BE(2);
-        if (bigLen > 16n * 1024n * 1024n) {
-          cleanup();
-          return;
-        }
-        payloadLen = Number(bigLen);
-        offset = 10;
+  const sub = {
+    emit(singleLine) {
+      if (closed || res.writableEnded || res.destroyed) return;
+      try {
+        res.write(`data: ${singleLine}\n\n`);
+      } catch {
+        sub.close();
       }
-
-      const maskLen = masked ? 4 : 0;
-      if (rxBuf.length < offset + maskLen + payloadLen) return;
-
-      let payload = rxBuf.subarray(offset + maskLen, offset + maskLen + payloadLen);
-      if (masked) {
-        const maskKey = rxBuf.subarray(offset, offset + 4);
-        const unmasked = Buffer.allocUnsafe(payloadLen);
-        for (let i = 0; i < payloadLen; i += 1) {
-          unmasked[i] = payload[i] ^ maskKey[i & 3];
-        }
-        payload = unmasked;
-      } else {
-        payload = Buffer.from(payload);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      upstreamHub.sseSubscribers.delete(sub);
+      if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
       }
-
-      rxBuf = rxBuf.subarray(offset + maskLen + payloadLen);
-
-      if (opcode === 0x8) {
-        cleanup();
-        return;
+      if (maxLifeTimer) {
+        clearTimeout(maxLifeTimer);
+        maxLifeTimer = null;
       }
-      if (opcode === 0x9) {
-        // Respond to server Ping with masked Pong
+      if (!res.writableEnded) {
         try {
-          upstream.write(buildMaskedClientWsFrame(0xA, payload));
-        } catch {
-          cleanup();
-        }
-        continue;
+          res.end();
+        } catch {}
       }
-      if (opcode === 0xA) {
-        continue;
-      }
-
-      if (opcode === 0x1 || opcode === 0x2) {
-        if (fin) {
-          if (opcode === 0x1) emitSseText(payload.toString('utf8'));
-        } else {
-          fragOpcode = opcode;
-          fragChunks = [payload];
-        }
-      } else if (opcode === 0x0 && fragOpcode) {
-        fragChunks.push(payload);
-        if (fin) {
-          if (fragOpcode === 0x1) {
-            emitSseText(Buffer.concat(fragChunks).toString('utf8'));
-          }
-          fragOpcode = 0;
-          fragChunks = [];
-        }
-      }
-    }
+    },
   };
 
-  upstream.on('connect', () => {
-    upstream.write(handshake);
+  upstreamHub.sseSubscribers.add(sub);
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+    'connection': 'close',
+    'x-accel-buffering': 'no',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
   });
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+  try {
+    res.write(': connected\n\n');
+    res.write(`data: ${JSON.stringify({ type: 'hello', ts: Date.now() / 1000 })}\n\n`);
+  } catch {
+    sub.close();
+    return;
+  }
 
-  upstream.on('data', (chunk) => {
-    if (closed) return;
-    rxBuf = rxBuf.length ? Buffer.concat([rxBuf, chunk]) : Buffer.from(chunk);
-    if (!handshakeDone) {
-      const sepIdx = rxBuf.indexOf('\r\n\r\n');
-      if (sepIdx === -1) {
-        if (rxBuf.length > 16384) {
-          if (!res.headersSent) sendJson(res, 502, { ok: false, error: 'Malformed upstream WS handshake' });
-          cleanup();
-        }
-        return;
+  keepaliveTimer = setInterval(() => {
+    if (!closed && !res.writableEnded) {
+      try {
+        res.write(': keepalive\n\n');
+      } catch {
+        sub.close();
       }
-      const headText = rxBuf.subarray(0, sepIdx).toString('latin1');
-      const statusLine = headText.split('\r\n')[0] || '';
-      const statusMatch = /^HTTP\/1\.\d\s+(\d{3})/.exec(statusLine);
-      const upStatus = statusMatch ? Number(statusMatch[1]) : 502;
-      rxBuf = rxBuf.subarray(sepIdx + 4);
-      handshakeDone = true;
-
-      if (upStatus !== 101) {
-        if (!res.headersSent) {
-          sendJson(res, upStatus === 401 ? 401 : 502, { ok: false, error: `Upstream WS rejected (${upStatus})` });
-        }
-        cleanup();
-        return;
-      }
-
-      sseStarted = true;
-      res.writeHead(200, {
-        'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-store, no-transform',
-        'connection': 'keep-alive',
-        'x-accel-buffering': 'no',
-        'x-content-type-options': 'nosniff',
-        'referrer-policy': 'no-referrer',
-      });
-      if (typeof res.flushHeaders === 'function') res.flushHeaders();
-      res.write(': connected\n\n');
-      keepaliveTimer = setInterval(() => {
-        if (!closed && sseStarted && !res.writableEnded) {
-          try { res.write(': keepalive\n\n'); } catch { cleanup(); }
-        }
-      }, 15000);
     }
-    drainWsFrames();
-  });
+  }, 15000);
+  if (typeof keepaliveTimer.unref === 'function') keepaliveTimer.unref();
 
-  upstream.on('error', () => {
-    if (!res.headersSent) {
-      sendJson(res, 502, { ok: false, error: 'Upstream Link Server WS unavailable' });
-    }
-    cleanup();
-  });
-  upstream.on('close', cleanup);
-  req.on('close', cleanup);
-  res.on('close', cleanup);
+  maxLifeTimer = setTimeout(() => {
+    sub.close();
+  }, SSE_MAX_LIFETIME_MS);
+  if (typeof maxLifeTimer.unref === 'function') maxLifeTimer.unref();
+
+  req.on('aborted', () => sub.close());
+  res.on('close', () => sub.close());
+  res.on('error', () => sub.close());
 }
 
 function buildUpstreamPath(urlObj, stripAllQuery = false) {
@@ -989,19 +1300,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/__sidecar/poll') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
+        return;
+      }
+      await handleSidecarPoll(req, res, urlObj);
+      return;
+    }
+
     if (pathname === '/__sidecar/events') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
         return;
       }
-      bridgeUpstreamWsToSse(req, res, urlObj);
+      await bridgeUpstreamWsToSse(req, res, urlObj);
       return;
     }
 
     // Root Workbench HTML (aux pane / and sidebar /sidebar) with preload + sidecar-bridge injection and offline fallback
     if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/' || pathname === '/index.html' || pathname === '/sidebar')) {
       proxyHtmlWithInjection(req, res, '/', {
-        scriptsMarkup: '<script src="/preload.js"></script>\n  <script src="/sidecar-bridge.js"></script>',
+        scriptsMarkup: `<script src="/preload.js?v=${SIDECAR_VERSION}"></script>\n  <script src="/sidecar-bridge.js?v=${SIDECAR_VERSION}"></script>`,
         fallbackOffline: true,
         preserveFrameHeaders: false,
       });
@@ -1018,7 +1338,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/pair') {
       const upstreamPath = buildUpstreamPath(urlObj, false);
       proxyHtmlWithInjection(req, res, upstreamPath, {
-        scriptsMarkup: '<script src="/sidecar-bridge.js"></script>',
+        scriptsMarkup: `<script src="/sidecar-bridge.js?v=${SIDECAR_VERSION}"></script>`,
         fallbackOffline: false,
         preserveFrameHeaders: !SIDECAR_TOKEN,
         transformHtml: (html) =>
@@ -1165,6 +1485,7 @@ server.listen(LISTEN_PORT, BIND_HOST, () => {
 });
 
 function shutdown() {
+  disconnectUpstreamHub(true);
   server.close(() => process.exit(0));
   if (typeof server.closeAllConnections === 'function') {
     server.closeAllConnections();

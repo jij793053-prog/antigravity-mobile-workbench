@@ -55,12 +55,20 @@
     qqbotAvailable: false,
     workspaceRoot: "",
     sidecarAutoFollowed: false,
+    sidecarAutoFollowInFlight: false,
     sidecarUserPicked: false,
 
     ws: null,
     wsConnected: false,
+    connPhase: "connecting", // "connecting" | "online" | "reconnecting" | "offline"
     reconnectTimer: null,
     connectEpoch: 0,
+    sseAbort: null,
+    sidecarPollTimer: null,
+    sidecarPollAbort: null,
+    sidecarPollSeq: -1,
+    sidecarPollEpoch: "",
+    sidecarPollUnsupported: false,
 
     conversations: [],
     filter: "all",           // "all" | "mobile" | "desktop" | "external"
@@ -310,6 +318,26 @@
       const nextTheme = ev && ev.detail && ev.detail.theme ? String(ev.detail.theme) : "";
       syncSidecarTheme(nextTheme);
     });
+    window.addEventListener("agy-sidecar-conversation", (ev) => {
+      const nextCid = ev && ev.detail && ev.detail.conversationId ? String(ev.detail.conversationId).trim() : "";
+      if (!SIDECAR_CID_RE.test(nextCid)) return;
+      updateSidecarHeaderActions();
+      if (
+        !state.sidecarUserPicked &&
+        !state.streaming &&
+        !String(state.currentCid || "").startsWith("pending-") &&
+        nextCid !== state.currentCid &&
+        getActiveHost()
+      ) {
+        maybeAutoFollowSidecarConversation({ forceSwitch: true });
+      }
+    });
+    window.addEventListener("pagehide", () => {
+      disconnectWs();
+    });
+    window.addEventListener("beforeunload", () => {
+      disconnectWs();
+    });
   }
 
   // =========================================================================
@@ -401,14 +429,24 @@
 
     if (parsed && typeof parsed === "object") {
       if (Array.isArray(parsed.hosts)) {
-        state.hosts = parsed.hosts
-          .filter((h) => h && h.url)
-          .map((h) => ({
+        const seenUrls = new Set();
+        state.hosts = [];
+        for (const h of parsed.hosts) {
+          if (!h || !h.url) continue;
+          const rawUrl = String(h.url).trim();
+          if (rawUrl.toLowerCase() === "http://same-origin") continue;
+          const normUrl = (SIDECAR && rawUrl === "same-origin") ? "same-origin" : normalizeServerUrl(rawUrl);
+          if (!normUrl) continue;
+          const key = normUrl.toLowerCase();
+          if (seenUrls.has(key)) continue;
+          seenUrls.add(key);
+          state.hosts.push({
             id: String(h.id || makeHostId()),
-            name: String(h.name || hostDisplayFallback(h.url)).trim(),
-            url: normalizeServerUrl(h.url),
+            name: String(h.name || (normUrl === "same-origin" ? "本机工作台" : hostDisplayFallback(normUrl))).trim(),
+            url: normUrl,
             token: String(h.token || "").trim(),
-          }));
+          });
+        }
         state.activeHostId = String(parsed.activeHostId || (state.hosts[0] ? state.hosts[0].id : ""));
       } else if (parsed.serverUrl) {
         const url = normalizeServerUrl(parsed.serverUrl);
@@ -809,7 +847,28 @@
     if (opts.body && !(opts.body instanceof FormData) && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const resp = await fetch(`${getApiBase(host)}${path}`, Object.assign({}, opts, { headers }));
+    const fetchOpts = Object.assign({}, opts, { headers });
+    delete fetchOpts.timeoutMs;
+    const isLongOp = opts.body instanceof FormData || path === "/api/chat/send";
+    const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : (isLongOp ? 120000 : 15000);
+    let ctrl = null;
+    let timer = null;
+    if (!fetchOpts.signal && typeof AbortController !== "undefined") {
+      ctrl = new AbortController();
+      fetchOpts.signal = ctrl.signal;
+      timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    }
+    let resp;
+    try {
+      resp = await fetch(`${getApiBase(host)}${path}`, fetchOpts);
+    } catch (err) {
+      if (err && err.name === "AbortError" && ctrl) {
+        throw new Error("请求超时，请检查本机服务连接");
+      }
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     if (resp.status === 401) {
       setConnState("offline", "访问令牌无效，请在主机设置检查");
       throw new Error("身份校验失败 (401)");
@@ -857,12 +916,21 @@
   let _lastRefreshConvsAt = 0;
   let _lastResumeSyncAt = 0;
 
-  function disconnectWs() {
+  function disconnectWs(opts = {}) {
+    const { preservePollCursor = false } = opts || {};
     state.connectEpoch += 1;
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
+    clearTimeout(state.sidecarPollTimer);
+    state.sidecarPollTimer = null;
     clearTimeout(_refreshConvsTimer);
     _refreshConvsTimer = null;
+    if (state.sidecarPollAbort) {
+      try {
+        state.sidecarPollAbort.abort();
+      } catch (_) {}
+      state.sidecarPollAbort = null;
+    }
     if (state.sseAbort) {
       try {
         state.sseAbort.abort();
@@ -879,7 +947,16 @@
       } catch (_) {}
       state.ws = null;
     }
-    state.wsConnected = false;
+    if (!preservePollCursor) {
+      state.sidecarPollSeq = -1;
+      state.sidecarPollEpoch = "";
+      state.wsConnected = false;
+    }
+  }
+
+  function pauseSidecarTransportForHidden() {
+    if (!SIDECAR) return;
+    disconnectWs({ preservePollCursor: true });
   }
 
   function syncOnForegroundResume() {
@@ -887,7 +964,12 @@
     const now = Date.now();
     if (now - _lastResumeSyncAt < 600) return;
     _lastResumeSyncAt = now;
-    if (!state.wsConnected) {
+    if (SIDECAR) {
+      const transportIdle = !state.sidecarPollTimer && !state.sidecarPollAbort && !state.sseAbort;
+      if (!state.wsConnected || transportIdle) {
+        connectWs({ preservePollCursor: true });
+      }
+    } else if (!state.wsConnected) {
       const rs = state.ws ? state.ws.readyState : WebSocket.CLOSED;
       if (rs === WebSocket.CLOSED || rs === WebSocket.CLOSING) {
         connectWs();
@@ -896,6 +978,8 @@
     refreshConversationsThrottled(500);
     if (state.currentCid && !state.streaming) {
       openConversation(state.currentCid, { silent: true });
+    } else if (SIDECAR && !state.currentConv && !state.streaming) {
+      maybeAutoFollowSidecarConversation();
     }
   }
 
@@ -1024,7 +1108,10 @@
     state.qqbotAvailable = false;
     state.workspaceRoot = "";
     state.currentDir = "";
+    state.connPhase = "connecting";
+    state.hostActivatedAt = Date.now();
     state.sidecarAutoFollowed = false;
+    state.sidecarAutoFollowInFlight = false;
     state.sidecarUserPicked = false;
     $("settings-open-qqbot")?.classList.add("hidden");
 
@@ -1033,17 +1120,151 @@
     updateSidecarHeaderActions();
     renderConversation();
     renderConvList();
-    // Kick off HTTP bootstrap immediately so sidebar/models populate even while stream connects
+    // Kick off HTTP bootstrap + active host-conversation auto-follow immediately in parallel
     fetchServerInfo();
     refreshConversations();
     loadModels();
+    maybeAutoFollowSidecarConversation();
     connectWs();
+  }
+
+  async function connectSidecarPoll(host, epoch) {
+    if (epoch !== state.connectEpoch) return;
+    if (!state.wsConnected && state.connPhase === "connecting") {
+      setConnState("connecting", `正在连接 ${host.name}...`);
+    }
+
+    const runTick = async () => {
+      if (epoch !== state.connectEpoch) return;
+      const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      state.sidecarPollAbort = ctrl;
+      const timeoutId = ctrl ? setTimeout(() => ctrl.abort(), 8000) : null;
+      let nextDelayMs = state.streaming ? 150 : 1200;
+      let stopPolling = false;
+      try {
+        const sinceParam = state.sidecarPollSeq >= 0 ? String(state.sidecarPollSeq) : "-1";
+        const resp = await fetch(`/__sidecar/poll?since=${encodeURIComponent(sinceParam)}`, {
+          method: "GET",
+          cache: "no-store",
+          headers: {
+            Authorization: `Bearer ${host.token}`,
+            Accept: "application/json",
+          },
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+        if (epoch !== state.connectEpoch) {
+          stopPolling = true;
+          return;
+        }
+        if (resp.status === 404 || resp.status === 405) {
+          // Running against an older sidecar without /__sidecar/poll: fall back cleanly to SSE
+          stopPolling = true;
+          state.sidecarPollUnsupported = true;
+          connectSidecarSse(host, epoch);
+          return;
+        }
+        if (resp.status === 401) {
+          stopPolling = true;
+          state.wsConnected = false;
+          state.connPhase = "auth_error";
+          updateHostDisplays();
+          setConnState("offline", "访问令牌无效，请在主机设置检查");
+          return;
+        }
+        if (!resp.ok) {
+          throw new Error(`Poll HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (epoch !== state.connectEpoch) {
+          stopPolling = true;
+          return;
+        }
+        if (!data || data.ok === false) {
+          throw new Error((data && data.error) || "Poll error");
+        }
+
+        if (data.connected) {
+          const wasConnected = state.wsConnected;
+          state.wsConnected = true;
+          state.connPhase = "online";
+          const nextEpoch = String(data.epoch || "");
+          const epochChanged = Boolean(nextEpoch && state.sidecarPollEpoch && nextEpoch !== state.sidecarPollEpoch);
+          if (nextEpoch) state.sidecarPollEpoch = nextEpoch;
+          if (typeof data.seq === "number" && Number.isFinite(data.seq)) {
+            state.sidecarPollSeq = data.seq;
+          }
+
+          if (!wasConnected) {
+            updateHostDisplays();
+            updateSendButton();
+            const pastInitialBoot = Date.now() - (state.hostActivatedAt || 0) > 1500;
+            if (pastInitialBoot) {
+              if (!state.serverInfo) fetchServerInfo();
+              if (!state.conversations.length) refreshConversations();
+              if (!state.models.length) loadModels();
+            }
+            if (state.currentCid && !state.currentConv && !state.streaming && !state.sidecarAutoFollowInFlight) {
+              openConversation(state.currentCid, { silent: true });
+            } else if (!state.currentConv && !state.streaming) {
+              maybeAutoFollowSidecarConversation();
+            }
+          }
+
+          const evList = Array.isArray(data.events) ? data.events : [];
+          for (const rawEv of evList) {
+            try {
+              const parsed = typeof rawEv === "string" ? JSON.parse(rawEv) : rawEv;
+              if (parsed && typeof parsed === "object") {
+                onWsEvent(parsed);
+              }
+            } catch (_) {}
+          }
+
+          if (data.reset || epochChanged) {
+            refreshConversationsThrottled(400);
+            if (state.currentCid && !state.streaming) {
+              openConversation(state.currentCid, { silent: true });
+            }
+          }
+          nextDelayMs = state.streaming ? 150 : 1200;
+        } else {
+          state.wsConnected = false;
+          state.connPhase = "reconnecting";
+          updateHostDisplays();
+          updateSendButton();
+          nextDelayMs = 2000;
+        }
+      } catch (_) {
+        if (epoch !== state.connectEpoch) {
+          stopPolling = true;
+          return;
+        }
+        state.wsConnected = false;
+        state.connPhase = "reconnecting";
+        updateHostDisplays();
+        updateSendButton();
+        nextDelayMs = 2200;
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        if (state.sidecarPollAbort === ctrl) state.sidecarPollAbort = null;
+        if (!stopPolling && epoch === state.connectEpoch && !state.sidecarPollUnsupported && getActiveHost()) {
+          if (document.visibilityState !== "hidden") {
+            state.sidecarPollTimer = setTimeout(runTick, nextDelayMs);
+          }
+        }
+      }
+    };
+
+    runTick();
   }
 
   async function connectSidecarSse(host, epoch) {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     state.sseAbort = ctrl;
-    setConnState("connecting", `正在连接 ${host.name}...`);
+    let stopSseRetry = false;
+    if (!state.wsConnected && state.connPhase === "connecting") {
+      setConnState("connecting", `正在连接 ${host.name}...`);
+    }
     try {
       const resp = await fetch("/__sidecar/events", {
         method: "GET",
@@ -1054,19 +1275,36 @@
         },
         signal: ctrl ? ctrl.signal : undefined,
       });
-      if (epoch !== state.connectEpoch) return;
+      if (epoch !== state.connectEpoch) {
+        stopSseRetry = true;
+        return;
+      }
+      if (resp.status === 401) {
+        stopSseRetry = true;
+        state.wsConnected = false;
+        state.connPhase = "auth_error";
+        updateHostDisplays();
+        setConnState("offline", "访问令牌无效，请在主机设置检查");
+        return;
+      }
       if (!resp.ok || !resp.body || typeof resp.body.getReader !== "function") {
         throw new Error(`SSE HTTP ${resp.status}`);
       }
 
       state.wsConnected = true;
+      state.connPhase = "online";
       updateHostDisplays();
       updateSendButton();
-      fetchServerInfo();
-      refreshConversations();
-      loadModels();
-      if (state.currentCid && !state.streaming) {
+      const pastInitialBoot = Date.now() - (state.hostActivatedAt || 0) > 1500;
+      if (pastInitialBoot) {
+        if (!state.serverInfo) fetchServerInfo();
+        if (!state.conversations.length) refreshConversations();
+        if (!state.models.length) loadModels();
+      }
+      if (state.currentCid && !state.currentConv && !state.streaming && !state.sidecarAutoFollowInFlight) {
         openConversation(state.currentCid, { silent: true });
+      } else if (!state.currentConv && !state.streaming) {
+        maybeAutoFollowSidecarConversation();
       }
 
       const reader = resp.body.getReader();
@@ -1096,28 +1334,34 @@
       // Fall through to clean disconnect/reconnect below
     } finally {
       if (state.sseAbort === ctrl) state.sseAbort = null;
-      if (epoch === state.connectEpoch) {
+      if (!stopSseRetry && epoch === state.connectEpoch) {
         state.wsConnected = false;
+        state.connPhase = "reconnecting";
         updateHostDisplays();
         updateSendButton();
-        if (getActiveHost()) {
+        if (getActiveHost() && document.visibilityState !== "hidden") {
           state.reconnectTimer = setTimeout(connectWs, 2500);
         }
       }
     }
   }
 
-  function connectWs() {
-    disconnectWs();
+  function connectWs(opts = {}) {
+    disconnectWs(opts);
     const host = getActiveHost();
     if (!host || (!SIDECAR && !host.url)) {
+      state.connPhase = "offline";
       setConnState("offline", "未配置主机");
       return;
     }
 
     const epoch = state.connectEpoch;
     if (SIDECAR) {
-      connectSidecarSse(host, epoch);
+      if (state.sidecarPollUnsupported) {
+        connectSidecarSse(host, epoch);
+      } else {
+        connectSidecarPoll(host, epoch);
+      }
       return;
     }
 
@@ -1131,6 +1375,7 @@
       ws.onopen = () => {
         if (epoch !== state.connectEpoch) return;
         state.wsConnected = true;
+        state.connPhase = "online";
         updateHostDisplays();
         updateSendButton();
         fetchServerInfo();
@@ -1152,6 +1397,7 @@
       ws.onclose = () => {
         if (epoch !== state.connectEpoch) return;
         state.wsConnected = false;
+        state.connPhase = "reconnecting";
         updateHostDisplays();
         updateSendButton();
         if (getActiveHost()) {
@@ -1165,6 +1411,7 @@
       };
     } catch (_) {
       if (epoch === state.connectEpoch && getActiveHost()) {
+        state.connPhase = "reconnecting";
         state.reconnectTimer = setTimeout(connectWs, 4000);
       }
     }
@@ -1657,6 +1904,10 @@
       if (state.wsConnected) {
         const hostName = host ? host.name : "主机";
         setConnState("online", `${hostName} · 已连接`);
+      } else if (state.connPhase === "auth_error") {
+        setConnState("offline", "访问令牌无效，请在主机设置检查");
+      } else if (host && state.connPhase === "connecting") {
+        setConnState("connecting", `正在连接 ${host.name}...`);
       } else {
         setConnState("offline", host ? `正在重连 ${host.name}...` : "未连接主机");
       }
@@ -1983,15 +2234,19 @@
         followBtn.classList.add("hidden");
       } else {
         followBtn.classList.remove("hidden");
-        const isFollowing = hasValidActiveCid && activeCid === hostCid;
+        const isLoadedHostConv = Boolean(state.currentConv && state.currentConv.id === hostCid);
+        const isFollowing = hasValidActiveCid && activeCid === hostCid && (isLoadedHostConv || state.streaming);
+        const isSyncingHost = hasValidActiveCid && activeCid === hostCid && !isFollowing;
         followBtn.classList.toggle("following", isFollowing);
         followBtn.setAttribute("aria-disabled", isFollowing ? "true" : "false");
         if (followTxt) {
-          followTxt.textContent = isFollowing ? "已跟随主窗口" : "回到主窗口对话";
+          followTxt.textContent = isFollowing
+            ? "已跟随主窗口"
+            : (isSyncingHost ? "正在同步主窗口..." : "回到主窗口对话");
         }
         followBtn.title = isFollowing
           ? "当前正跟随 Antigravity 主窗口对话"
-          : "点击跳回 Antigravity 主窗口正在查看的对话";
+          : (isSyncingHost ? "正在加载 Antigravity 主窗口当前对话..." : "点击跳回 Antigravity 主窗口正在查看的对话");
       }
     }
 
@@ -2002,12 +2257,23 @@
     }
   }
 
-  function maybeAutoFollowSidecarConversation() {
-    if (!SIDECAR || state.sidecarAutoFollowed || state.sidecarUserPicked) return;
-    if (state.currentCid || state.streaming) return;
+  function maybeAutoFollowSidecarConversation(opts = {}) {
+    const { forceSwitch = false } = opts || {};
+    if (!SIDECAR || state.sidecarUserPicked) return;
+    if (state.streaming) return;
+    if (!forceSwitch && (state.sidecarAutoFollowed || state.sidecarAutoFollowInFlight)) return;
     const hostCid = getSidecarConversationId();
     if (!hostCid) return;
-    state.sidecarAutoFollowed = true;
+    if (state.currentCid && state.currentCid !== hostCid) {
+      if (!forceSwitch || String(state.currentCid).startsWith("pending-")) return;
+    }
+    if (state.currentConv && state.currentConv.id === hostCid && state.currentCid === hostCid) {
+      state.sidecarAutoFollowed = true;
+      updateSidecarHeaderActions();
+      return;
+    }
+    state.sidecarAutoFollowed = false;
+    state.sidecarAutoFollowInFlight = true;
     openConversation(hostCid, { silent: true, autoFollow: true });
   }
 
@@ -2108,6 +2374,9 @@
       const nextFp = computeConvFingerprint(nextConv, nextRunning);
 
       state.currentConv = nextConv;
+      if (autoFollow || (SIDECAR && cid === getSidecarConversationId())) {
+        state.sidecarAutoFollowed = true;
+      }
       if ((!silent || switching) && nextConv && nextConv.model) {
         state.selectedModel = nextConv.model;
         updateModelPill();
@@ -2136,14 +2405,25 @@
       }
     } catch (e) {
       if (reqSeq !== state.openConvSeq) return;
-      if (autoFollow && !state.currentConv && state.currentCid === cid) {
-        state.currentCid = "";
-        restoreDraftFor(NEW_DRAFT_KEY);
+      if (state.currentCid === cid && (autoFollow || (SIDECAR && cid === getSidecarConversationId()))) {
+        if (!state.currentConv) {
+          state.currentCid = "";
+          state.sidecarAutoFollowed = false;
+          restoreDraftFor(NEW_DRAFT_KEY);
+        } else if (state.currentConv.id && state.currentConv.id !== cid) {
+          state.currentCid = state.currentConv.id;
+          state.sidecarAutoFollowed = false;
+          restoreDraftFor(state.currentCid);
+        }
         renderConvList();
         updateSidecarHeaderActions();
       }
       if (!silent) {
         showToast(`加载会话失败：${e.message}`);
+      }
+    } finally {
+      if (autoFollow && reqSeq === state.openConvSeq) {
+        state.sidecarAutoFollowInFlight = false;
       }
     }
   }
@@ -3299,6 +3579,8 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
         syncOnForegroundResume();
+      } else if (SIDECAR) {
+        pauseSidecarTransportForHidden();
       }
     });
 

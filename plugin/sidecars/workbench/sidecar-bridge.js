@@ -154,7 +154,7 @@
       if (!href || /^(?:agylink|mailto|tel|javascript):/i.test(href)) return;
       try {
         const parsed = new URL(href, window.location.href);
-        if (!isSameOriginHttp(parsed)) return;
+        if (!isSameOriginHttp(parsed, href)) return;
         if (parsed.pathname === '/pair' || parsed.pathname === '/download-apk' || parsed.pathname === '/') {
           parsed.searchParams.set('sidecar_token', token);
           anchor.setAttribute('href', parsed.pathname + parsed.search + parsed.hash);
