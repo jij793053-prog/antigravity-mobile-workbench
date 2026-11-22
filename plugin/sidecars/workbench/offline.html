@@ -245,7 +245,7 @@
           </svg>
         </div>
         <div>
-          <h1 class="title">Antigravity Link Server 未运行</h1>
+          <h1 id="offline-title" class="title">Antigravity Link Server 未运行</h1>
           <div class="status-line">
             <span id="status-dot" class="dot" aria-hidden="true"></span>
             <span id="status-text">正在检测 127.0.0.1:18795...</span>
@@ -253,7 +253,7 @@
         </div>
       </div>
 
-      <p class="desc">
+      <p id="offline-desc" class="desc">
         Mobile Sync 侧边工作台通过本机回环连接到 <strong>Antigravity Link Server</strong>，以实现手机与电脑实时双向同步、扫码配对和额度看板。
       </p>
 
@@ -269,7 +269,7 @@
       </div>
 
       <div class="manual">
-        <p class="manual-title">手动启动命令（项目根目录）</p>
+        <p id="manual-title" class="manual-title">手动启动命令（项目根目录）</p>
         <div class="cmd-list">
           <div class="cmd-row">
             <span class="cmd-label">Windows</span>
@@ -297,12 +297,80 @@
     (() => {
       'use strict';
 
+      const isEn = (() => {
+        try {
+          const saved = String(localStorage.getItem('agy_mobile_lang_v1') || 'auto').toLowerCase();
+          if (saved === 'en') return true;
+          if (saved === 'zh') return false;
+        } catch (_) {}
+        const nav = String((navigator.languages && navigator.languages[0]) || navigator.language || 'zh').toLowerCase();
+        return !nav.startsWith('zh');
+      })();
+
+      const L = isEn
+        ? {
+            lang: 'en',
+            title: 'Antigravity Link Server Offline',
+            checking: 'Checking 127.0.0.1:18795...',
+            desc: 'Mobile Sync connects over loopback to <strong>Antigravity Link Server</strong> for live two-way sync, phone QR pairing, and usage stats.',
+            startBtn: 'Start Local Link Server',
+            startingBtn: 'Starting Link Server...',
+            retryBtn: 'Retry Now',
+            manualTitle: 'Manual Start Commands (Repo Root)',
+            pollHint: 'Auto-checking every 3s to enter workbench',
+            onlineStatus: 'Link Server is online — entering workbench...',
+            onlineBanner: 'Connected! Loading Mobile Sync workbench...',
+            rechecking: 'Re-checking connection...',
+            authErr: (st) => 'Sidecar auth or health error (HTTP ' + st + ')',
+            notFound: (port) => 'No server detected on 127.0.0.1:' + port,
+            healthErr: 'Cannot reach Sidecar health endpoint',
+            startingStatus: 'Starting local server in background...',
+            startingBanner: 'Starting agy_mobile_server.py (up to 8s)...',
+            startedWait: 'Server started — waiting to come online...',
+            startFail: 'Failed to start. Check Python or run a command below.',
+            startReqFail: 'Start request failed. Run one of the commands below.',
+          }
+        : {
+            lang: 'zh-CN',
+            title: 'Antigravity Link Server 未运行',
+            checking: '正在检测 127.0.0.1:18795...',
+            desc: 'Mobile Sync 侧边工作台通过本机回环连接到 <strong>Antigravity Link Server</strong>，以实现手机与电脑实时双向同步、扫码配对和额度看板。',
+            startBtn: '启动本地 Link Server',
+            startingBtn: '正在启动 Link Server...',
+            retryBtn: '立即重试',
+            manualTitle: '手动启动命令（项目根目录）',
+            pollHint: '每 3 秒自动检测并进入工作台',
+            onlineStatus: 'Link Server 已上线，正在进入工作台...',
+            onlineBanner: '连接成功，正在加载 Mobile Sync 工作台...',
+            rechecking: '正在重新检测连接...',
+            authErr: (st) => 'Sidecar 鉴权或状态异常 (HTTP ' + st + ')',
+            notFound: (port) => '未检测到 127.0.0.1:' + port + ' 服务',
+            healthErr: '无法连接 Sidecar 健康检查接口',
+            startingStatus: '正在后台拉起本地服务，请稍候...',
+            startingBanner: '正在启动 agy_mobile_server.py，最长等待 8 秒...',
+            startedWait: '服务进程已启动，正在等待就绪（自动重连中）...',
+            startFail: '启动失败，请检查 Python 环境或使用下方命令手动启动。',
+            startReqFail: '启动请求失败，请使用下方命令手动启动 Link Server。',
+          };
+
+      document.documentElement.lang = L.lang;
+      const titleEl = document.getElementById('offline-title');
+      const descEl = document.getElementById('offline-desc');
+      const manualTitleEl = document.getElementById('manual-title');
+      const pollHintEl = document.getElementById('poll-hint');
       const statusDot = document.getElementById('status-dot');
       const statusText = document.getElementById('status-text');
       const portBadge = document.getElementById('port-badge');
       const msgBanner = document.getElementById('msg-banner');
       const startBtn = document.getElementById('btn-start-server');
       const retryBtn = document.getElementById('btn-retry');
+      if (titleEl) titleEl.textContent = L.title;
+      if (descEl) descEl.innerHTML = L.desc;
+      if (manualTitleEl) manualTitleEl.textContent = L.manualTitle;
+      if (pollHintEl) pollHintEl.textContent = L.pollHint;
+      if (statusText) statusText.textContent = L.checking;
+      if (startBtn) startBtn.textContent = L.startBtn;
+      if (retryBtn) retryBtn.textContent = L.retryBtn;
       let busyStarting = false;
       let redirecting = false;
 
@@ -320,8 +388,8 @@
         if (redirecting) return;
         redirecting = true;
         statusDot.classList.add('online');
-        statusText.textContent = 'Link Server 已上线，正在进入工作台...';
-        showBanner('连接成功，正在加载 Mobile Sync 工作台...', 'ok');
+        statusText.textContent = L.onlineStatus;
+        showBanner(L.onlineBanner, 'ok');
         setTimeout(() => {
           if (window.__AGY_SIDECAR__ && typeof window.__AGY_SIDECAR__.reloadWithToken === 'function') {
             window.__AGY_SIDECAR__.reloadWithToken();
@@ -335,12 +403,12 @@
         if (redirecting) return;
         if (manual) {
           retryBtn.disabled = true;
-          statusText.textContent = '正在重新检测连接...';
+          statusText.textContent = L.rechecking;
         }
         try {
           const resp = await window.fetch('/__sidecar/health', { cache: 'no-store' });
           if (!resp.ok) {
-            statusText.textContent = 'Sidecar 鉴权或状态异常 (HTTP ' + resp.status + ')';
+            statusText.textContent = L.authErr(resp.status);
             return;
           }
           const data = await resp.json();
@@ -359,11 +427,11 @@
           }
 
           if (!busyStarting) {
-            statusText.textContent = '未检测到 127.0.0.1:' + port + ' 服务';
+            statusText.textContent = L.notFound(port);
           }
         } catch (_) {
           if (!busyStarting) {
-            statusText.textContent = '无法连接 Sidecar 健康检查接口';
+            statusText.textContent = L.healthErr;
           }
         } finally {
           if (manual) {
@@ -376,9 +444,9 @@
         if (busyStarting || redirecting) return;
         busyStarting = true;
         startBtn.disabled = true;
-        startBtn.textContent = '正在启动 Link Server...';
-        statusText.textContent = '正在后台拉起本地服务，请稍候...';
-        showBanner('正在启动 agy_mobile_server.py，最长等待 8 秒...', '');
+        startBtn.textContent = L.startingBtn;
+        statusText.textContent = L.startingStatus;
+        showBanner(L.startingBanner, '');
         try {
           const res = window.__AGY_SIDECAR__ && typeof window.__AGY_SIDECAR__.startLocalServer === 'function'
             ? await window.__AGY_SIDECAR__.startLocalServer()
@@ -389,17 +457,17 @@
             return;
           }
           if (res && res.started) {
-            showBanner(res.message || '服务进程已启动，正在等待就绪（自动重连中）...', '');
+            showBanner(res.message || L.startedWait, '');
           } else {
-            showBanner((res && res.message) || '启动失败，请检查 Python 环境或使用下方命令手动启动。', 'err');
+            showBanner((res && res.message) || L.startFail, 'err');
           }
         } catch (_) {
-          showBanner('启动请求失败，请使用下方命令手动启动 Link Server。', 'err');
+          showBanner(L.startReqFail, 'err');
         } finally {
           busyStarting = false;
           if (!redirecting) {
             startBtn.disabled = false;
-            startBtn.textContent = '启动本地 Link Server';
+            startBtn.textContent = L.startBtn;
           }
         }
       });

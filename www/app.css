@@ -512,6 +512,11 @@ button {
   font-weight: 500;
   color: var(--md-text-secondary);
 }
+.welcome-topbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
 .mini-prism-dot {
   width: 10px;
   height: 10px;

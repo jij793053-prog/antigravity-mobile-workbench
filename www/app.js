@@ -9,6 +9,36 @@
   const SIDECAR = (window.__AGY_SIDECAR__ && window.__AGY_SIDECAR__.active) ? window.__AGY_SIDECAR__ : null;
   const SIDECAR_CID_RE = /^[A-Za-z0-9_-]{6,80}$/;
 
+  const I18N = window.AGY_I18N || {
+    t: (k) => k,
+    setLang: () => "zh",
+    applyDom: () => {},
+    normalizePref: (p) => p || "auto",
+    getPref: () => "auto",
+    getLang: () => "zh",
+    isEn: () => false,
+    fmtTokens: (n) => String(Math.round(Number(n) || 0)),
+    fmtResetLeft: (d, r, h) => (d > 0 ? `${d}d ${r}h` : `${Math.max(1, h)}h`),
+  };
+  const t = (key, vars) => I18N.t(key, vars);
+
+  function formatHostDisplayName(rawName) {
+    const s = String(rawName || "").trim();
+    if (!s) return t("host.localWorkbench");
+    if (I18N.isEn()) {
+      if (s === "本机工作台") return t("host.localWorkbench");
+      if (s.endsWith("（本机）")) {
+        return t("host.localSuffix", { name: s.slice(0, -4) });
+      }
+    } else {
+      if (s === "Local Workbench") return t("host.localWorkbench");
+      if (s.endsWith(" (Local)")) {
+        return t("host.localSuffix", { name: s.slice(0, -8) });
+      }
+    }
+    return s;
+  }
+
   function withSidecarToken(url) {
     if (!SIDECAR || !url) return url;
     try {
@@ -46,6 +76,7 @@
   const state = {
     themePref: "light", // "light" | "dark" | "system"
     resolvedDark: false,
+    langPref: I18N.getPref(), // "auto" | "zh" | "en"
     hosts: [],          // [{ id, name, url, token }]
     activeHostId: "",
     selectedModel: DEFAULT_MODEL,
@@ -177,7 +208,7 @@
     if (alt && !$("welcome-view").classList.contains("hidden")) {
       alt.open = true;
     }
-    showToast("请在 Android 客户端内使用相机扫码，或在下方粘贴配对链接");
+    showToast(t("toast.useAndroidScan"));
   }
 
   function syncSystemBars(isDark) {
@@ -268,12 +299,12 @@
     try {
       const data = JSON.parse(String(responseJson || "{}"));
       if (!data || data.ok === false) {
-        entry.reject(new Error(data?.error || "上传返回异常"));
+        entry.reject(new Error(data?.error || t("err.uploadResp")));
         return;
       }
       entry.resolve(data);
     } catch (_) {
-      entry.reject(new Error("上传响应解析失败"));
+      entry.reject(new Error(t("err.uploadParse")));
     }
   };
 
@@ -303,7 +334,7 @@
 
     // Update theme labels & icons
     const wLbl = $("welcome-theme-label");
-    if (wLbl) wLbl.textContent = isDark ? "深色" : "浅色";
+    if (wLbl) wLbl.textContent = isDark ? t("welcome.themeDark") : t("welcome.themeLight");
 
     const wBtn = $("btn-welcome-theme");
     if (wBtn) {
@@ -317,6 +348,64 @@
 
     if (persist) {
       persistConfig();
+    }
+  }
+
+  function applyLanguage(pref, opts = {}) {
+    const { persist = false, notify = false, rerender = true } = opts || {};
+    const valid = I18N.normalizePref(pref);
+    state.langPref = valid;
+    const resolved = I18N.setLang(valid, { persistFast: true, applyDom: true });
+
+    document.querySelectorAll(".lang-opt").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.langChoice === valid);
+    });
+    const wLangLbl = $("welcome-lang-label");
+    if (wLangLbl) wLangLbl.textContent = t("welcome.langChip");
+    const wThemeLbl = $("welcome-theme-label");
+    if (wThemeLbl) wThemeLbl.textContent = state.resolvedDark ? t("welcome.themeDark") : t("welcome.themeLight");
+
+    if (persist) {
+      persistConfig();
+    }
+
+    if (rerender) {
+      updateHostDisplays();
+      updateSendButton();
+      updateSidecarHeaderActions();
+      renderConvList();
+      renderHostSheetList();
+      renderSettingsHosts();
+      syncDownloadSettingsUi();
+      if (state.currentConv) {
+        renderConversation({ preserveScroll: true });
+      } else {
+        updateTurnTriggerUi();
+      }
+      if (state.usageData && !$("usage-modal")?.classList.contains("hidden")) {
+        const sub = $("usage-subtitle");
+        if (sub) {
+          const cnt = Number(state.usageData.scanned_conversations || 0);
+          const tStr = fmtLocalTime(state.usageData.generated_at);
+          sub.textContent = t("usage.subScanned", { cnt, time: tStr || t("usage.justNow") });
+        }
+        renderUsageView();
+      }
+      if (!$("attach-sheet")?.classList.contains("hidden")) {
+        loadRecentPhotosInSheet(false);
+        updateAttachSelectionUi();
+      }
+      if (!$("model-sheet")?.classList.contains("hidden")) {
+        openModelSheet();
+      }
+    }
+
+    if (notify) {
+      if (valid === "auto") {
+        showToast(resolved === "en" ? t("toast.langSwitchedAutoEn") : t("toast.langSwitchedAutoZh"));
+      } else {
+        showToast(resolved === "en" ? t("toast.langSwitchedEn") : t("toast.langSwitchedZh"));
+      }
     }
   }
 
@@ -464,7 +553,7 @@
           seenUrls.add(key);
           state.hosts.push({
             id: String(h.id || makeHostId()),
-            name: String(h.name || (normUrl === "same-origin" ? "本机工作台" : hostDisplayFallback(normUrl))).trim(),
+            name: String(h.name || (normUrl === "same-origin" ? t("host.localWorkbench") : hostDisplayFallback(normUrl))).trim(),
             url: normUrl,
             token: String(h.token || "").trim(),
           });
@@ -478,6 +567,7 @@
       }
 
       if (parsed.theme) state.themePref = parsed.theme;
+      if (parsed.lang) state.langPref = I18N.normalizePref(parsed.lang);
       if (parsed.selectedModel) state.selectedModel = String(parsed.selectedModel);
       if (parsed.downloadSubdir !== undefined) state.downloadSubdir = String(parsed.downloadSubdir);
       if (parsed.downloadAskFolder !== undefined) state.downloadAskFolder = Boolean(parsed.downloadAskFolder);
@@ -490,12 +580,16 @@
       }
     }
 
-    // Optional URL theme override (?theme=dark or ?theme=light) for quick testing
+    // Optional URL theme / lang override (?theme=dark&lang=en) for quick testing
     try {
       const qs = new URLSearchParams(location.search);
       const qTheme = qs.get("theme");
       if (qTheme === "dark" || qTheme === "light" || qTheme === "system") {
         state.themePref = qTheme;
+      }
+      const qLang = qs.get("lang");
+      if (qLang) {
+        state.langPref = I18N.normalizePref(qLang);
       }
     } catch (_) {}
   }
@@ -504,6 +598,7 @@
     const payload = {
       version: 2,
       theme: state.themePref,
+      lang: state.langPref,
       hosts: state.hosts,
       activeHostId: state.activeHostId,
       selectedModel: state.selectedModel,
@@ -529,7 +624,7 @@
   function upsertHost({ name, url, token }, activate = true) {
     const normUrl = (SIDECAR && url === "same-origin") ? "same-origin" : normalizeServerUrl(url);
     const cleanTok = String(token || "").trim();
-    const cleanName = String(name || "").trim() || (normUrl === "same-origin" ? "本机工作台" : hostDisplayFallback(normUrl));
+    const cleanName = String(name || "").trim() || (normUrl === "same-origin" ? t("host.localWorkbench") : hostDisplayFallback(normUrl));
 
     let existing = state.hosts.find((h) => h.url.toLowerCase() === normUrl.toLowerCase());
     if (existing) {
@@ -630,7 +725,7 @@
       return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
     } catch (err) {
       if (err && err.name === "AbortError") {
-        throw new Error("连接超时（8秒无响应）：请检查电脑防火墙是否已放行 18795 端口，或在校园网下改用 Tailscale (100.x.x.x) 地址");
+        throw new Error(t("err.pairTimeout"));
       }
       throw err;
     } finally {
@@ -642,16 +737,16 @@
     const url = normalizeServerUrl(rawHost);
     const pin = String(rawPin || "").replace(/\D+/g, "");
     if (!url) {
-      showBanner(bannerEl, "err", "请先填写电脑的局域网或 Tailscale 地址");
+      showBanner(bannerEl, "err", t("toast.enterHost"));
       return false;
     }
     if (!/^\d{6}$/.test(pin)) {
-      showBanner(bannerEl, "err", "请输入完整的 6 位数字配对码");
+      showBanner(bannerEl, "err", t("toast.enterPin"));
       return false;
     }
 
     if (btnEl) btnEl.disabled = true;
-    showBanner(bannerEl, "info", "正在向电脑验证 6 位配对码...");
+    showBanner(bannerEl, "info", t("toast.verifyingPin"));
     try {
       const resp = await fetchWithTimeout(`${url}/api/pair/claim`, {
         method: "POST",
@@ -660,7 +755,7 @@
       }, 8000);
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || data.ok === false || !data.token) {
-        const reason = data.error || (resp.status === 429 ? "尝试过于频繁，请一分钟后重试" : resp.status === 401 || resp.status === 403 ? "配对码错误或已过期" : `HTTP ${resp.status}`);
+        const reason = data.error || (resp.status === 429 ? t("err.pairRateLimit") : resp.status === 401 || resp.status === 403 ? t("err.pairBadPin") : `HTTP ${resp.status}`);
         throw new Error(reason);
       }
 
@@ -669,15 +764,15 @@
         updateModelPill();
       }
       const host = upsertHost({ name: data.hostname || hostDisplayFallback(url), url, token: data.token }, true);
-      showBanner(bannerEl, "ok", `配对成功：${host.name}`);
+      showBanner(bannerEl, "ok", t("toast.pairOk", { name: formatHostDisplayName(host.name) }));
       haptic("success");
-      showToast(`已配对并连接到 ${host.name}`);
+      showToast(t("toast.pairedAndConnected", { name: formatHostDisplayName(host.name) }));
       $("settings-modal").classList.add("hidden");
       showWorkspaceScreen();
       activateCurrentHost();
       return true;
     } catch (err) {
-      showBanner(bannerEl, "err", `配对失败：${err.message || "无法连接到该地址"}`);
+      showBanner(bannerEl, "err", t("toast.pairFail", { err: err.message || t("err.unreachable") }));
       return false;
     } finally {
       if (btnEl) btnEl.disabled = false;
@@ -721,9 +816,9 @@
     _pendingPairConfirm = null;
     if (cancelled && prev) {
       if (prev.opts?.bannerEl) {
-        showBanner(prev.opts.bannerEl, "info", "已取消导入主机");
+        showBanner(prev.opts.bannerEl, "info", t("toast.importCancelled"));
       } else {
-        showToast("已取消导入主机");
+        showToast(t("toast.importCancelled"));
       }
     }
   }
@@ -731,11 +826,12 @@
   function applyConfirmedPair(parsed, opts = {}) {
     const host = upsertHost(parsed, true);
     haptic("success");
-    if (opts.bannerEl) showBanner(opts.bannerEl, "ok", `已导入主机：${host.name}`);
+    const dispName = formatHostDisplayName(host.name);
+    if (opts.bannerEl) showBanner(opts.bannerEl, "ok", t("toast.importedHost", { name: dispName }));
     $("settings-modal").classList.add("hidden");
     showWorkspaceScreen();
     activateCurrentHost();
-    showToast(`已配对并连接：${host.name}`);
+    showToast(t("toast.pairedColon", { name: dispName }));
     return true;
   }
 
@@ -743,9 +839,9 @@
     const dlg = $("pair-confirm-dialog");
     const displayName = parsed.name || hostDisplayFallback(parsed.url);
     if (!dlg) {
-      const ok = window.confirm(`确认导入并切换到此主机？\n\n名称：${displayName}\n地址：${parsed.url}`);
+      const ok = window.confirm(t("toast.confirmImportNative", { name: displayName, url: parsed.url }));
       if (!ok) {
-        showToast("已取消导入主机");
+        showToast(t("toast.importCancelled"));
         return false;
       }
       return applyConfirmedPair(parsed, opts);
@@ -774,15 +870,15 @@
             const sHost = $("add-pin-host");
             if (wHost) wHost.value = hostAddr;
             if (sHost) sHost.value = hostAddr;
-            showToast("已识别电脑地址，请继续输入 6 位配对码");
+            showToast(t("toast.detectedHostEnterPin"));
             return false;
           }
         } catch (_) {}
       }
       if (opts.bannerEl) {
-        showBanner(opts.bannerEl, "err", "配对链接格式无效，请扫描电脑 /pair 页面上的二维码");
+        showBanner(opts.bannerEl, "err", t("toast.invalidPairUri"));
       } else if (opts.source === "deeplink" || opts.source === "qr") {
-        showToast("未识别到有效的 Antigravity 配对二维码");
+        showToast(t("toast.invalidQr"));
       }
       return false;
     }
@@ -798,18 +894,18 @@
     const url = normalizeServerUrl(rawUrl);
     const token = String(rawToken || "").trim();
     if (!url || !token) {
-      showBanner(bannerEl, "err", "请填写完整的服务地址和访问令牌");
+      showBanner(bannerEl, "err", t("toast.fillUrlToken"));
       return false;
     }
 
     if (btnEl) btnEl.disabled = true;
-    showBanner(bannerEl, "info", "正在验证主机连通性与令牌...");
+    showBanner(bannerEl, "info", t("toast.verifyingHost"));
     try {
       const resp = await fetchWithTimeout(`${url}/api/server-info`, {
         headers: { Authorization: `Bearer ${token}` },
       }, 8000);
       const data = await resp.json().catch(() => ({}));
-      if (resp.status === 401) throw new Error("访问令牌无效 (401)");
+      if (resp.status === 401) throw new Error(t("err.token401"));
       if (!resp.ok || data.ok === false) throw new Error(data.error || `HTTP ${resp.status}`);
 
       const name = String(rawName || "").trim() || data.hostname || hostDisplayFallback(url);
@@ -818,15 +914,16 @@
         updateModelPill();
       }
       const host = upsertHost({ name, url, token }, true);
+      const dispName = formatHostDisplayName(host.name);
       haptic("success");
-      showBanner(bannerEl, "ok", `连接成功：${host.name}`);
+      showBanner(bannerEl, "ok", t("toast.connectOk", { name: dispName }));
       $("settings-modal").classList.add("hidden");
       showWorkspaceScreen();
       activateCurrentHost();
-      showToast(`已连接到 ${host.name}`);
+      showToast(t("toast.connectedTo", { name: dispName }));
       return true;
     } catch (err) {
-      showBanner(bannerEl, "err", `连接失败：${err.message || "网络不可达"}`);
+      showBanner(bannerEl, "err", t("toast.connectFail", { err: err.message || t("err.netUnreachable") }));
       return false;
     } finally {
       if (btnEl) btnEl.disabled = false;
@@ -837,24 +934,27 @@
     const url = normalizeServerUrl(rawUrl);
     const token = String(rawToken || "").trim();
     if (!url) {
-      showBanner(bannerEl, "err", "请先输入服务地址");
+      showBanner(bannerEl, "err", t("toast.enterUrlFirst"));
       return;
     }
-    showBanner(bannerEl, "info", "正在测试连通性...");
+    showBanner(bannerEl, "info", t("toast.testingConn"));
     try {
       const resp = await fetchWithTimeout(`${url}/api/server-info`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       }, 8000);
       const data = await resp.json().catch(() => ({}));
-      if (resp.status === 401) throw new Error("服务器可达，但访问令牌校验未通过 (401)");
+      if (resp.status === 401) throw new Error(t("err.serverReachable401"));
       if (!resp.ok || data.ok === false) throw new Error(data.error || `HTTP ${resp.status}`);
       showBanner(
         bannerEl,
         "ok",
-        `连接正常 · 主机 ${data.hostname || hostDisplayFallback(url)} · CLI ${data.agy_cli_ready ? "就绪" : "未检测到"}`
+        t("toast.testOk", {
+          host: data.hostname || hostDisplayFallback(url),
+          cli: data.agy_cli_ready ? t("toast.cliReady") : t("toast.cliMissing"),
+        })
       );
     } catch (err) {
-      showBanner(bannerEl, "err", `测试失败：${err.message || "无法访问该地址"}`);
+      showBanner(bannerEl, "err", t("toast.testFail", { err: err.message || t("err.cannotAccess") }));
     }
   }
 
@@ -863,7 +963,7 @@
   // =========================================================================
   async function apiFetch(path, opts = {}) {
     const host = getActiveHost();
-    if (!host || (!SIDECAR && !host.url)) throw new Error("未配置主机");
+    if (!host || (!SIDECAR && !host.url)) throw new Error(t("err.noHost"));
     const headers = Object.assign({}, opts.headers || {});
     if (host.token) headers["Authorization"] = `Bearer ${host.token}`;
     if (opts.body && !(opts.body instanceof FormData) && !headers["Content-Type"]) {
@@ -885,15 +985,15 @@
       resp = await fetch(`${getApiBase(host)}${path}`, fetchOpts);
     } catch (err) {
       if (err && err.name === "AbortError" && ctrl) {
-        throw new Error("请求超时，请检查本机服务连接");
+        throw new Error(t("err.reqTimeout"));
       }
       throw err;
     } finally {
       if (timer) clearTimeout(timer);
     }
     if (resp.status === 401) {
-      setConnState("offline", "访问令牌无效，请在主机设置检查");
-      throw new Error("身份校验失败 (401)");
+      setConnState("offline", t("conn.tokenInvalid"));
+      throw new Error(t("err.auth401"));
     }
     const ct = resp.headers.get("content-type") || "";
     if (ct.includes("application/json")) {
@@ -918,10 +1018,10 @@
   function updateHostDisplays() {
     const host = getActiveHost();
     const isDesktopHost = isLocalDesktopBrowser();
-    const label = host ? host.name : (isDesktopHost ? "本机主机" : "未配置主机");
+    const label = host ? formatHostDisplayName(host.name) : (isDesktopHost ? t("host.localHost") : t("err.noHost"));
     const sub = isDesktopHost
-      ? (state.wsConnected ? "本机主机在线 · 点此出示手机扫码" : "正在连接本机服务...")
-      : (host ? host.url.replace(/^https?:\/\//i, "") : "点击添加主机");
+      ? (state.wsConnected ? t("host.localOnlineDrawer") : t("host.localConnectingDrawer"))
+      : (host ? host.url.replace(/^https?:\/\//i, "") : t("host.tapAddHost"));
     const dName = $("drawer-host-name");
     const dUrl = $("drawer-host-url");
     const eName = $("empty-host-name");
@@ -929,8 +1029,8 @@
     if (dUrl) dUrl.textContent = sub;
     if (eName) {
       eName.textContent = isDesktopHost
-        ? (state.wsConnected ? `${label} · 点此出示手机扫码二维码` : "正在连接本机主机...")
-        : (state.wsConnected ? `已连接 · ${label}` : label);
+        ? (state.wsConnected ? t("host.localOnlineChip", { label }) : t("host.localConnectingChip"))
+        : (state.wsConnected ? t("host.connectedChip", { label }) : label);
     }
   }
 
@@ -1156,7 +1256,7 @@
   async function connectSidecarPoll(host, epoch) {
     if (epoch !== state.connectEpoch) return;
     if (!state.wsConnected && state.connPhase === "connecting") {
-      setConnState("connecting", `正在连接 ${host.name}...`);
+      setConnState("connecting", t("conn.connecting", { name: formatHostDisplayName(host.name) }));
     }
 
     const runTick = async () => {
@@ -1193,7 +1293,7 @@
           state.wsConnected = false;
           state.connPhase = "auth_error";
           updateHostDisplays();
-          setConnState("offline", "访问令牌无效，请在主机设置检查");
+          setConnState("offline", t("conn.tokenInvalid"));
           return;
         }
         if (!resp.ok) {
@@ -1288,7 +1388,7 @@
     state.sseAbort = ctrl;
     let stopSseRetry = false;
     if (!state.wsConnected && state.connPhase === "connecting") {
-      setConnState("connecting", `正在连接 ${host.name}...`);
+      setConnState("connecting", t("conn.connecting", { name: formatHostDisplayName(host.name) }));
     }
     try {
       const resp = await fetch("/__sidecar/events", {
@@ -1309,7 +1409,7 @@
         state.wsConnected = false;
         state.connPhase = "auth_error";
         updateHostDisplays();
-        setConnState("offline", "访问令牌无效，请在主机设置检查");
+        setConnState("offline", t("conn.tokenInvalid"));
         return;
       }
       if (!resp.ok || !resp.body || typeof resp.body.getReader !== "function") {
@@ -1376,7 +1476,7 @@
     const host = getActiveHost();
     if (!host || (!SIDECAR && !host.url)) {
       state.connPhase = "offline";
-      setConnState("offline", "未配置主机");
+      setConnState("offline", t("err.noHost"));
       return;
     }
 
@@ -1391,7 +1491,7 @@
     }
 
     const wsUrl = host.url.replace(/^http/i, "ws") + `/ws?token=${encodeURIComponent(host.token)}`;
-    setConnState("connecting", `正在连接 ${host.name}...`);
+    setConnState("connecting", t("conn.connecting", { name: formatHostDisplayName(host.name) }));
 
     try {
       const ws = new WebSocket(wsUrl);
@@ -1488,7 +1588,7 @@
         if (!state.currentConv) {
           state.currentConv = {
             id: cid,
-            title: String(promptText || "").slice(0, 36) || "新对话",
+            title: String(promptText || "").slice(0, 36) || t("chat.newConvTitle"),
             source: "mobile",
             messages: [],
             deliverables: [],
@@ -1575,25 +1675,25 @@
         state.streaming = false;
         state.streamBuffer = "";
         state.streamTools = [];
-        const errText = String(ev.error || "未知错误");
+        const errText = String(ev.error || t("err.unknown"));
         if (state.currentConv) {
           state.currentConv.messages.push({
             role: "assistant",
-            text: `执行发生错误：\n\`\`\`\n${errText}\n\`\`\``,
+            text: t("chat.execError", { err: errText }),
             model: state.selectedModel,
           });
         }
         renderConversation({ preserveScroll: true });
-        showToast(`执行失败：${errText.slice(0, 80)}`);
+        showToast(t("toast.execFail", { err: errText.slice(0, 80) }));
       }
       refreshConversationsThrottled(400);
     } else if (ev.type === "tunnel_status" && ev.tunnel) {
       if (isLocalDesktopBrowser()) {
         const ts = String(ev.tunnel.status || "");
         if (ts === "reconnecting") {
-          showToast("检测到公网隧道断连，后台正在自动自愈重连...");
+          showToast(t("toast.tunnelDown"));
         } else if (ts === "online" && ev.tunnel.url) {
-          showToast("公网隧道已恢复在线，可点右上角「供手机扫码」刷新二维码");
+          showToast(t("toast.tunnelUp"));
         }
       }
     } else if (ev.type === "desktop_update") {
@@ -1788,7 +1888,7 @@
           blocks.push(
             `<div class="code-block">` +
               `<div class="code-head"><span>${escHtml(cb.lang)}</span>` +
-              `<button class="code-copy-btn" type="button" data-copy="${encodeURIComponent(cb.code)}">复制</button></div>` +
+              `<button class="code-copy-btn" type="button" data-copy="${encodeURIComponent(cb.code)}">${escHtml(t("chat.copyCode"))}</button></div>` +
               `<pre><code>${escHtml(cb.code)}</code></pre>` +
             `</div>`
           );
@@ -1916,25 +2016,25 @@
     if (state.streaming) {
       btn.classList.add("stopping");
       btn.classList.remove("ready");
-      btn.setAttribute("aria-label", "停止生成");
+      btn.setAttribute("aria-label", t("chat.stopAria"));
       $("icon-send").classList.add("hidden");
       $("icon-stop").classList.remove("hidden");
-      setConnState("running", "正在执行任务...");
+      setConnState("running", t("conn.runningTask"));
     } else {
       btn.classList.remove("stopping");
       btn.classList.toggle("ready", hasContent);
-      btn.setAttribute("aria-label", "发送");
+      btn.setAttribute("aria-label", t("chat.sendAria"));
       $("icon-send").classList.remove("hidden");
       $("icon-stop").classList.add("hidden");
       if (state.wsConnected) {
-        const hostName = host ? host.name : "主机";
-        setConnState("online", `${hostName} · 已连接`);
+        const hostName = host ? formatHostDisplayName(host.name) : t("host.generic");
+        setConnState("online", t("conn.connected", { name: hostName }));
       } else if (state.connPhase === "auth_error") {
-        setConnState("offline", "访问令牌无效，请在主机设置检查");
+        setConnState("offline", t("conn.tokenInvalid"));
       } else if (host && state.connPhase === "connecting") {
-        setConnState("connecting", `正在连接 ${host.name}...`);
+        setConnState("connecting", t("conn.connecting", { name: formatHostDisplayName(host.name) }));
       } else {
-        setConnState("offline", host ? `正在重连 ${host.name}...` : "未连接主机");
+        setConnState("offline", host ? t("conn.reconnecting", { name: formatHostDisplayName(host.name) }) : t("conn.notConnected"));
       }
     }
   }
@@ -2479,7 +2579,7 @@
 
   function makeTurnPreviewText(msg, turnIndex) {
     const raw = String((msg && msg.text) || "")
-      .replace(/```[\s\S]*?```/g, " [代码] ")
+      .replace(/```[\s\S]*?```/g, t("turnNav.codeStub"))
       .replace(/[#*_`>~]+/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -2489,13 +2589,13 @@
     let preview = raw;
     if (!preview) {
       if (imageCount > 0 && fileCount > 0) {
-        preview = `[图片 ×${imageCount} · 附件 ×${fileCount}]`;
+        preview = t("turnNav.mediaBoth", { img: imageCount, file: fileCount });
       } else if (imageCount > 0) {
-        preview = imageCount > 1 ? `[图片 ×${imageCount}]` : "[图片]";
+        preview = imageCount > 1 ? t("turnNav.mediaImgMany", { img: imageCount }) : t("turnNav.mediaImgOne");
       } else if (fileCount > 0) {
-        preview = fileCount > 1 ? `[附件 ×${fileCount}]` : "[附件]";
+        preview = fileCount > 1 ? t("turnNav.mediaFileMany", { file: fileCount }) : t("turnNav.mediaFileOne");
       } else {
-        preview = `第 ${turnIndex} 轮`;
+        preview = t("turnNav.turnFallback", { idx: turnIndex });
       }
     } else if (preview.length > 96) {
       preview = `${preview.slice(0, 96)}…`;
@@ -2505,7 +2605,7 @@
       preview,
       imageCount,
       fileCount,
-      searchText: `${turnIndex} #${turnIndex} 第${turnIndex}轮 ${raw} ${preview} ${attNames}`.toLowerCase(),
+      searchText: `${turnIndex} #${turnIndex} 第${turnIndex}轮 turn ${turnIndex} ${raw} ${preview} ${attNames}`.toLowerCase(),
     };
   }
 
@@ -2551,12 +2651,12 @@
       trigger.classList.toggle("turn-nav-ready", enabled);
       trigger.classList.toggle("turn-nav-open", enabled && state.turnNavOpen);
       trigger.setAttribute("aria-expanded", enabled && state.turnNavOpen ? "true" : "false");
-      trigger.title = enabled ? `共 ${total} 轮对话 · 点击展开轮次导航` : "";
+      trigger.title = enabled ? t("turnNav.triggerTitle", { total }) : "";
     }
     if (badge) {
       if (enabled) {
         const cur = Math.min(total, Math.max(1, state.activeTurnIndex || total));
-        badge.textContent = `${cur}/${total}轮`;
+        badge.textContent = t("turnNav.badge", { cur, total });
         badge.classList.remove("hidden");
       } else {
         badge.textContent = "";
@@ -2627,7 +2727,7 @@
 
     const total = state.turns.length;
     if (headingEl) {
-      headingEl.textContent = `对话轮次导航 · 共 ${total} 轮`;
+      headingEl.textContent = t("turnNav.headingCount", { total });
     }
     if (searchWrap) {
       searchWrap.classList.toggle("hidden", total < 8);
@@ -2637,26 +2737,26 @@
     const filtered = q ? state.turns.filter((t) => t.searchText.includes(q)) : state.turns;
 
     if (!filtered.length) {
-      listEl.innerHTML = `<div class="empty-placeholder">无匹配轮次</div>`;
+      listEl.innerHTML = `<div class="empty-placeholder">${escHtml(t("turnNav.empty"))}</div>`;
       return;
     }
 
     const activeIdx = state.activeTurnIndex || total;
     listEl.innerHTML = filtered
-      .map((t) => {
-        const isAct = t.index === activeIdx;
-        const imgBadge = t.imageCount > 0
-          ? `<span class="turn-nav-att-badge" title="${t.imageCount} 张图片">${TURN_IMG_ICON_SVG}<span>${t.imageCount}</span></span>`
+      .map((item) => {
+        const isAct = item.index === activeIdx;
+        const imgBadge = item.imageCount > 0
+          ? `<span class="turn-nav-att-badge" title="${escHtml(t("turnNav.imgCountTitle", { count: item.imageCount }))}">${TURN_IMG_ICON_SVG}<span>${item.imageCount}</span></span>`
           : "";
-        const fileBadge = t.fileCount > 0
-          ? `<span class="turn-nav-att-badge" title="${t.fileCount} 个文件">📎${t.fileCount}</span>`
+        const fileBadge = item.fileCount > 0
+          ? `<span class="turn-nav-att-badge" title="${escHtml(t("turnNav.fileCountTitle", { count: item.fileCount }))}">📎${item.fileCount}</span>`
           : "";
-        const timeTag = t.timeLabel ? `<span class="turn-nav-time">${escHtml(t.timeLabel)}</span>` : "";
+        const timeTag = item.timeLabel ? `<span class="turn-nav-time">${escHtml(item.timeLabel)}</span>` : "";
         return `
-          <button class="turn-nav-item ${isAct ? "active" : ""}" type="button" role="listitem" data-turn-index="${t.index}"${isAct ? ' aria-current="true"' : ""}>
+          <button class="turn-nav-item ${isAct ? "active" : ""}" type="button" role="listitem" data-turn-index="${item.index}"${isAct ? ' aria-current="true"' : ""}>
             <span class="turn-nav-dot" aria-hidden="true"></span>
-            <span class="turn-nav-num">#${t.index}</span>
-            <span class="turn-nav-preview">${escHtml(t.preview)}</span>
+            <span class="turn-nav-num">#${item.index}</span>
+            <span class="turn-nav-preview">${escHtml(item.preview)}</span>
             <span class="turn-nav-meta">${imgBadge}${fileBadge}${timeTag}</span>
           </button>`;
       })
@@ -2833,7 +2933,7 @@
     }
 
     $("empty-state").classList.add("hidden");
-    $("conv-title").textContent = conv.title || "新对话";
+    $("conv-title").textContent = conv.title || t("chat.newConvTitle");
 
     const host = getActiveHost();
     const { turns, msgIndexToTurnIndex } = buildConversationTurns(conv.messages);
@@ -2880,9 +2980,9 @@
                   imgAttr = directUrl ? `src="${escHtml(directUrl)}" loading="${loadingAttr}"` : "";
                   thumbStateCls = directUrl ? "img-loading" : "img-error";
                 }
-                return `<button class="msg-img-thumb msg-att-btn ${thumbStateCls}" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "image")}" data-media-path="${escHtml(apiPath)}" aria-label="查看原图 ${escHtml(a.name || "")}">` +
+                return `<button class="msg-img-thumb msg-att-btn ${thumbStateCls}" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "image")}" data-media-path="${escHtml(apiPath)}" aria-label="${escHtml(a.name || "image")}">` +
                   `<img ${imgAttr} data-media-path="${escHtml(apiPath)}" data-media-key="${escHtml(cacheKey)}" alt="${escHtml(a.name || "")}" decoding="async" />` +
-                  `<span class="msg-img-retry" aria-hidden="true">加载失败<br/>点击重试</span>` +
+                  `<span class="msg-img-retry" aria-hidden="true">${t("chat.imgLoadFailed")}</span>` +
                 `</button>`;
               })
               .join("");
@@ -2893,7 +2993,7 @@
               .map(
                 (a) =>
                   `<button class="msg-file-pill msg-att-btn" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "file")}">` +
-                    `<span>📎 ${escHtml(a.name || "文件")}</span>` +
+                    `<span>📎 ${escHtml(a.name || t("chat.fileFallback"))}</span>` +
                   `</button>`
               )
               .join("");
@@ -2911,23 +3011,23 @@
         if (hasTools || hasThinking) {
           const items = (msg.tools || [])
             .map(
-              (t) =>
+              (tool) =>
                 `<div class="tool-step">` +
                   `<span class="tool-step-status">✓</span>` +
-                  `<span class="tool-step-name">${escHtml(t.name)}</span>` +
-                  `<span class="tool-step-target">${escHtml(t.target || "")}</span>` +
+                  `<span class="tool-step-name">${escHtml(tool.name)}</span>` +
+                  `<span class="tool-step-target">${escHtml(tool.target || "")}</span>` +
                 `</div>`
             )
             .join("");
           const thinkHtml = hasThinking
             ? `<div class="thinking-snippet">${escHtml(msg.thinking.trim())}</div>`
             : "";
-          const summaryTitle = hasTools ? `已执行 ${msg.tools.length} 个工具步骤` : "查看思考摘要";
+          const summaryTitle = hasTools ? t("chat.toolsExecuted", { count: msg.tools.length }) : t("chat.viewThinking");
           toolsHtml = `
             <details class="m3-tool-card">
               <summary>
                 ${CHECK_SVG}
-                <span class="m3-tool-summary-text">${summaryTitle}</span>
+                <span class="m3-tool-summary-text">${escHtml(summaryTitle)}</span>
                 ${CHEVRON_SVG}
               </summary>
               <div class="tool-items">${items}${thinkHtml}</div>
@@ -2947,7 +3047,7 @@
               msg.text
                 ? `<div class="msg-actions">
                      <button class="msg-action-btn copy-msg" type="button" data-raw="${encodeURIComponent(msg.text)}">
-                       ${COPY_SVG}<span>复制全文</span>
+                       ${COPY_SVG}<span>${escHtml(t("chat.copyFull"))}</span>
                      </button>
                    </div>`
                 : ""
@@ -2977,7 +3077,7 @@
       delivBox.classList.remove("hidden");
       delivBox.open = wasOpen;
       const cntEl = $("deliverables-count");
-      if (cntEl) cntEl.textContent = `本会话生成与关联文件（${delivs.length} 个）`;
+      if (cntEl) cntEl.textContent = t("deliv.countTitle", { count: delivs.length });
       $("deliverables-list").innerHTML = delivs
         .map(
           (d) =>
@@ -3035,18 +3135,18 @@
     const tools = state.streamTools || [];
     const items = tools
       .map(
-        (t) =>
+        (tool) =>
           `<div class="tool-step">` +
-            `<span class="tool-step-status ${t.state === "ACTIVE" ? "active" : ""}">${t.state === "ACTIVE" ? "●" : "✓"}</span>` +
-            `<span class="tool-step-name">${escHtml(t.name)}</span>` +
-            `<span class="tool-step-target">${escHtml(t.target || "")}</span>` +
+            `<span class="tool-step-status ${tool.state === "ACTIVE" ? "active" : ""}">${tool.state === "ACTIVE" ? "●" : "✓"}</span>` +
+            `<span class="tool-step-name">${escHtml(tool.name)}</span>` +
+            `<span class="tool-step-target">${escHtml(tool.target || "")}</span>` +
           `</div>`
       )
       .join("");
 
     const summaryText = tools.length
-      ? `正在执行 (${tools.length} 步): ${escHtml(tools[tools.length - 1].name)}`
-      : "正在思考与规划任务...";
+      ? escHtml(t("chat.runningTool", { count: tools.length, name: tools[tools.length - 1].name }))
+      : escHtml(t("chat.thinking"));
 
     const traceHtml = `
       <details class="m3-tool-card" open>
@@ -3063,7 +3163,7 @@
       <div class="assistant-flow">
         <div class="assistant-head">
           <span class="assistant-avatar">${assistantMarkSvg()}</span>
-          <span>${escHtml(shortModelLabel(state.selectedModel))} · 实时输出</span>
+          <span>${escHtml(t("chat.liveOutput", { model: shortModelLabel(state.selectedModel) }))}</span>
         </div>
         ${traceHtml}
         ${state.streamBuffer ? `<div class="md-body">${renderMarkdown(state.streamBuffer)}</div>` : ""}
@@ -3144,12 +3244,12 @@
         followBtn.setAttribute("aria-disabled", isFollowing ? "true" : "false");
         if (followTxt) {
           followTxt.textContent = isFollowing
-            ? "已跟随主窗口"
-            : (isSyncingHost ? "正在同步主窗口..." : "回到主窗口对话");
+            ? t("topbar.following")
+            : (isSyncingHost ? t("topbar.syncingHost") : t("topbar.returnHost"));
         }
         followBtn.title = isFollowing
-          ? "当前正跟随 Antigravity 主窗口对话"
-          : (isSyncingHost ? "正在加载 Antigravity 主窗口当前对话..." : "点击跳回 Antigravity 主窗口正在查看的对话");
+          ? t("topbar.followingTip")
+          : (isSyncingHost ? t("topbar.syncingHostTip") : t("topbar.returnHostTip"));
       }
     }
 
@@ -3211,7 +3311,7 @@
     });
 
     if (!filtered.length) {
-      el.innerHTML = `<div class="empty-placeholder">暂无匹配会话</div>`;
+      el.innerHTML = `<div class="empty-placeholder">${escHtml(t("drawer.noMatch"))}</div>`;
       return;
     }
 
@@ -3220,22 +3320,22 @@
         const act = c.id === state.currentCid ? "active" : "";
         let badge = "";
         if (c.status === "running") {
-          badge = `<span class="ci-badge run">运行中</span>`;
+          badge = `<span class="ci-badge run">${escHtml(t("drawer.badgeRun"))}</span>`;
         } else if (c.source === "external") {
-          badge = `<span class="ci-badge ext">外部</span>`;
+          badge = `<span class="ci-badge ext">${escHtml(t("drawer.badgeExt"))}</span>`;
         } else if (c.subSource === "qq_dm") {
-          badge = `<span class="ci-badge qqdm">QQ私聊</span>`;
+          badge = `<span class="ci-badge qqdm">${escHtml(t("drawer.badgeQqdm"))}</span>`;
         } else if (c.source === "mobile") {
-          badge = `<span class="ci-badge mob">移动</span>`;
+          badge = `<span class="ci-badge mob">${escHtml(t("drawer.badgeMob"))}</span>`;
         } else if (c.hasMobile && c.source === "desktop") {
-          badge = `<span class="ci-badge sync">同步</span>`;
+          badge = `<span class="ci-badge sync">${escHtml(t("drawer.badgeSync"))}</span>`;
         }
         const draft = state.drafts[c.id];
         let prevHtml = escHtml(c.preview || c.shortId);
         if (hasDraftContent(draft)) {
           const dTxt = (draft.text || "").trim().replace(/\s+/g, " ");
-          const dAtt = draft.attachments && draft.attachments.length ? `[${draft.attachments.length} 个附件]` : "";
-          prevHtml = `<span class="ci-draft-tag">[草稿]</span>${escHtml(dTxt || dAtt)}`;
+          const dAtt = draft.attachments && draft.attachments.length ? t("drawer.draftAtt", { count: draft.attachments.length }) : "";
+          prevHtml = `<span class="ci-draft-tag">${escHtml(t("drawer.draftTag"))}</span>${escHtml(dTxt || dAtt)}`;
         }
         return `
           <button class="conv-item ${act}" type="button" data-cid="${escHtml(c.id)}">
@@ -3323,7 +3423,7 @@
         updateSidecarHeaderActions();
       }
       if (!silent) {
-        showToast(`加载会话失败：${e.message}`);
+        showToast(t("toast.loadConvFail", { err: e.message }));
       }
     } finally {
       if (autoFollow && reqSeq === state.openConvSeq) {
@@ -3366,9 +3466,9 @@
         await apiFetch(`/api/chat/cancel/${encodeURIComponent(state.currentCid)}`, { method: "POST" });
         state.streaming = false;
         updateSendButton();
-        showToast("已停止任务");
+        showToast(t("toast.stoppedTask"));
       } catch (e) {
-        showToast(`停止失败：${e.message}`);
+        showToast(t("toast.stopFail", { err: e.message }));
       }
       return;
     }
@@ -3387,7 +3487,7 @@
       state.sidecarUserPicked = true;
       state.currentConv = {
         id: "",
-        title: text.slice(0, 36) || (prevAttachments[0]?.name || "新对话"),
+        title: text.slice(0, 36) || (prevAttachments[0]?.name || t("chat.newConvTitle")),
         source: "mobile",
         messages: [],
         deliverables: [],
@@ -3465,7 +3565,7 @@
       } else {
         updateSendButton();
       }
-      showToast(`发送失败：${e.message}`);
+      showToast(t("toast.sendFail", { err: e.message }));
     }
   }
 
@@ -3513,8 +3613,8 @@
         return `
           <div class="attach-chip">
             ${imgTag}
-            <span>${escHtml((a.name || "文件").slice(0, 18))}</span>
-            <button type="button" data-rm="${idx}" aria-label="移除附件">✕</button>
+            <span>${escHtml((a.name || t("chat.fileFallback")).slice(0, 18))}</span>
+            <button type="button" data-rm="${idx}" aria-label="${escHtml(t("chat.removeAttachAria"))}">✕</button>
           </div>`;
       })
       .join("");
@@ -3531,17 +3631,17 @@
   async function uploadFiles(fileList) {
     const targetKey = currentDraftKey();
     for (const f of Array.from(fileList || [])) {
-      showToast(`正在上传 ${f.name}...`);
+      showToast(t("toast.uploading", { name: f.name }));
       const fd = new FormData();
       fd.append("file", f, f.name);
       try {
         const res = await apiFetch("/api/upload", { method: "POST", body: fd });
         appendUploadedAttachment(res, targetKey);
         haptic("light");
-        const kindTag = res.is_image ? "无损原图" : "原文件";
-        showToast(`已上传${kindTag} ${f.name} (${formatSize(res.size)})`);
+        const kindTag = res.is_image ? t("toast.kindOrigImg") : t("toast.kindOrigFile");
+        showToast(t("toast.uploaded", { kind: kindTag, name: f.name, size: formatSize(res.size) }));
       } catch (e) {
-        showToast(`上传失败：${e.message}`);
+        showToast(t("toast.uploadFail", { err: e.message }));
       }
     }
   }
@@ -3550,11 +3650,11 @@
     return new Promise((resolve, reject) => {
       const host = getActiveHost();
       if (!host || !host.url) {
-        reject(new Error("未配置主机"));
+        reject(new Error(t("err.noHost")));
         return;
       }
       if (!window.AndroidBridge?.uploadMediaImage) {
-        reject(new Error("当前环境不支持原生相册直传"));
+        reject(new Error(t("err.noNativeAlbum")));
         return;
       }
       const cbId = `up_${Date.now()}_${++state.nativeUploadSeq}`;
@@ -3618,7 +3718,7 @@
           </div>
         </div>`
         )
-        .join("") || `<div class="empty-placeholder">连接主机后自动加载可用模型列表</div>`;
+        .join("") || `<div class="empty-placeholder">${escHtml(t("sheet.modelEmpty"))}</div>`;
 
     $("host-sheet").classList.add("hidden");
     $("attach-sheet")?.classList.add("hidden");
@@ -3630,7 +3730,7 @@
     const el = $("host-sheet-list");
     if (!el) return;
     if (!state.hosts.length) {
-      el.innerHTML = `<div class="empty-placeholder">暂无已配对主机</div>`;
+      el.innerHTML = `<div class="empty-placeholder">${escHtml(t("sheet.hostEmpty"))}</div>`;
       return;
     }
     el.innerHTML = state.hosts
@@ -3640,7 +3740,7 @@
           <button class="host-sheet-item ${isAct ? "active" : ""}" type="button" data-hid="${escHtml(h.id)}">
             <span class="conn-dot ${isAct ? (state.wsConnected ? "online" : "connecting") : ""}"></span>
             <div class="host-sheet-meta">
-              <div class="host-sheet-name">${escHtml(h.name)}</div>
+              <div class="host-sheet-name">${escHtml(formatHostDisplayName(h.name))}</div>
               <div class="host-sheet-url">${escHtml(h.url)}</div>
             </div>
             ${isAct ? CHECK_SVG : ""}
@@ -3676,7 +3776,7 @@
     if (btn) {
       const cnt = state.selectedPhotoIds.length;
       btn.disabled = cnt === 0;
-      btn.textContent = cnt > 0 ? `添加 (${cnt})` : "添加";
+      btn.textContent = cnt > 0 ? t("sheet.addCount", { count: cnt }) : t("sheet.add");
     }
   }
 
@@ -3687,8 +3787,8 @@
     if (!window.AndroidBridge?.getRecentPhotosJson) {
       strip.innerHTML = `
         <div class="photo-perm-card">
-          <div class="photo-perm-title">快速添加图片或文件</div>
-          <div class="photo-perm-desc">点击下方「相册」选择图片，或点击「打开文件夹」浏览任意文件</div>
+          <div class="photo-perm-title">${escHtml(t("sheet.photoQuickTitle"))}</div>
+          <div class="photo-perm-desc">${escHtml(t("sheet.photoQuickDesc"))}</div>
         </div>`;
       return;
     }
@@ -3707,9 +3807,9 @@
     if (!state.recentPhotosGranted) {
       strip.innerHTML = `
         <div class="photo-perm-card">
-          <div class="photo-perm-title">开启相册权限，滑出即选最近图片</div>
-          <div class="photo-perm-desc">授权后可像 QQ 一样直接横滑勾选最新截图与照片；不授权也可直接点下方「相册」或「打开文件夹」</div>
-          <button id="btn-grant-media-perm" class="m3-btn tonal sm" type="button">授权查看最近照片</button>
+          <div class="photo-perm-title">${escHtml(t("sheet.photoPermTitle"))}</div>
+          <div class="photo-perm-desc">${escHtml(t("sheet.photoPermDesc"))}</div>
+          <button id="btn-grant-media-perm" class="m3-btn tonal sm" type="button">${escHtml(t("sheet.photoGrantBtn"))}</button>
         </div>`;
       if (autoRequestPerm && !state.mediaPermRequestedOnce) {
         state.mediaPermRequestedOnce = true;
@@ -3725,9 +3825,9 @@
     if (!items.length) {
       strip.innerHTML = `
         <div class="photo-perm-card">
-          <div class="photo-perm-title">暂无最近照片</div>
-          <div class="photo-perm-desc">可点击下方「相册」选择系统图库图片，或点击「打开文件夹」选择文件</div>
-          ${state.recentPhotosPartial ? `<button id="btn-grant-media-perm" class="m3-btn tonal sm" type="button">添加更多授权照片</button>` : ""}
+          <div class="photo-perm-title">${escHtml(t("sheet.photoEmptyTitle"))}</div>
+          <div class="photo-perm-desc">${escHtml(t("sheet.photoEmptyDesc"))}</div>
+          ${state.recentPhotosPartial ? `<button id="btn-grant-media-perm" class="m3-btn tonal sm" type="button">${escHtml(t("sheet.photoAddMore"))}</button>` : ""}
         </div>`;
       return;
     }
@@ -3739,7 +3839,7 @@
         const ratio = w > 0 && h > 0 ? w / h : 0.66;
         const cardW = Math.max(112, Math.min(244, Math.round(230 * ratio)));
         return `
-          <button class="photo-tile" type="button" data-pid="${Number(p.id)}" style="width:${cardW}px" aria-label="${escHtml(p.name || "照片")}">
+          <button class="photo-tile" type="button" data-pid="${Number(p.id)}" style="width:${cardW}px" aria-label="${escHtml(p.name || t("sheet.photoAlt"))}">
             <img src="${escHtml(p.thumbUrl)}" loading="lazy" decoding="async" alt="" />
             <span class="photo-check" aria-hidden="true"></span>
           </button>`;
@@ -3752,7 +3852,7 @@
              <line x1="12" y1="5" x2="12" y2="19"></line>
              <line x1="5" y1="12" x2="19" y2="12"></line>
            </svg>
-           <span>管理更多<br/>授权照片</span>
+           <span>${t("sheet.photoManageMore")}</span>
          </button>`
       : "";
 
@@ -3796,7 +3896,11 @@
     let lastSucceededName = "";
     for (let i = 0; i < picked.length; i++) {
       const p = picked[i];
-      showToast(picked.length > 1 ? `正在上传原图 (${i + 1}/${picked.length})...` : `正在上传原图 ${p.name}...`);
+      showToast(
+        picked.length > 1
+          ? t("toast.uploadingOrigMulti", { cur: i + 1, total: picked.length })
+          : t("toast.uploadingOrigOne", { name: p.name })
+      );
       try {
         const res = await uploadNativeMediaPhoto(p);
         appendUploadedAttachment(res, targetKey);
@@ -3804,20 +3908,20 @@
         lastSucceededName = p.name || "";
         haptic("light");
       } catch (err) {
-        showToast(`上传 ${p.name} 失败：${err.message}`);
+        showToast(t("toast.uploadItemFail", { name: p.name, err: err.message }));
       }
     }
     if (succeeded > 1) {
       showToast(
         succeeded === picked.length
-          ? `已添加 ${succeeded} 张无损原图`
-          : `已添加 ${succeeded}/${picked.length} 张无损原图`
+          ? t("toast.addedOrigAll", { ok: succeeded })
+          : t("toast.addedOrigPart", { ok: succeeded, total: picked.length })
       );
     } else if (succeeded === 1) {
       showToast(
         picked.length === 1
-          ? `已添加无损原图 ${lastSucceededName}`
-          : `已添加 1/${picked.length} 张无损原图`
+          ? t("toast.addedOrigOne", { name: lastSucceededName })
+          : t("toast.addedOrigOnePart", { total: picked.length })
       );
     }
   }
@@ -3831,12 +3935,12 @@
 
   async function loadFilesDir(dirPath) {
     const list = $("files-list");
-    list.innerHTML = `<div class="empty-placeholder">正在读取目录...</div>`;
+    list.innerHTML = `<div class="empty-placeholder">${escHtml(t("files.reading"))}</div>`;
     try {
       const qs = dirPath ? `?dir=${encodeURIComponent(dirPath)}` : "";
       const data = await apiFetch(`/api/files${qs}`);
       state.currentDir = data.dir || "";
-      $("files-path").textContent = data.dir || "工作区";
+      $("files-path").textContent = data.dir || t("files.workspace");
       $("btn-files-up").dataset.parent = data.parent || "";
       $("btn-files-up").disabled = !data.parent;
 
@@ -3850,13 +3954,13 @@
                 <div class="file-ic ${it.is_dir ? "folder" : ""}">${ic}</div>
                 <div class="file-info">
                   <div class="file-name">${escHtml(it.name)}</div>
-                  <div class="file-meta">${it.is_dir ? "文件夹" : formatSize(it.size)}</div>
+                  <div class="file-meta">${it.is_dir ? escHtml(t("files.folder")) : formatSize(it.size)}</div>
                 </div>
               </div>`;
           })
-          .join("") || `<div class="empty-placeholder">空目录</div>`;
+          .join("") || `<div class="empty-placeholder">${escHtml(t("files.emptyDir"))}</div>`;
     } catch (e) {
-      list.innerHTML = `<div class="empty-placeholder">读取目录失败：${escHtml(e.message)}</div>`;
+      list.innerHTML = `<div class="empty-placeholder">${escHtml(t("files.readError", { err: e.message }))}</div>`;
     }
   }
 
@@ -3871,7 +3975,7 @@
     $("preview-name").textContent = name || path.split("/").pop();
     $("preview-meta").textContent = path;
     const bodyEl = $("preview-body");
-    bodyEl.innerHTML = `<div class="empty-placeholder">正在加载预览...</div>`;
+    bodyEl.innerHTML = `<div class="empty-placeholder">${escHtml(t("preview.loading"))}</div>`;
     $("preview-modal").classList.remove("hidden");
 
     const ext = (path.split(".").pop() || "").toLowerCase();
@@ -3879,10 +3983,11 @@
       const apiPath = buildPreviewApiPath("", path);
       const renderPreviewError = (errMsg) => {
         if (previewSeq !== _previewLoadSeq) return;
+        const detail = errMsg ? (I18N.isEn() ? ` (${errMsg})` : `（${errMsg}）`) : "";
         bodyEl.innerHTML = `
           <div class="m3-card preview-img-error">
-            <p class="info-text">图片预览加载失败${errMsg ? `（${escHtml(errMsg)}）` : ""}</p>
-            <button id="btn-preview-retry" class="m3-btn tonal sm" type="button">重新加载图片</button>
+            <p class="info-text">${escHtml(t("preview.imgError", { detail }))}</p>
+            <button id="btn-preview-retry" class="m3-btn tonal sm" type="button">${escHtml(t("preview.retryImg"))}</button>
           </div>`;
         $("btn-preview-retry")?.addEventListener("click", () => {
           openFilePreview(path, name);
@@ -3909,14 +4014,14 @@
                 }
               } catch (_) {}
             }
-            renderPreviewError("解码异常");
+            renderPreviewError(t("preview.decodeErr"));
           };
           img.src = entry.dataUrl || entry.blobUrl;
           bodyEl.innerHTML = "";
           bodyEl.appendChild(img);
         } catch (err) {
           if (previewSeq !== _previewLoadSeq || $("preview-modal")?.classList.contains("hidden")) return;
-          renderPreviewError(err && err.name === "AbortError" ? "请求超时或已取消" : (err ? err.message : ""));
+          renderPreviewError(err && err.name === "AbortError" ? t("preview.abortErr") : (err ? err.message : ""));
         }
       };
 
@@ -3935,7 +4040,7 @@
           img.dataset.authFallbackTried = "1";
           mountBlobImage(true);
         } else {
-          renderPreviewError("网络异常");
+          renderPreviewError(t("preview.netErr"));
         }
       };
       img.src = directUrl;
@@ -3949,15 +4054,15 @@
       if (previewSeq !== _previewLoadSeq) return;
       if (typeof Response !== "undefined" && data instanceof Response) {
         const txt = await data.text();
-        bodyEl.innerHTML = `<pre>${escHtml(txt.slice(0, 65536) || "(空文件)")}</pre>`;
+        bodyEl.innerHTML = `<pre>${escHtml(txt.slice(0, 65536) || t("preview.emptyFile"))}</pre>`;
       } else if (data.binary) {
-        bodyEl.innerHTML = `<div class="m3-card"><p class="info-text">该文件为二进制格式（${formatSize(data.size)}），请点击右上角「下载」保存到手机查看。</p></div>`;
+        bodyEl.innerHTML = `<div class="m3-card"><p class="info-text">${escHtml(t("preview.binaryMsg", { size: formatSize(data.size) }))}</p></div>`;
       } else {
-        bodyEl.innerHTML = `<pre>${escHtml(data.content || "(空文件)")}</pre>`;
+        bodyEl.innerHTML = `<pre>${escHtml(data.content || t("preview.emptyFile"))}</pre>`;
       }
     } catch (e) {
       if (previewSeq !== _previewLoadSeq) return;
-      bodyEl.innerHTML = `<div class="m3-card"><p class="info-text">预览失败：${escHtml(e.message)}</p></div>`;
+      bodyEl.innerHTML = `<div class="m3-card"><p class="info-text">${escHtml(t("preview.fail", { err: e.message }))}</p></div>`;
     }
   }
 
@@ -3983,10 +4088,10 @@
     const hint = $("settings-dl-hint");
     if (hint) {
       if (ask) {
-        hint.innerHTML = "每次点击下载将弹出系统<strong>「另存为」</strong>窗口，可自由选择手机任意文件夹。";
+        hint.innerHTML = t("settings.dlHintAsk");
       } else {
         const pathTxt = sub ? `Download/${escHtml(sub)}/` : "Download/";
-        hint.innerHTML = `当前将直接保存到手机 <code>${pathTxt}</code>`;
+        hint.innerHTML = t("settings.dlHintSubdir", { path: pathTxt });
       }
     }
   }
@@ -4006,7 +4111,7 @@
         window.AndroidBridge.downloadFileWithOptions(url, filename, subdir, ask);
         if (!ask) {
           const dest = subdir ? `Download/${subdir}/` : "Download/";
-          showToast(`已开始下载到 ${dest}`);
+          showToast(t("toast.downloadStarted", { dest }));
         }
         return;
       } catch (_) {}
@@ -4014,7 +4119,7 @@
     if (window.AndroidBridge?.downloadFile) {
       try {
         window.AndroidBridge.downloadFile(url, filename);
-        showToast("已开始下载到手机 Downloads/Antigravity/");
+        showToast(t("toast.downloadDefault"));
         return;
       } catch (_) {}
     }
@@ -4050,11 +4155,7 @@
   }
 
   function fmtTokens(n) {
-    const v = Number(n) || 0;
-    if (v >= 1e8) return `${(v / 1e8).toFixed(2)} 亿`;
-    if (v >= 1e4) return `${(v / 1e4).toFixed(1)} 万`;
-    if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
-    return String(Math.round(v));
+    return I18N.fmtTokens(n);
   }
 
   function fmtLocalTime(isoStr) {
@@ -4081,7 +4182,7 @@
   async function loadUsageData() {
     const body = $("usage-body");
     if (!body) return;
-    body.innerHTML = `<div class="empty-placeholder">正在核算本机对话日志用量...</div>`;
+    body.innerHTML = `<div class="empty-placeholder">${escHtml(t("usage.loading"))}</div>`;
     try {
       const qs = state.currentCid ? `?cid=${encodeURIComponent(state.currentCid)}` : "";
       const data = await apiFetch(`/api/usage${qs}`);
@@ -4090,11 +4191,11 @@
       if (sub) {
         const cnt = Number(data.scanned_conversations || 0);
         const tStr = fmtLocalTime(data.generated_at);
-        sub.textContent = `已核算近 7 天 ${cnt} 个会话 · 更新于 ${tStr || "刚刚"}`;
+        sub.textContent = t("usage.subScanned", { cnt, time: tStr || t("usage.justNow") });
       }
       renderUsageView();
     } catch (e) {
-      body.innerHTML = `<div class="m3-card"><p class="info-text">查询用量失败：${escHtml(e.message || "未知错误")}</p></div>`;
+      body.innerHTML = `<div class="m3-card"><p class="info-text">${escHtml(t("usage.queryFail", { err: e.message || t("err.unknown") }))}</p></div>`;
     }
   }
 
@@ -4109,7 +4210,7 @@
         const hrs = Math.floor(diffMs / 3600000);
         const days = Math.floor(hrs / 24);
         const remH = hrs % 24;
-        const left = days > 0 ? `${days}天${remH}时后` : `${Math.max(1, hrs)}小时后`;
+        const left = I18N.fmtResetLeft(days, remH, hrs);
         return `${dtStr} (${left})`;
       }
       return dtStr;
@@ -4143,6 +4244,7 @@
         : data.current_conversation;
 
     const parts = [];
+    const isEn = I18N.isEn();
 
     // Live Antigravity-ONLY Remaining Quota Card (from optional local bridge or AGY_QUOTA_API_URL)
     if (data.external_quota && Array.isArray(data.external_quota.pools) && data.external_quota.pools.length) {
@@ -4156,49 +4258,52 @@
           const h5 = hasH5 ? Math.max(0, Math.min(100, Number(p.h5_pct))) : null;
           const wk = hasWk ? Math.max(0, Math.min(100, Number(p.weekly_pct))) : (p.remaining_pct !== null && p.remaining_pct !== undefined ? Math.max(0, Math.min(100, Number(p.remaining_pct))) : null);
           const barCls = (v) => (v === null ? "" : v <= 20 ? "low" : v <= 50 ? "warn" : "ok");
-          const rst = p.reset_at ? `重置 ${escHtml(fmtResetTime(p.reset_at))}` : "";
+          const rst = p.reset_at ? escHtml(t("usage.resetPrefix", { time: fmtResetTime(p.reset_at) })) : "";
 
           if (h5 !== null && wk !== null) {
             return `
               <div class="usage-pool-row">
                 <div class="usage-pool-top">
-                  <span class="usage-pool-name">${escHtml(p.name || "Antigravity 模型池")}</span>
+                  <span class="usage-pool-name">${escHtml(p.name || t("usage.poolFallback"))}</span>
                   <span class="usage-pool-meta">${rst || escHtml(p.note || "")}</span>
                 </div>
                 <div class="usage-quota-subbars">
                   <div>
-                    <div class="usage-quota-mini-label"><span>5 小时窗口剩余</span><strong>${h5.toFixed(1)}%</strong></div>
+                    <div class="usage-quota-mini-label"><span>${escHtml(t("usage.h5Remain"))}</span><strong>${h5.toFixed(1)}%</strong></div>
                     <div class="usage-bar-track"><div class="usage-bar-fill ${barCls(h5)}" style="width:${h5}%"></div></div>
                   </div>
                   <div>
-                    <div class="usage-quota-mini-label"><span>每周总额度剩余</span><strong>${wk.toFixed(1)}%</strong></div>
+                    <div class="usage-quota-mini-label"><span>${escHtml(t("usage.wkRemain"))}</span><strong>${wk.toFixed(1)}%</strong></div>
                     <div class="usage-bar-track"><div class="usage-bar-fill ${barCls(wk)}" style="width:${wk}%"></div></div>
                   </div>
                 </div>
               </div>`;
           }
           const pct = wk;
-          const pctTxt = pct !== null ? `剩余 ${pct.toFixed(1)}%` : "--";
+          const pctTxt = pct !== null ? escHtml(t("usage.remainPct", { pct: pct.toFixed(1) })) : "--";
           const note = p.note ? ` · ${escHtml(p.note)}` : "";
           return `
             <div class="usage-pool-row">
               <div class="usage-pool-top">
-                <span class="usage-pool-name">${escHtml(p.name || "Antigravity 模型池")}</span>
+                <span class="usage-pool-name">${escHtml(p.name || t("usage.poolFallback"))}</span>
                 <span class="usage-pool-meta">${pctTxt}${rst ? ` · ${rst}` : ""}${note}</span>
               </div>
               <div class="usage-bar-track"><div class="usage-bar-fill ${barCls(pct)}" style="width:${pct !== null ? pct : 0}%"></div></div>
             </div>`;
         })
         .join("");
+      const extHeading = isEn
+        ? t("usage.extQuotaDefault")
+        : (data.external_quota.source || t("usage.extQuotaDefault"));
       parts.push(`
         <div class="m3-card">
-          <div class="section-heading">${escHtml(data.external_quota.source || "Antigravity 实时剩余额度")}${planBadge}</div>
+          <div class="section-heading">${escHtml(extHeading)}${planBadge}</div>
           <div class="usage-pool-list">${extRows}</div>
         </div>`);
     }
 
     if (!bucket) {
-      parts.push(`<div class="m3-card"><div class="empty-placeholder">${win === "conv" ? "请先打开一个会话再查看「本会话」统计" : "该时间窗口内暂无 Antigravity 消耗记录"}</div></div>`);
+      parts.push(`<div class="m3-card"><div class="empty-placeholder">${escHtml(win === "conv" ? t("usage.openConvFirst") : t("usage.noWindowData"))}</div></div>`);
       body.innerHTML = parts.join("");
       return;
     }
@@ -4212,26 +4317,36 @@
     const costCny = Number(bucket.cost_cny || 0);
     const costUsd = Number(bucket.cost_usd || 0);
     const quotaEst = Number(bucket.quota_used_est_pct || 0);
-    const reliefTxt = win === "5h" && bucket.relief_at ? ` · 最早批次预计 ${fmtLocalTime(bucket.relief_at)} 滑出 5h 窗口` : "";
+    const reliefTxt = win === "5h" && bucket.relief_at ? t("usage.reliefSuffix", { time: fmtLocalTime(bucket.relief_at) }) : "";
+    const primaryCost = isEn ? `$${costUsd.toFixed(2)}` : `¥${costCny.toFixed(2)}`;
+    const costSub = t("usage.statCostSub", {
+      usd: costUsd.toFixed(2),
+      cny: costCny.toFixed(2),
+      pct: quotaEst.toFixed(1),
+    });
+    const stepsHeading = win === "conv" && bucket.turns ? t("usage.statStepsTurns") : t("usage.statSteps");
+    const stepsVal = win === "conv" && bucket.turns
+      ? t("usage.statStepsTurnsVal", { steps, turns: bucket.turns })
+      : t("usage.statStepsVal", { steps });
 
     parts.push(`
       <div class="stat-grid">
         <div class="stat-box">
-          <div class="stat-k">Antigravity 等效消耗</div>
-          <div class="stat-v" style="color:var(--md-primary)">¥${costCny.toFixed(2)}</div>
-          <div class="stat-sub" style="font-size:11px;color:var(--md-text-secondary);margin-top:2px;">$${costUsd.toFixed(2)} · 折合耗额 ${quotaEst.toFixed(1)}%</div>
+          <div class="stat-k">${escHtml(t("usage.statCostTitle"))}</div>
+          <div class="stat-v" style="color:var(--md-primary)">${primaryCost}</div>
+          <div class="stat-sub" style="font-size:11px;color:var(--md-text-secondary);margin-top:2px;">${escHtml(costSub)}</div>
         </div>
         <div class="stat-box">
-          <div class="stat-k">总 Token / 缓存命中</div>
+          <div class="stat-k">${escHtml(t("usage.statTokenTitle"))}</div>
           <div class="stat-v">${escHtml(fmtTokens(totalTok))}</div>
-          <div class="stat-sub" style="font-size:11px;color:var(--md-success);margin-top:2px;">缓存命中率 ${hitPct.toFixed(1)}%</div>
+          <div class="stat-sub" style="font-size:11px;color:var(--md-success);margin-top:2px;">${escHtml(t("usage.statCacheHit", { pct: hitPct.toFixed(1) }))}</div>
         </div>
         <div class="stat-box">
-          <div class="stat-k">推理步数${win === "conv" && bucket.turns ? " / 轮次" : ""}</div>
-          <div class="stat-v">${steps} 步${win === "conv" && bucket.turns ? ` · ${bucket.turns} 轮` : ""}</div>
+          <div class="stat-k">${escHtml(stepsHeading)}</div>
+          <div class="stat-v">${escHtml(stepsVal)}</div>
         </div>
         <div class="stat-box">
-          <div class="stat-k">净输入 / 输出</div>
+          <div class="stat-k">${escHtml(t("usage.statInOut"))}</div>
           <div class="stat-v" style="font-size:13.5px">${escHtml(fmtTokens(inTok))} / ${escHtml(fmtTokens(outTok))}</div>
         </div>
       </div>`);
@@ -4242,12 +4357,20 @@
         .map((p) => {
           const share = Math.max(2, Math.min(100, Number(p.share_pct || 0)));
           const pCny = Number(p.cost_cny || 0);
+          const pUsd = Number(p.cost_usd || (pCny / 7.25));
           const pQ = Number(p.quota_used_est_pct || 0);
+          const metaStr = t("usage.poolMeta", {
+            cny: pCny.toFixed(2),
+            usd: pUsd.toFixed(2),
+            q: pQ.toFixed(1),
+            tok: fmtTokens(p.total_tokens),
+            steps: Number(p.steps || 0),
+          });
           return `
             <div class="usage-pool-row">
               <div class="usage-pool-top">
                 <span class="usage-pool-name">${escHtml(p.label || p.id)}</span>
-                <span class="usage-pool-meta">¥${pCny.toFixed(2)} · 耗额 ${pQ.toFixed(1)}% · ${escHtml(fmtTokens(p.total_tokens))} · ${Number(p.steps || 0)} 步</span>
+                <span class="usage-pool-meta">${escHtml(metaStr)}</span>
               </div>
               <div class="usage-bar-track"><div class="usage-bar-fill" style="width:${share}%"></div></div>
             </div>`;
@@ -4255,11 +4378,11 @@
         .join("");
       parts.push(`
         <div class="m3-card">
-          <div class="section-heading">Antigravity 分模型池消耗明细</div>
+          <div class="section-heading">${escHtml(t("usage.poolBreakdown"))}</div>
           <div class="usage-pool-list">${poolHtml}</div>
         </div>`);
     } else {
-      parts.push(`<div class="m3-card"><div class="empty-placeholder">该周期内暂无 Antigravity 模型调用记录</div></div>`);
+      parts.push(`<div class="m3-card"><div class="empty-placeholder">${escHtml(t("usage.noPoolRecords"))}</div></div>`);
     }
 
     if ((win === "3d" || win === "7d") && Array.isArray(bucket.daily) && bucket.daily.length) {
@@ -4268,10 +4391,19 @@
         .map((d) => {
           const v = Number(d.total_tokens || 0);
           const cny = Number(d.cost_cny || 0);
+          const usd = Number(d.cost_usd || (cny / 7.25));
           const pct = v > 0 ? Math.max(6, Math.round((v * 100) / maxDay)) : 0;
+          const colVal = isEn ? (usd > 0 ? `$${usd.toFixed(usd >= 10 ? 0 : 1)}` : "0") : (cny > 0 ? `¥${cny.toFixed(0)}` : "0");
+          const colTitle = t("usage.dailyColTitle", {
+            date: d.date,
+            cny: cny.toFixed(2),
+            usd: usd.toFixed(2),
+            tok: fmtTokens(v),
+            steps: Number(d.steps || 0),
+          });
           return `
-            <div class="usage-daily-col" title="${escHtml(d.date)}: ¥${cny.toFixed(2)} · ${escHtml(fmtTokens(v))} (${Number(d.steps || 0)} 步)">
-              <span class="usage-daily-val">${cny > 0 ? `¥${cny.toFixed(0)}` : "0"}</span>
+            <div class="usage-daily-col" title="${escHtml(colTitle)}">
+              <span class="usage-daily-val">${colVal}</span>
               <div class="usage-daily-bar-wrap"><div class="usage-daily-bar" style="height:${pct}%"></div></div>
               <span class="usage-daily-lbl">${escHtml(d.date)}</span>
             </div>`;
@@ -4279,7 +4411,7 @@
         .join("");
       parts.push(`
         <div class="m3-card">
-          <div class="section-heading">${win === "3d" ? "近 3 天每日趋势" : "近 7 天每日趋势"}（按等效费用 ¥）</div>
+          <div class="section-heading">${escHtml(win === "3d" ? t("usage.trend3d") : t("usage.trend7d"))}</div>
           <div class="usage-daily-chart">${cols}</div>
         </div>`);
     }
@@ -4287,26 +4419,32 @@
     const models = Array.isArray(bucket.models) ? bucket.models : [];
     if (models.length) {
       const chips = models
-        .map(
-          (m) => `
+        .map((m) => {
+          const mCny = Number(m.cost_cny || 0);
+          const mUsd = Number(m.cost_usd || (mCny / 7.25));
+          const chipSub = t("usage.modelChipSub", {
+            cny: mCny.toFixed(2),
+            usd: mUsd.toFixed(2),
+            tok: fmtTokens(m.total_tokens),
+            steps: Number(m.steps || 0),
+          });
+          return `
           <span class="usage-model-chip">
             <strong>${escHtml(shortModelLabel(m.model))}</strong>
-            <span class="m-sub">¥${Number(m.cost_cny || 0).toFixed(2)} · ${escHtml(fmtTokens(m.total_tokens))} · ${Number(m.steps || 0)}步</span>
-          </span>`
-        )
+            <span class="m-sub">${escHtml(chipSub)}</span>
+          </span>`;
+        })
         .join("");
       parts.push(`
         <div class="m3-card">
-          <div class="section-heading">具体模型调用分布</div>
+          <div class="section-heading">${escHtml(t("usage.modelDist"))}</div>
           <div class="usage-model-chips">${chips}</div>
         </div>`);
     }
 
     parts.push(`
       <div class="m3-card tonal-info-card">
-        <p class="info-text">
-          统计口径：仅核算 Antigravity 平台模型（已自动排除 DeepSeek 等第三方接口），汇总桌面端与 CLI 对话日志（缓存读取 ${escHtml(fmtTokens(caTok))}${reliefTxt}），等效费用与窗口耗额按 AI Usage 标准折算（缓存读按 10% 输入计价）。
-        </p>
+        <p class="info-text">${escHtml(t("usage.footnote", { cached: fmtTokens(caTok), relief: reliefTxt }))}</p>
       </div>`);
 
     body.innerHTML = parts.join("");
@@ -4314,7 +4452,7 @@
 
   async function loadQqBotStatus() {
     const body = $("qqbot-body");
-    body.innerHTML = `<div class="empty-placeholder">正在查询本机 QQ Bot 状态...</div>`;
+    body.innerHTML = `<div class="empty-placeholder">${escHtml(t("qqbot.loading"))}</div>`;
     try {
       const d = await apiFetch("/api/qqbot/status");
       const quickModels = [
@@ -4328,24 +4466,24 @@
       body.innerHTML = `
         <div class="stat-grid">
           <div class="stat-box">
-            <div class="stat-k">桥接 / 网关</div>
-            <div class="stat-v" style="color:${online ? "var(--md-success)" : "var(--md-error)"}">${online ? "全部在线" : "异常"}</div>
+            <div class="stat-k">${escHtml(t("qqbot.bridge"))}</div>
+            <div class="stat-v" style="color:${online ? "var(--md-success)" : "var(--md-error)"}">${escHtml(online ? t("qqbot.online") : t("qqbot.abnormal"))}</div>
           </div>
           <div class="stat-box">
-            <div class="stat-k">DeepSeek 余额</div>
+            <div class="stat-k">${escHtml(t("qqbot.dsBalance"))}</div>
             <div class="stat-v">¥${escHtml(d.deepseek_cny ?? "--")}</div>
           </div>
           <div class="stat-box">
-            <div class="stat-k">群聊模型</div>
+            <div class="stat-k">${escHtml(t("qqbot.groupModel"))}</div>
             <div class="stat-v" style="font-size:13.5px">${escHtml(d.group_chat_model || "--")}</div>
           </div>
           <div class="stat-box">
-            <div class="stat-k">累计调用</div>
-            <div class="stat-v">${escHtml(d.total_calls ?? 0)} 次</div>
+            <div class="stat-k">${escHtml(t("qqbot.totalCalls"))}</div>
+            <div class="stat-v">${escHtml(t("qqbot.callsUnit", { count: d.total_calls ?? 0 }))}</div>
           </div>
         </div>
         <div class="m3-card">
-          <div class="section-heading">一键切换 QQ 群聊模型</div>
+          <div class="section-heading">${escHtml(t("qqbot.switchHeading"))}</div>
           <div class="mg-grid">
             ${quickModels
               .map(
@@ -4359,18 +4497,18 @@
           </div>
         </div>`;
     } catch (e) {
-      body.innerHTML = `<div class="m3-card"><p class="info-text">查询失败：${escHtml(e.message)}</p></div>`;
+      body.innerHTML = `<div class="m3-card"><p class="info-text">${escHtml(t("qqbot.queryFail", { err: e.message }))}</p></div>`;
     }
   }
 
   function renderSettingsHosts() {
     const list = $("settings-hosts-list");
     const countEl = $("settings-host-count");
-    if (countEl) countEl.textContent = `${state.hosts.length} 台`;
+    if (countEl) countEl.textContent = t("settings.hostCount", { count: state.hosts.length });
     if (!list) return;
 
     if (!state.hosts.length) {
-      list.innerHTML = `<div class="empty-placeholder">尚未添加任何电脑主机</div>`;
+      list.innerHTML = `<div class="empty-placeholder">${escHtml(t("settings.noHosts"))}</div>`;
       return;
     }
 
@@ -4382,16 +4520,16 @@
             <div class="sh-top">
               <div class="sh-info">
                 <div class="sh-name-row">
-                  <span class="sh-name">${escHtml(h.name)}</span>
-                  ${isAct ? `<span class="sh-active-pill">当前使用</span>` : ""}
+                  <span class="sh-name">${escHtml(formatHostDisplayName(h.name))}</span>
+                  ${isAct ? `<span class="sh-active-pill">${escHtml(t("settings.activeHostPill"))}</span>` : ""}
                 </div>
                 <div class="sh-url">${escHtml(h.url)}</div>
               </div>
             </div>
             <div class="sh-actions">
-              ${isAct ? "" : `<button class="m3-btn tonal sm host-switch-btn" type="button" data-hid="${escHtml(h.id)}">切换使用</button>`}
-              <button class="m3-btn outlined sm host-test-btn" type="button" data-hid="${escHtml(h.id)}">测试连通</button>
-              <button class="m3-btn danger-tonal sm host-del-btn" type="button" data-hid="${escHtml(h.id)}">删除</button>
+              ${isAct ? "" : `<button class="m3-btn tonal sm host-switch-btn" type="button" data-hid="${escHtml(h.id)}">${escHtml(t("settings.switchHost"))}</button>`}
+              <button class="m3-btn outlined sm host-test-btn" type="button" data-hid="${escHtml(h.id)}">${escHtml(t("settings.testConn"))}</button>
+              <button class="m3-btn danger-tonal sm host-del-btn" type="button" data-hid="${escHtml(h.id)}">${escHtml(t("settings.delete"))}</button>
             </div>
           </div>`;
       })
@@ -4433,6 +4571,11 @@
     $("btn-welcome-qr-scan")?.addEventListener("click", openQrScanner);
     $("btn-welcome-alt-scan")?.addEventListener("click", openQrScanner);
     $("btn-settings-qr-scan")?.addEventListener("click", openQrScanner);
+
+    $("btn-welcome-lang")?.addEventListener("click", () => {
+      haptic("light");
+      applyLanguage(I18N.isEn() ? "zh" : "en", { persist: true, notify: true, rerender: true });
+    });
 
     $("btn-welcome-theme").addEventListener("click", () => {
       haptic("light");
@@ -4508,9 +4651,9 @@
       if (!activeCid || String(activeCid).startsWith("pending-")) return;
       try {
         SIDECAR.toggleConversation(activeCid);
-        showToast("已在 Antigravity 主窗口打开此对话");
+        showToast(t("toast.openedInMain"));
       } catch (err) {
-        showToast(`打开主窗口失败：${err?.message || "未知错误"}`);
+        showToast(t("toast.openMainFail", { err: err?.message || t("err.unknown") }));
       }
     });
     $("btn-drawer-host").addEventListener("click", () => {
@@ -4542,7 +4685,7 @@
       persistConfig();
       updateModelPill();
       closeAllSheets();
-      showToast(`已切换模型：${shortModelLabel(state.selectedModel)}`);
+      showToast(t("toast.switchedModel", { model: shortModelLabel(state.selectedModel) }));
     });
 
     $("host-sheet-list").addEventListener("click", (e) => {
@@ -4556,7 +4699,7 @@
         haptic("light");
         activateCurrentHost();
         const h = getActiveHost();
-        if (h) showToast(`已切换到主机：${h.name}`);
+        if (h) showToast(t("toast.switchedHost", { name: formatHostDisplayName(h.name) }));
       }
     });
 
@@ -4629,7 +4772,7 @@
       btn.querySelector(".swarm-ic-off")?.classList.toggle("hidden", state.swarmMode);
       btn.querySelector(".swarm-ic-on")?.classList.toggle("hidden", !state.swarmMode);
       haptic("light");
-      showToast(state.swarmMode ? "已开启 /swarm 蜂群多智能体协作模式" : "已切回单 Agent 模式");
+      showToast(state.swarmMode ? t("toast.swarmOn") : t("toast.swarmOff"));
     });
 
     $("btn-attach").addEventListener("click", openAttachSheet);
@@ -4705,9 +4848,9 @@
       if (cpCode) {
         bridgeCopyText(decodeURIComponent(cpCode.dataset.copy || ""));
         haptic("light");
-        cpCode.textContent = "已复制";
+        cpCode.textContent = t("chat.copiedCode");
         setTimeout(() => {
-          cpCode.textContent = "复制";
+          cpCode.textContent = t("chat.copyCode");
         }, 1400);
         return;
       }
@@ -4716,7 +4859,7 @@
       if (cpMsg) {
         bridgeCopyText(decodeURIComponent(cpMsg.dataset.raw || ""));
         haptic("light");
-        showToast("已复制全文");
+        showToast(t("toast.copiedFull"));
         return;
       }
 
@@ -4987,7 +5130,7 @@
         state.downloadAskFolder = btn.dataset.dlMode === "ask";
         persistConfig();
         syncDownloadSettingsUi();
-        showToast(state.downloadAskFolder ? "已开启：每次下载手动选择文件夹" : "已切回：固定下载目录");
+        showToast(state.downloadAskFolder ? t("toast.dlAskOn") : t("toast.dlFixedOn"));
       });
     });
 
@@ -4998,7 +5141,7 @@
       persistConfig();
       syncDownloadSettingsUi();
       haptic("success");
-      showToast(clean ? `已保存下载目录：Download/${clean}/` : "已保存下载目录：Download/");
+      showToast(t("toast.dlDirSaved", { path: clean ? `Download/${clean}/` : "Download/" }));
     });
 
     // --- Full-Screen Views Controls ---
@@ -5035,14 +5178,21 @@
           body: JSON.stringify({ model: btn.dataset.qmodel, target: "group" }),
         });
         haptic("success");
-        showToast(`QQ 群聊已切换为 ${shortModelLabel(btn.dataset.qmodel)}`);
+        showToast(t("toast.qqModelSwitched", { model: shortModelLabel(btn.dataset.qmodel) }));
         loadQqBotStatus();
       } catch (err) {
-        showToast(`切换失败：${err.message}`);
+        showToast(t("toast.switchFail", { err: err.message }));
       }
     });
 
     // --- Settings View ---
+    document.querySelectorAll(".lang-opt").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        haptic("light");
+        applyLanguage(btn.dataset.langChoice, { persist: true, notify: true, rerender: true });
+      });
+    });
+
     document.querySelectorAll(".theme-opt").forEach((btn) => {
       btn.addEventListener("click", () => {
         haptic("light");
@@ -5061,11 +5211,7 @@
         persistConfig();
         syncFilterUi();
         refreshConversations();
-        showToast(
-          nextShow
-            ? "已开启：侧栏可查看「外部/QQ」独立会话"
-            : "已关闭：侧栏仅显示桌面端与手机/工作台会话"
-        );
+        showToast(nextShow ? t("toast.extCliOn") : t("toast.extCliOff"));
       });
     });
 
@@ -5121,7 +5267,7 @@
         showWorkspaceScreen();
         activateCurrentHost();
         const h = getActiveHost();
-        if (h) showToast(`已切换到：${h.name}`);
+        if (h) showToast(t("toast.switchedHostShort", { name: formatHostDisplayName(h.name) }));
         return;
       }
 
@@ -5136,7 +5282,7 @@
       if (del && del.dataset.hid) {
         haptic("light");
         deleteHost(del.dataset.hid);
-        showToast("已移除该主机");
+        showToast(t("toast.hostRemoved"));
       }
     });
   }
@@ -5212,7 +5358,7 @@
         ? location.origin
         : (location.host ? `${location.protocol}//${location.host}` : "");
       const localUrl = normalizeServerUrl(rawOrigin) || (SIDECAR ? "same-origin" : "");
-      const localName = data.hostname ? `${data.hostname}（本机）` : "本机工作台";
+      const localName = data.hostname ? t("host.localSuffix", { name: data.hostname }) : t("host.localWorkbench");
       if (data.default_model && !state.hosts.length) {
         state.selectedModel = String(data.default_model);
         updateModelPill();
@@ -5253,6 +5399,7 @@
     } else if (isDesktopHost && !hadSavedCfg && state.themePref === "light") {
       state.themePref = "dark";
     }
+    applyLanguage(state.langPref, { persist: false, notify: false, rerender: false });
     applyTheme(state.themePref, false);
     syncFilterUi();
     updateModelPill();
@@ -5294,7 +5441,7 @@
         }
         // Host PC must NEVER show the phone "scan PC QR" welcome screen
         showWorkspaceScreen();
-        setConnState("offline", "本机服务连接中，请刷新或重启工作台");
+        setConnState("offline", t("conn.localBootRetry"));
         return;
       }
       if (getActiveHost()) {

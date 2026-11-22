@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const SIDECAR_VERSION = '1.7.5';
+const SIDECAR_VERSION = '1.7.6';
 const BIND_HOST = '127.0.0.1';
 const UPSTREAM_HOST = '127.0.0.1';
 const SIDECAR_TOKEN = String(process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN || '').trim();
@@ -22,6 +22,7 @@ const SAFE_STATIC_PATHS = new Set([
   '/preload.js',
   '/sidecar-bridge.js',
   '/app.css',
+  '/i18n.js',
   '/app.js',
   '/favicon.ico',
   '/manifest.json',

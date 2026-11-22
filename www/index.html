@@ -8,29 +8,38 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.7.5" />
+  <link rel="stylesheet" href="./app.css?v=1.7.6" />
 </head>
 <body>
   <!-- =========================================================
        VIEW 1: UNIVERSAL M3 WELCOME & PAIRING SETUP
        Shown automatically on first launch when no host is saved
        ========================================================= -->
-  <section id="welcome-view" class="welcome-view hidden" aria-label="配对与连接设置">
+  <section id="welcome-view" class="welcome-view hidden" data-i18n-aria="welcome.aria" aria-label="配对与连接设置">
     <div class="welcome-topbar">
       <div class="welcome-topbar-brand">
         <span class="mini-prism-dot" aria-hidden="true"></span>
         <span>Antigravity Link</span>
       </div>
-      <button id="btn-welcome-theme" class="m3-tonal-chip sm" type="button" aria-label="切换外观主题">
-        <svg class="icon-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="4"></circle>
-          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
-        </svg>
-        <svg class="icon-moon hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-        </svg>
-        <span id="welcome-theme-label">浅色</span>
-      </button>
+      <div class="welcome-topbar-actions">
+        <button id="btn-welcome-lang" class="m3-tonal-chip sm" type="button" data-i18n-aria="welcome.langAria" aria-label="切换界面语言">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"></circle>
+            <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+          </svg>
+          <span id="welcome-lang-label" data-i18n="welcome.langChip">中文</span>
+        </button>
+        <button id="btn-welcome-theme" class="m3-tonal-chip sm" type="button" data-i18n-aria="welcome.themeAria" aria-label="切换外观主题">
+          <svg class="icon-sun" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <svg class="icon-moon hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+          <span id="welcome-theme-label" data-i18n="welcome.themeLight">浅色</span>
+        </button>
+      </div>
     </div>
 
     <div class="welcome-scroll">
@@ -38,8 +47,8 @@
         <div class="brand-emblem lg" aria-hidden="true">
           <img src="./logo-mark.png" alt="Antigravity" width="44" height="44" style="display:block;object-fit:contain;" />
         </div>
-        <h1 class="welcome-title">连接你的 Antigravity</h1>
-        <p class="welcome-sub">通用移动工作台 · 支持局域网直连、Tailscale 远程与 Google 官方云端</p>
+        <h1 class="welcome-title" data-i18n="welcome.title">连接你的 Antigravity</h1>
+        <p class="welcome-sub" data-i18n="welcome.sub">通用移动工作台 · 支持局域网直连、Tailscale 远程与 Google 官方云端</p>
       </div>
 
       <!-- Option 0: Direct In-App Camera QR Scan (Primary Recommended) -->
@@ -52,8 +61,8 @@
             </svg>
           </div>
           <div class="setup-card-titles">
-            <div class="setup-card-title">扫码一键配对（调用相机）</div>
-            <div class="setup-card-desc">直接扫电脑 /pair 二维码秒连 · 支持手电筒与相册选图</div>
+            <div class="setup-card-title" data-i18n="welcome.qrTitle">扫码一键配对（调用相机）</div>
+            <div class="setup-card-desc" data-i18n="welcome.qrDesc">直接扫电脑 /pair 二维码秒连 · 支持手电筒与相册选图</div>
           </div>
           <svg class="trailing-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 18 15 12 9 6"></polyline>
@@ -70,25 +79,25 @@
             </svg>
           </div>
           <div class="setup-card-titles">
-            <div class="setup-card-title">局域网快速配对（6 位配对码）</div>
-            <div class="setup-card-desc">输入电脑地址与 6 位配对码，无需扫码也能直连</div>
+            <div class="setup-card-title" data-i18n="welcome.pinTitle">局域网快速配对（6 位配对码）</div>
+            <div class="setup-card-desc" data-i18n="welcome.pinDesc">输入电脑地址与 6 位配对码，无需扫码也能直连</div>
           </div>
         </div>
 
         <div class="m3-field-group">
-          <label class="m3-label" for="welcome-host-input">电脑地址（IP:端口）</label>
-          <input id="welcome-host-input" class="m3-input" type="text" inputmode="url" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="输入电脑 IP:18795 或 Tailscale 100.x" />
+          <label class="m3-label" for="welcome-host-input" data-i18n="welcome.hostLabel">电脑地址（IP:端口）</label>
+          <input id="welcome-host-input" class="m3-input" type="text" inputmode="url" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-i18n-placeholder="welcome.hostPlaceholder" placeholder="输入电脑 IP:18795 或 Tailscale 100.x" />
         </div>
 
         <div class="m3-field-group">
-          <label class="m3-label" for="welcome-pin-input">6 位配对码</label>
+          <label class="m3-label" for="welcome-pin-input" data-i18n="welcome.pinLabel">6 位配对码</label>
           <input id="welcome-pin-input" class="m3-input pin-input" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="000000" />
         </div>
 
         <div id="welcome-pin-msg" class="m3-inline-banner hidden" role="status"></div>
 
         <button id="btn-welcome-pin-pair" class="m3-btn filled full" type="button">
-          <span>配对并连接</span>
+          <span data-i18n="welcome.pinBtn">配对并连接</span>
         </button>
       </div>
 
@@ -102,8 +111,8 @@
             </svg>
           </div>
           <div class="setup-card-titles">
-            <div class="setup-card-title">粘贴配对链接 / 手动令牌</div>
-            <div class="setup-card-desc">手动粘贴 agylink:// 链接或输入服务地址与 Token</div>
+            <div class="setup-card-title" data-i18n="welcome.altTitle">粘贴配对链接 / 手动令牌</div>
+            <div class="setup-card-desc" data-i18n="welcome.altDesc">手动粘贴 agylink:// 链接或输入服务地址与 Token</div>
           </div>
           <svg class="chevron-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="6 9 12 15 18 9"></polyline>
@@ -111,35 +120,35 @@
         </summary>
 
         <div class="collapsible-body">
-          <button id="btn-welcome-alt-scan" class="m3-btn tonal full" type="button">打开相机扫描二维码</button>
+          <button id="btn-welcome-alt-scan" class="m3-btn tonal full" type="button" data-i18n="welcome.altScanBtn">打开相机扫描二维码</button>
 
-          <div class="m3-segmented sm" role="tablist" aria-label="配对方式">
-            <button type="button" class="seg-btn active" data-welcome-tab="uri">粘贴配对链接</button>
-            <button type="button" class="seg-btn" data-welcome-tab="manual">手动地址与令牌</button>
+          <div class="m3-segmented sm" role="tablist" data-i18n-aria="welcome.pairModeAria" aria-label="配对方式">
+            <button type="button" class="seg-btn active" data-welcome-tab="uri" data-i18n="welcome.tabUri">粘贴配对链接</button>
+            <button type="button" class="seg-btn" data-welcome-tab="manual" data-i18n="welcome.tabManual">手动地址与令牌</button>
           </div>
 
           <div id="welcome-tab-uri" class="tab-panel">
             <div class="m3-field-group">
-              <label class="m3-label" for="welcome-uri-input">配对链接（agylink://pair?...）</label>
-              <input id="welcome-uri-input" class="m3-input" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 agylink://pair?u=...&t=...&n=..." />
+              <label class="m3-label" for="welcome-uri-input" data-i18n="welcome.uriLabel">配对链接（agylink://pair?...）</label>
+              <input id="welcome-uri-input" class="m3-input" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="welcome.uriPlaceholder" placeholder="粘贴 agylink://pair?u=...&t=...&n=..." />
             </div>
-            <button id="btn-welcome-uri-pair" class="m3-btn tonal full" type="button">解析并连接</button>
+            <button id="btn-welcome-uri-pair" class="m3-btn tonal full" type="button" data-i18n="welcome.uriBtn">解析并连接</button>
           </div>
 
           <div id="welcome-tab-manual" class="tab-panel hidden">
             <div class="m3-field-group">
-              <label class="m3-label" for="welcome-manual-name">主机备注名（可选）</label>
-              <input id="welcome-manual-name" class="m3-input" type="text" placeholder="例如 家里电脑 / 办公室工作站" />
+              <label class="m3-label" for="welcome-manual-name" data-i18n="welcome.manualNameLabel">主机备注名（可选）</label>
+              <input id="welcome-manual-name" class="m3-input" type="text" data-i18n-placeholder="welcome.manualNamePlaceholder" placeholder="例如 家里电脑 / 办公室工作站" />
             </div>
             <div class="m3-field-group">
-              <label class="m3-label" for="welcome-manual-url">服务地址（Server URL）</label>
+              <label class="m3-label" for="welcome-manual-url" data-i18n="welcome.manualUrlLabel">服务地址（Server URL）</label>
               <input id="welcome-manual-url" class="m3-input" type="url" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:18795" />
             </div>
             <div class="m3-field-group">
-              <label class="m3-label" for="welcome-manual-token">访问令牌（Access Token）</label>
-              <input id="welcome-manual-token" class="m3-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴电脑端显示的访问令牌" />
+              <label class="m3-label" for="welcome-manual-token" data-i18n="welcome.manualTokenLabel">访问令牌（Access Token）</label>
+              <input id="welcome-manual-token" class="m3-input" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="welcome.manualTokenPlaceholder" placeholder="粘贴电脑端显示的访问令牌" />
             </div>
-            <button id="btn-welcome-manual-pair" class="m3-btn tonal full" type="button">验证并连接</button>
+            <button id="btn-welcome-manual-pair" class="m3-btn tonal full" type="button" data-i18n="welcome.manualBtn">验证并连接</button>
           </div>
 
           <div id="welcome-alt-msg" class="m3-inline-banner hidden" role="status"></div>
@@ -156,8 +165,8 @@
             </svg>
           </div>
           <div class="setup-card-titles">
-            <div class="setup-card-title">直接使用 Google 官方远程模式</div>
-            <div class="setup-card-desc">无需电脑端本地服务，无边框全屏直达官方云端</div>
+            <div class="setup-card-title" data-i18n="welcome.officialTitle">直接使用 Google 官方远程模式</div>
+            <div class="setup-card-desc" data-i18n="welcome.officialDesc">无需电脑端本地服务，无边框全屏直达官方云端</div>
           </div>
           <svg class="trailing-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="9 18 15 12 9 6"></polyline>
@@ -173,7 +182,7 @@
   <div id="app" class="app-shell">
     <!-- M3 Top App Bar (56px) -->
     <header id="topbar" class="m3-topbar">
-      <button id="btn-drawer" class="m3-icon-btn" type="button" aria-label="打开侧边栏">
+      <button id="btn-drawer" class="m3-icon-btn" type="button" data-i18n-aria="topbar.openDrawer" aria-label="打开侧边栏">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="4" y1="7" x2="20" y2="7"></line>
           <line x1="4" y1="12" x2="16" y2="12"></line>
@@ -192,30 +201,30 @@
         </div>
         <div class="status-row">
           <span id="conn-dot" class="conn-dot connecting" aria-hidden="true"></span>
-          <span id="conv-subtitle" class="conv-subtitle">正在连接主机...</span>
+          <span id="conv-subtitle" class="conv-subtitle" data-i18n="topbar.connectingHost">正在连接主机...</span>
         </div>
       </button>
 
       <div class="topbar-actions">
-        <button id="sidecar-follow-btn" class="sidecar-header-pill hidden" type="button" aria-label="跟随主窗口对话" title="跟随或回到 Antigravity 主窗口当前对话">
+        <button id="sidecar-follow-btn" class="sidecar-header-pill hidden" type="button" data-i18n-aria="topbar.followAria" data-i18n-title="topbar.followTitle" aria-label="跟随主窗口对话" title="跟随或回到 Antigravity 主窗口当前对话">
           <span class="sidecar-follow-dot" aria-hidden="true"></span>
-          <span id="sidecar-follow-text">已跟随主窗口</span>
+          <span id="sidecar-follow-text" data-i18n="topbar.following">已跟随主窗口</span>
         </button>
-        <button id="sidecar-open-main-btn" class="m3-icon-btn sidecar-open-main-btn hidden" type="button" aria-label="在 Antigravity 主窗口打开此对话" title="在 Antigravity 主窗口中打开此对话">
+        <button id="sidecar-open-main-btn" class="m3-icon-btn sidecar-open-main-btn hidden" type="button" data-i18n-aria="topbar.openMainAria" data-i18n-title="topbar.openMainTitle" aria-label="在 Antigravity 主窗口打开此对话" title="在 Antigravity 主窗口中打开此对话">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
             <polyline points="15 3 21 3 21 9"></polyline>
             <line x1="10" y1="14" x2="21" y2="3"></line>
           </svg>
         </button>
-        <button id="btn-top-pair" class="topbar-pair-pill hidden" type="button" aria-label="出示配对二维码供手机扫描" title="出示本机二维码与 6 位配对码，供手机 App 扫码连接">
+        <button id="btn-top-pair" class="topbar-pair-pill hidden" type="button" data-i18n-aria="topbar.pairAria" data-i18n-title="topbar.pairTitle" aria-label="出示配对二维码供手机扫描" title="出示本机二维码与 6 位配对码，供手机 App 扫码连接">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
             <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
           </svg>
-          <span>供手机扫码</span>
+          <span data-i18n="topbar.pairBtn">供手机扫码</span>
         </button>
-        <button id="btn-new-top" class="m3-icon-btn" type="button" aria-label="新建对话" title="新建对话">
+        <button id="btn-new-top" class="m3-icon-btn" type="button" data-i18n-aria="topbar.newChat" data-i18n-title="topbar.newChat" aria-label="新建对话" title="新建对话">
           <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
             <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.375-9.375z"></path>
@@ -226,15 +235,15 @@
 
     <!-- Expandable Turn Navigator (Triggered by Top Conversation Title Bar) -->
     <div id="turn-nav-backdrop" class="turn-nav-backdrop hidden" aria-hidden="true"></div>
-    <section id="turn-nav-panel" class="turn-nav-panel hidden" role="dialog" aria-label="对话轮次导航">
+    <section id="turn-nav-panel" class="turn-nav-panel hidden" role="dialog" data-i18n-aria="turnNav.aria" aria-label="对话轮次导航">
       <div class="turn-nav-header">
         <div class="turn-nav-heading-wrap">
           <span class="turn-nav-heading-dot" aria-hidden="true"></span>
-          <span id="turn-nav-heading" class="turn-nav-heading">对话轮次导航</span>
+          <span id="turn-nav-heading" class="turn-nav-heading" data-i18n="turnNav.title">对话轮次导航</span>
         </div>
         <div class="turn-nav-quick-actions">
-          <button id="btn-turn-first" class="turn-nav-quick-btn" type="button" title="跳到第 1 轮">第 1 轮 ↑</button>
-          <button id="btn-turn-latest" class="turn-nav-quick-btn primary" type="button" title="跳到最新一轮">最新 ↓</button>
+          <button id="btn-turn-first" class="turn-nav-quick-btn" type="button" data-i18n="turnNav.firstBtn" data-i18n-title="turnNav.firstTitle" title="跳到第 1 轮">第 1 轮 ↑</button>
+          <button id="btn-turn-latest" class="turn-nav-quick-btn primary" type="button" data-i18n="turnNav.latestBtn" data-i18n-title="turnNav.latestTitle" title="跳到最新一轮">最新 ↓</button>
         </div>
       </div>
       <div id="turn-nav-search-wrap" class="turn-nav-search-wrap hidden">
@@ -242,7 +251,7 @@
           <circle cx="11" cy="11" r="7"></circle>
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
-        <input id="turn-nav-search" class="turn-nav-search-input" type="search" autocomplete="off" spellcheck="false" placeholder="筛选轮次关键词或编号..." />
+        <input id="turn-nav-search" class="turn-nav-search-input" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="turnNav.searchPlaceholder" placeholder="筛选轮次关键词或编号..." />
       </div>
       <div id="turn-nav-list" class="turn-nav-list" role="list"></div>
     </section>
@@ -254,56 +263,56 @@
           <img src="./logo-mark.png" alt="Antigravity" width="38" height="38" style="display:block;object-fit:contain;" />
         </div>
 
-        <h1 class="hero-title">你好，开始今天的任务</h1>
+        <h1 class="hero-title" data-i18n="empty.heroTitle">你好，开始今天的任务</h1>
 
         <button id="empty-host-chip" class="host-status-chip" type="button">
           <span id="empty-host-dot" class="conn-dot connecting"></span>
-          <span id="empty-host-name">正在连接主机</span>
+          <span id="empty-host-name" data-i18n="empty.connectingHost">正在连接主机</span>
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="6 9 12 15 18 9"></polyline>
           </svg>
         </button>
 
         <div class="quick-grid">
-          <button class="quick-card" type="button" data-prompt="检查当前电脑的开发环境、磁盘空间和正在运行的服务状态，给我一份简洁汇报">
+          <button class="quick-card" type="button" data-i18n-prompt="quick.1.prompt" data-prompt="检查当前电脑的开发环境、磁盘空间和正在运行的服务状态，给我一份简洁汇报">
             <span class="qc-icon-wrap">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M22 12h-4l-3 9L9 3l-3 9H2"></path>
               </svg>
             </span>
-            <span class="qc-title">主机环境巡检</span>
-            <span class="qc-desc">查看磁盘、服务与运行状态</span>
+            <span class="qc-title" data-i18n="quick.1.title">主机环境巡检</span>
+            <span class="qc-desc" data-i18n="quick.1.desc">查看磁盘、服务与运行状态</span>
           </button>
 
-          <button class="quick-card" type="button" data-prompt="帮我看看工作区里最近修改过哪些项目和主要文件，按时间列出摘要">
+          <button class="quick-card" type="button" data-i18n-prompt="quick.2.prompt" data-prompt="帮我看看工作区里最近修改过哪些项目和主要文件，按时间列出摘要">
             <span class="qc-icon-wrap">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
               </svg>
             </span>
-            <span class="qc-title">工作区动态</span>
-            <span class="qc-desc">浏览近期代码与修改记录</span>
+            <span class="qc-title" data-i18n="quick.2.title">工作区动态</span>
+            <span class="qc-desc" data-i18n="quick.2.desc">浏览近期代码与修改记录</span>
           </button>
 
-          <button class="quick-card" type="button" data-prompt="帮我整理今天桌面端 Antigravity 做过的主要改动与待办事项清单">
+          <button class="quick-card" type="button" data-i18n-prompt="quick.3.prompt" data-prompt="帮我整理今天桌面端 Antigravity 做过的主要改动与待办事项清单">
             <span class="qc-icon-wrap">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9 11l3 3L22 4"></path>
                 <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
               </svg>
             </span>
-            <span class="qc-title">今日任务总结</span>
-            <span class="qc-desc">汇总已完成改动与进度</span>
+            <span class="qc-title" data-i18n="quick.3.title">今日任务总结</span>
+            <span class="qc-desc" data-i18n="quick.3.desc">汇总已完成改动与进度</span>
           </button>
 
-          <button class="quick-card" type="button" data-prompt="测试一下当前直连环境是否畅通，顺便告诉我现在正在使用的模型和工作目录">
+          <button class="quick-card" type="button" data-i18n-prompt="quick.4.prompt" data-prompt="测试一下当前直连环境是否畅通，顺便告诉我现在正在使用的模型和工作目录">
             <span class="qc-icon-wrap">
               <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
               </svg>
             </span>
-            <span class="qc-title">快速连通测试</span>
-            <span class="qc-desc">验证直连速度与当前模型</span>
+            <span class="qc-title" data-i18n="quick.4.title">快速连通测试</span>
+            <span class="qc-desc" data-i18n="quick.4.desc">验证直连速度与当前模型</span>
           </button>
         </div>
       </div>
@@ -311,13 +320,13 @@
       <div id="messages-list" class="messages-list"></div>
 
       <!-- Inline Deliverables Section (Default Collapsed) -->
-      <details id="deliverables-box" class="deliverables-box hidden" aria-label="关联与交付文件">
+      <details id="deliverables-box" class="deliverables-box hidden" data-i18n-aria="deliv.aria" aria-label="关联与交付文件">
         <summary class="deliv-header">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
             <polyline points="14 2 14 8 20 8"></polyline>
           </svg>
-          <span id="deliverables-count" class="deliv-title-text">本会话生成与关联文件</span>
+          <span id="deliverables-count" class="deliv-title-text" data-i18n="deliv.title">本会话生成与关联文件</span>
           <svg class="deliv-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="6 9 12 15 18 9"></polyline>
           </svg>
@@ -327,7 +336,7 @@
     </main>
 
     <!-- Jump To Bottom M3 Small FAB -->
-    <button id="btn-scroll-bottom" class="scroll-fab hidden" type="button" aria-label="回到底部">
+    <button id="btn-scroll-bottom" class="scroll-fab hidden" type="button" data-i18n-aria="chat.scrollBottomAria" aria-label="回到底部">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
         <line x1="12" y1="5" x2="12" y2="19"></line>
         <polyline points="19 12 12 19 5 12"></polyline>
@@ -338,26 +347,26 @@
     <footer class="composer-wrap">
       <div id="attach-tray" class="attach-tray hidden"></div>
       <div class="composer-pill">
-        <textarea id="prompt-input" class="prompt-input" rows="1" placeholder="向 Antigravity 下达指令..."></textarea>
+        <textarea id="prompt-input" class="prompt-input" rows="1" data-i18n-placeholder="chat.promptPlaceholder" placeholder="向 Antigravity 下达指令..."></textarea>
         <div class="composer-toolbar">
           <div class="composer-tools-left">
             <input id="file-input" type="file" multiple class="hidden" />
             <input id="gallery-input" type="file" accept="image/*" multiple class="hidden" />
-            <button id="btn-attach" class="composer-circle-btn" type="button" aria-label="选择图片或文件" title="选择图片或文件">
+            <button id="btn-attach" class="composer-circle-btn" type="button" data-i18n-aria="chat.attachAria" data-i18n-title="chat.attachAria" aria-label="选择图片或文件" title="选择图片或文件">
               <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <line x1="12" y1="5" x2="12" y2="19"></line>
                 <line x1="5" y1="12" x2="19" y2="12"></line>
               </svg>
             </button>
 
-            <button id="btn-model" class="composer-model-pill" type="button" aria-label="选择推理模型与 Orchestrator 搭配">
+            <button id="btn-model" class="composer-model-pill" type="button" data-i18n-aria="chat.modelAria" aria-label="选择推理模型与 Orchestrator 搭配">
               <span id="model-pill-text">Neon Med</span>
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="6 9 12 15 18 9"></polyline>
               </svg>
             </button>
 
-            <button id="btn-swarm" class="swarm-pill" type="button" aria-pressed="false" title="开启或关闭 /swarm 蜂群多智能体模式">
+            <button id="btn-swarm" class="swarm-pill" type="button" aria-pressed="false" data-i18n-title="chat.swarmTitle" title="开启或关闭 /swarm 蜂群多智能体模式">
               <svg class="swarm-ic-off" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="12" cy="5" r="2.2"></circle>
                 <circle cx="5.5" cy="17.5" r="2.2"></circle>
@@ -367,11 +376,11 @@
               <svg class="swarm-ic-on hidden" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="20 6 9 17 4 12"></polyline>
               </svg>
-              <span>蜂群</span>
+              <span data-i18n="chat.swarm">蜂群</span>
             </button>
           </div>
 
-          <button id="btn-send" class="send-btn" type="button" aria-label="发送">
+          <button id="btn-send" class="send-btn" type="button" data-i18n-aria="chat.sendAria" aria-label="发送">
             <svg id="icon-send" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
               <line x1="12" y1="19" x2="12" y2="5"></line>
               <polyline points="5 12 12 5 19 12"></polyline>
@@ -389,7 +398,7 @@
        M3 NAVIGATION DRAWER
        ========================================================= -->
   <div id="drawer-backdrop" class="scrim hidden"></div>
-  <aside id="drawer" class="m3-drawer" aria-label="导航抽屉">
+  <aside id="drawer" class="m3-drawer" data-i18n-aria="drawer.aria" aria-label="导航抽屉">
     <div class="drawer-header">
       <div class="drawer-brand">
         <div class="brand-emblem sm" aria-hidden="true">
@@ -397,7 +406,7 @@
         </div>
         <span class="drawer-brand-title">Antigravity</span>
       </div>
-      <button id="btn-close-drawer" class="m3-icon-btn sm" type="button" aria-label="关闭抽屉">
+      <button id="btn-close-drawer" class="m3-icon-btn sm" type="button" data-i18n-aria="drawer.closeAria" aria-label="关闭抽屉">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="18" y1="6" x2="6" y2="18"></line>
           <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -410,8 +419,8 @@
       <button id="btn-drawer-host" class="drawer-host-chip" type="button">
         <span id="drawer-host-dot" class="conn-dot connecting"></span>
         <div class="drawer-host-text">
-          <div id="drawer-host-name" class="drawer-host-name">未配置主机</div>
-          <div id="drawer-host-url" class="drawer-host-url">点击切换或添加电脑</div>
+          <div id="drawer-host-name" class="drawer-host-name" data-i18n="drawer.noHost">未配置主机</div>
+          <div id="drawer-host-url" class="drawer-host-url" data-i18n="drawer.tapHost">点击切换或添加电脑</div>
         </div>
         <svg class="phone-only" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="7 15 12 20 17 15"></polyline>
@@ -429,8 +438,8 @@
           <line x1="12" y1="5" x2="12" y2="19"></line>
           <line x1="5" y1="12" x2="19" y2="12"></line>
         </svg>
-        <span>新建对话</span>
-        <span id="new-chat-draft-pill" class="drawer-draft-pill hidden">草稿</span>
+        <span data-i18n="drawer.newChat">新建对话</span>
+        <span id="new-chat-draft-pill" class="drawer-draft-pill hidden" data-i18n="drawer.draft">草稿</span>
       </button>
 
       <!-- Search Input -->
@@ -439,28 +448,28 @@
           <circle cx="11" cy="11" r="7"></circle>
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
-        <input id="conv-search" class="m3-search-input" type="search" placeholder="搜索会话..." />
+        <input id="conv-search" class="m3-search-input" type="search" data-i18n-placeholder="drawer.searchPlaceholder" placeholder="搜索会话..." />
       </div>
 
       <!-- Sidebar Conversation Source Filter Bar -->
-      <div id="conv-filter-bar" class="m3-segmented sm conv-filter-bar" role="tablist" aria-label="会话分类">
-        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-filter="all">全部</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-filter="mobile">移动</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-filter="desktop">桌面</button>
-        <button id="filter-pill-external" type="button" class="seg-btn hidden" role="tab" aria-selected="false" data-filter="external">外部/QQ</button>
+      <div id="conv-filter-bar" class="m3-segmented sm conv-filter-bar" role="tablist" data-i18n-aria="drawer.filterAria" aria-label="会话分类">
+        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-filter="all" data-i18n="drawer.filterAll">全部</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-filter="mobile" data-i18n="drawer.filterMobile">移动</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-filter="desktop" data-i18n="drawer.filterDesktop">桌面</button>
+        <button id="filter-pill-external" type="button" class="seg-btn hidden" role="tab" aria-selected="false" data-filter="external" data-i18n="drawer.filterExternal">外部/QQ</button>
       </div>
     </div>
 
     <div id="conv-list" class="conv-list"></div>
 
     <!-- Bottom Utilities -->
-    <nav class="drawer-utilities" aria-label="设置与工具">
+    <nav class="drawer-utilities" data-i18n-aria="drawer.utilAria" aria-label="设置与工具">
       <button id="nav-pair-qr" class="drawer-util-item hidden" type="button">
         <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
           <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
         </svg>
-        <span>出示二维码给手机扫</span>
+        <span data-i18n="drawer.showQr">出示二维码给手机扫</span>
         <svg class="drawer-util-meta" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="9 18 15 12 9 6"></polyline>
         </svg>
@@ -471,7 +480,7 @@
           <path d="M12 20V4"></path>
           <path d="M6 20v-6"></path>
         </svg>
-        <span>额度与用量</span>
+        <span data-i18n="drawer.usage">额度与用量</span>
         <svg class="drawer-util-meta" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="9 18 15 12 9 6"></polyline>
         </svg>
@@ -481,7 +490,7 @@
           <circle cx="12" cy="12" r="3"></circle>
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
         </svg>
-        <span>设置与工具</span>
+        <span data-i18n="drawer.settings">设置与工具</span>
         <svg class="drawer-util-meta" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="9 18 15 12 9 6"></polyline>
         </svg>
@@ -494,11 +503,11 @@
        ========================================================= -->
   <div id="sheet-backdrop" class="scrim hidden"></div>
 
-  <section id="model-sheet" class="m3-bottom-sheet hidden" aria-label="选择推理模型">
+  <section id="model-sheet" class="m3-bottom-sheet hidden" data-i18n-aria="sheet.modelTitle" aria-label="选择推理模型">
     <div class="sheet-drag-handle" aria-hidden="true"></div>
     <div class="sheet-header">
-      <span class="sheet-title">选择推理模型</span>
-      <button class="m3-icon-btn sm close-sheet" type="button" aria-label="关闭">
+      <span class="sheet-title" data-i18n="sheet.modelTitle">选择推理模型</span>
+      <button class="m3-icon-btn sm close-sheet" type="button" data-i18n-aria="sheet.close" aria-label="关闭">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="18" y1="6" x2="6" y2="18"></line>
           <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -508,11 +517,11 @@
     <div id="model-groups" class="sheet-body"></div>
   </section>
 
-  <section id="host-sheet" class="m3-bottom-sheet hidden" aria-label="切换已配对主机">
+  <section id="host-sheet" class="m3-bottom-sheet hidden" data-i18n-aria="sheet.hostAria" aria-label="切换已配对主机">
     <div class="sheet-drag-handle" aria-hidden="true"></div>
     <div class="sheet-header">
-      <span class="sheet-title">切换主机</span>
-      <button class="m3-icon-btn sm close-sheet" type="button" aria-label="关闭">
+      <span class="sheet-title" data-i18n="sheet.hostTitle">切换主机</span>
+      <button class="m3-icon-btn sm close-sheet" type="button" data-i18n-aria="sheet.close" aria-label="关闭">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="18" y1="6" x2="6" y2="18"></line>
           <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -521,20 +530,20 @@
     </div>
     <div class="sheet-body">
       <div id="host-sheet-list" class="host-sheet-list"></div>
-      <button id="btn-host-sheet-add" class="m3-btn tonal full" type="button">＋ 添加或配对新主机</button>
+      <button id="btn-host-sheet-add" class="m3-btn tonal full" type="button" data-i18n="sheet.hostAdd">＋ 添加或配对新主机</button>
     </div>
   </section>
 
   <!-- QQ-Style Bottom Photo & Attachment Drawer -->
-  <section id="attach-sheet" class="m3-bottom-sheet attach-sheet hidden" aria-label="选择图片与文件">
+  <section id="attach-sheet" class="m3-bottom-sheet attach-sheet hidden" data-i18n-aria="sheet.attachAria" aria-label="选择图片与文件">
     <div class="sheet-drag-handle" aria-hidden="true"></div>
-    <div id="attach-photo-strip" class="photo-strip" aria-label="最近照片"></div>
+    <div id="attach-photo-strip" class="photo-strip" data-i18n-aria="sheet.recentPhotosAria" aria-label="最近照片"></div>
     <div class="attach-sheet-bar">
       <div class="attach-bar-actions">
-        <button id="btn-attach-album" class="attach-bar-link" type="button">相册</button>
-        <button id="btn-attach-folder" class="attach-bar-link" type="button">打开文件夹</button>
+        <button id="btn-attach-album" class="attach-bar-link" type="button" data-i18n="sheet.album">相册</button>
+        <button id="btn-attach-folder" class="attach-bar-link" type="button" data-i18n="sheet.openFolder">打开文件夹</button>
       </div>
-      <button id="btn-attach-confirm" class="attach-confirm-btn" type="button" disabled>添加</button>
+      <button id="btn-attach-confirm" class="attach-confirm-btn" type="button" data-i18n="sheet.add" disabled>添加</button>
     </div>
   </section>
 
@@ -542,19 +551,19 @@
        FULL-SCREEN M3 UTILITY VIEWS
        ========================================================= -->
   <!-- Workspace Files Browser -->
-  <section id="files-modal" class="m3-full-view hidden" aria-label="工作区文件">
+  <section id="files-modal" class="m3-full-view hidden" data-i18n-aria="files.title" aria-label="工作区文件">
     <header class="m3-topbar">
-      <button class="m3-icon-btn close-modal" type="button" data-target="files-modal" aria-label="返回">
+      <button class="m3-icon-btn close-modal" type="button" data-target="files-modal" data-i18n-aria="modal.back" aria-label="返回">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="19" y1="12" x2="5" y2="12"></line>
           <polyline points="12 19 5 12 12 5"></polyline>
         </svg>
       </button>
       <div class="topbar-center">
-        <div class="conv-title">工作区文件</div>
-        <div id="files-path" class="conv-subtitle">加载中...</div>
+        <div class="conv-title" data-i18n="files.title">工作区文件</div>
+        <div id="files-path" class="conv-subtitle" data-i18n="files.loading">加载中...</div>
       </div>
-      <button id="btn-files-up" class="m3-icon-btn" type="button" aria-label="返回上一级" title="上一级">
+      <button id="btn-files-up" class="m3-icon-btn" type="button" data-i18n-aria="files.upAria" data-i18n-title="files.upTitle" aria-label="返回上一级" title="上一级">
         <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="17 11 12 6 7 11"></polyline>
           <line x1="12" y1="18" x2="12" y2="6"></line>
@@ -565,16 +574,16 @@
   </section>
 
   <!-- File Preview Sheet -->
-  <section id="preview-modal" class="m3-full-view hidden" aria-label="文件预览">
+  <section id="preview-modal" class="m3-full-view hidden" data-i18n-aria="preview.title" aria-label="文件预览">
     <header class="m3-topbar">
-      <button class="m3-icon-btn close-modal" type="button" data-target="preview-modal" aria-label="返回">
+      <button class="m3-icon-btn close-modal" type="button" data-target="preview-modal" data-i18n-aria="modal.back" aria-label="返回">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="19" y1="12" x2="5" y2="12"></line>
           <polyline points="12 19 5 12 12 5"></polyline>
         </svg>
       </button>
       <div class="topbar-center">
-        <div id="preview-name" class="conv-title">文件预览</div>
+        <div id="preview-name" class="conv-title" data-i18n="preview.title">文件预览</div>
         <div id="preview-meta" class="conv-subtitle"></div>
       </div>
       <button id="btn-preview-download" class="m3-btn tonal sm" type="button">
@@ -583,26 +592,26 @@
           <polyline points="7 10 12 15 17 10"></polyline>
           <line x1="12" y1="15" x2="12" y2="3"></line>
         </svg>
-        <span>下载</span>
+        <span data-i18n="preview.download">下载</span>
       </button>
     </header>
     <div id="preview-body" class="view-body preview-body"></div>
   </section>
 
   <!-- QQ Bot Control (Shown only when server supports it) -->
-  <section id="qqbot-modal" class="m3-full-view hidden" aria-label="QQ Bot 控制台">
+  <section id="qqbot-modal" class="m3-full-view hidden" data-i18n-aria="qqbot.title" aria-label="QQ Bot 控制台">
     <header class="m3-topbar">
-      <button class="m3-icon-btn close-modal" type="button" data-target="qqbot-modal" aria-label="返回">
+      <button class="m3-icon-btn close-modal" type="button" data-target="qqbot-modal" data-i18n-aria="modal.back" aria-label="返回">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="19" y1="12" x2="5" y2="12"></line>
           <polyline points="12 19 5 12 12 5"></polyline>
         </svg>
       </button>
       <div class="topbar-center">
-        <div class="conv-title">QQ Bot 控制台</div>
-        <div class="conv-subtitle">本机桥接状态与模型切换</div>
+        <div class="conv-title" data-i18n="qqbot.title">QQ Bot 控制台</div>
+        <div class="conv-subtitle" data-i18n="qqbot.sub">本机桥接状态与模型切换</div>
       </div>
-      <button id="btn-qqbot-refresh" class="m3-icon-btn" type="button" aria-label="刷新状态">
+      <button id="btn-qqbot-refresh" class="m3-icon-btn" type="button" data-i18n-aria="qqbot.refreshAria" aria-label="刷新状态">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="23 4 23 10 17 10"></polyline>
           <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
@@ -613,24 +622,24 @@
   </section>
 
   <!-- Unified Settings & Tools View -->
-  <section id="settings-modal" class="m3-full-view hidden" aria-label="设置与工具">
+  <section id="settings-modal" class="m3-full-view hidden" data-i18n-aria="settings.title" aria-label="设置与工具">
     <header class="m3-topbar">
-      <button class="m3-icon-btn close-modal" type="button" data-target="settings-modal" aria-label="返回">
+      <button class="m3-icon-btn close-modal" type="button" data-target="settings-modal" data-i18n-aria="modal.back" aria-label="返回">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="19" y1="12" x2="5" y2="12"></line>
           <polyline points="12 19 5 12 12 5"></polyline>
         </svg>
       </button>
       <div class="topbar-center">
-        <div class="conv-title">设置与工具</div>
-        <div class="conv-subtitle">工具箱、下载路径、外观主题与多主机管理</div>
+        <div class="conv-title" data-i18n="settings.title">设置与工具</div>
+        <div class="conv-subtitle" data-i18n="settings.sub">工具箱、语言、外观主题与多主机管理</div>
       </div>
     </header>
 
     <div class="view-body settings-body">
       <!-- Unified Tools Section -->
       <div class="m3-card">
-        <div class="section-heading">工具箱</div>
+        <div class="section-heading" data-i18n="settings.toolbox">工具箱</div>
         <div class="settings-tools-list">
           <button id="settings-open-usage" class="settings-tool-row" type="button">
             <span class="settings-tool-ic">
@@ -641,8 +650,8 @@
               </svg>
             </span>
             <span class="settings-tool-text">
-              <span class="settings-tool-title">额度与用量统计</span>
-              <span class="settings-tool-desc">5 小时 / 今日 / 近 7 天 / 本会话 Token 与模型池消耗</span>
+              <span class="settings-tool-title" data-i18n="settings.toolUsageTitle">额度与用量统计</span>
+              <span class="settings-tool-desc" data-i18n="settings.toolUsageDesc">5 小时 / 今日 / 近 7 天 / 本会话 Token 与模型池消耗</span>
             </span>
             <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"></polyline>
@@ -656,8 +665,8 @@
               </svg>
             </span>
             <span class="settings-tool-text">
-              <span class="settings-tool-title">工作区文件</span>
-              <span class="settings-tool-desc">浏览电脑目录、无损原图预览与下载</span>
+              <span class="settings-tool-title" data-i18n="settings.toolFilesTitle">工作区文件</span>
+              <span class="settings-tool-desc" data-i18n="settings.toolFilesDesc">浏览电脑目录、无损原图预览与下载</span>
             </span>
             <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"></polyline>
@@ -672,8 +681,8 @@
               </svg>
             </span>
             <span class="settings-tool-text">
-              <span class="settings-tool-title">官方远程模式</span>
-              <span class="settings-tool-desc">无边框全屏直达 Google 官方 Antigravity Web</span>
+              <span class="settings-tool-title" data-i18n="settings.toolOfficialTitle">官方远程模式</span>
+              <span class="settings-tool-desc" data-i18n="settings.toolOfficialDesc">无边框全屏直达 Google 官方 Antigravity Web</span>
             </span>
             <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"></polyline>
@@ -689,8 +698,8 @@
               </svg>
             </span>
             <span class="settings-tool-text">
-              <span class="settings-tool-title">QQ Bot 控制台</span>
-              <span class="settings-tool-desc">查看桥接状态与切换 QQ 群聊模型</span>
+              <span class="settings-tool-title" data-i18n="settings.toolQqTitle">QQ Bot 控制台</span>
+              <span class="settings-tool-desc" data-i18n="settings.toolQqDesc">查看桥接状态与切换 QQ 群聊模型</span>
             </span>
             <svg class="trailing-ic" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 18 15 12 9 6"></polyline>
@@ -701,55 +710,66 @@
 
       <!-- Desktop Host-Only Pairing Card (Shown ONLY on local PC Host Workbench) -->
       <div class="m3-card desktop-host-only">
-        <div class="section-heading">本机主机服务 · 供手机连接</div>
-        <p class="info-text" style="margin-bottom:12px;">
+        <div class="section-heading" data-i18n="settings.desktopHostHeading">本机主机服务 · 供手机连接</div>
+        <p class="info-text" style="margin-bottom:12px;" data-i18n-html="settings.desktopHostDesc">
           当前电脑即为 <strong>Antigravity 主机端（被连接端）</strong>，无需反向扫码。点击下方按钮即可出示本机二维码与 6 位配对码，供手机 App 扫描连接；关闭工作台窗口后，后台服务与公网免 VPN 隧道依然常驻运行。
         </p>
-        <button id="btn-settings-show-qr" class="m3-btn filled full" type="button">出示二维码 / 6 位配对码（供手机扫描）</button>
+        <button id="btn-settings-show-qr" class="m3-btn filled full" type="button" data-i18n="settings.desktopHostBtn">出示二维码 / 6 位配对码（供手机扫描）</button>
       </div>
 
       <!-- Download Folder Settings Section (Phone Client Only) -->
       <div class="m3-card phone-only">
-        <div class="section-heading">文件下载位置</div>
-        <div class="m3-segmented sm" role="group" aria-label="文件下载方式">
-          <button type="button" class="seg-btn dl-mode-opt active" data-dl-mode="subdir">固定目录</button>
-          <button type="button" class="seg-btn dl-mode-opt" data-dl-mode="ask">每次手动选文件夹</button>
+        <div class="section-heading" data-i18n="settings.dlHeading">文件下载位置</div>
+        <div class="m3-segmented sm" role="group" data-i18n-aria="settings.dlModeAria" aria-label="文件下载方式">
+          <button type="button" class="seg-btn dl-mode-opt active" data-dl-mode="subdir" data-i18n="settings.dlModeSubdir">固定目录</button>
+          <button type="button" class="seg-btn dl-mode-opt" data-dl-mode="ask" data-i18n="settings.dlModeAsk">每次手动选文件夹</button>
         </div>
         <div id="dl-subdir-wrap" class="m3-field-group" style="margin-top:10px;">
-          <label class="m3-label" for="settings-dl-subdir">Download 下的子文件夹（留空直存 Download 根目录）</label>
+          <label class="m3-label" for="settings-dl-subdir" data-i18n="settings.dlSubdirLabel">Download 下的子文件夹（留空直存 Download 根目录）</label>
           <div class="dl-subdir-row">
-            <input id="settings-dl-subdir" class="m3-input" type="text" autocomplete="off" spellcheck="false" placeholder="例如 Antigravity 或 工作/代码" />
-            <button id="btn-save-dl-dir" class="m3-btn tonal sm" type="button">保存</button>
+            <input id="settings-dl-subdir" class="m3-input" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="settings.dlSubdirPlaceholder" placeholder="例如 Antigravity 或 工作/代码" />
+            <button id="btn-save-dl-dir" class="m3-btn tonal sm" type="button" data-i18n="settings.save">保存</button>
           </div>
         </div>
         <p id="settings-dl-hint" class="info-text" style="margin-top:8px;">当前将保存到手机 <code>Download/Antigravity/</code></p>
       </div>
 
+      <!-- Language Section -->
+      <div class="m3-card">
+        <div class="section-heading" data-i18n="settings.langHeading">界面语言 / Language</div>
+        <div class="m3-segmented" role="group" data-i18n-aria="settings.langAria" aria-label="界面语言选择">
+          <button type="button" class="seg-btn lang-opt" data-lang-choice="auto" data-i18n="settings.langAuto">跟随系统</button>
+          <button type="button" class="seg-btn lang-opt" data-lang-choice="zh" data-i18n="settings.langZh">中文</button>
+          <button type="button" class="seg-btn lang-opt" data-lang-choice="en" data-i18n="settings.langEn">English</button>
+        </div>
+        <p class="info-text" style="margin-top:8px;" data-i18n="settings.langHint">默认跟随系统语言；也可手动锁定简体中文或 English，立即生效且本地记住。</p>
+      </div>
+
       <!-- Theme Section -->
       <div class="m3-card">
-        <div class="section-heading">外观主题</div>
-        <div class="m3-segmented" role="group" aria-label="外观主题选择">
-          <button type="button" class="seg-btn theme-opt" data-theme-choice="light">浅色</button>
-          <button type="button" class="seg-btn theme-opt" data-theme-choice="dark">深色</button>
-          <button type="button" class="seg-btn theme-opt" data-theme-choice="system">跟随系统</button>
+        <div class="section-heading" data-i18n="settings.themeHeading">外观主题</div>
+        <div class="m3-segmented" role="group" data-i18n-aria="settings.themeAria" aria-label="外观主题选择">
+          <button type="button" class="seg-btn theme-opt" data-theme-choice="light" data-i18n="settings.themeLight">浅色</button>
+          <button type="button" class="seg-btn theme-opt" data-theme-choice="dark" data-i18n="settings.themeDark">深色</button>
+          <button type="button" class="seg-btn theme-opt" data-theme-choice="system" data-i18n="settings.themeSystem">跟随系统</button>
         </div>
       </div>
 
       <!-- Sidebar Conversation Filter Section -->
       <div class="m3-card">
-        <div class="section-heading">侧栏会话过滤</div>
-        <div class="m3-label" style="margin-bottom:8px;">显示外部 CLI / QQ 机器人会话</div>
-        <div class="m3-segmented sm" role="group" aria-label="显示外部 CLI / QQ 机器人会话">
-          <button type="button" class="seg-btn ext-cli-opt active" data-ext-cli="off">关闭（默认）</button>
-          <button type="button" class="seg-btn ext-cli-opt" data-ext-cli="on">开启</button>
+        <div class="section-heading" data-i18n="settings.filterHeading">侧栏会话过滤</div>
+        <div class="m3-label" style="margin-bottom:8px;" data-i18n="settings.filterLabel">显示外部 CLI / QQ 机器人会话</div>
+        <div class="m3-segmented sm" role="group" data-i18n-aria="settings.filterLabel" aria-label="显示外部 CLI / QQ 机器人会话">
+          <button type="button" class="seg-btn ext-cli-opt active" data-ext-cli="off" data-i18n="settings.filterOff">关闭（默认）</button>
+          <button type="button" class="seg-btn ext-cli-opt" data-ext-cli="on" data-i18n="settings.filterOn">开启</button>
         </div>
-        <p class="info-text" style="margin-top:8px;">默认仅显示桌面端与手机/工作台会话；开启后侧栏将多出「外部/QQ」栏位，用于查看终端或 QQ 机器人产生的独立对话。</p>
+        <p class="info-text" style="margin-top:8px;" data-i18n="settings.filterDesc">默认仅显示桌面端与手机/工作台会话；开启后侧栏将多出「外部/QQ」栏位，用于查看终端或 QQ 机器人产生的独立对话。</p>
       </div>
 
       <!-- Saved Hosts List (Phone Client Only) -->
       <div class="m3-card phone-only">
         <div class="section-heading-row">
-          <span class="section-heading">已保存主机</span>
+          <span class="section-heading" data-i18n="settings.savedHosts">已保存主机</span>
           <span id="settings-host-count" class="section-meta">0 台</span>
         </div>
         <div id="settings-hosts-msg" class="m3-inline-banner hidden" role="status"></div>
@@ -758,56 +778,56 @@
 
       <!-- Add New Host Card (Phone Client Only) -->
       <div class="m3-card phone-only">
-        <div class="section-heading">添加新主机</div>
+        <div class="section-heading" data-i18n="settings.addHostHeading">添加新主机</div>
         <button id="btn-settings-qr-scan" class="m3-btn tonal full" type="button" style="margin-bottom:12px;">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
             <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
           </svg>
-          <span>扫描电脑二维码一键添加</span>
+          <span data-i18n="settings.scanAddBtn">扫描电脑二维码一键添加</span>
         </button>
-        <div class="m3-segmented sm" role="tablist" aria-label="添加主机方式">
-          <button type="button" class="seg-btn active" data-add-tab="pin">6 位配对码</button>
-          <button type="button" class="seg-btn" data-add-tab="uri">配对链接</button>
-          <button type="button" class="seg-btn" data-add-tab="manual">手动输入</button>
+        <div class="m3-segmented sm" role="tablist" data-i18n-aria="settings.addTabAria" aria-label="添加主机方式">
+          <button type="button" class="seg-btn active" data-add-tab="pin" data-i18n="settings.addTabPin">6 位配对码</button>
+          <button type="button" class="seg-btn" data-add-tab="uri" data-i18n="settings.addTabUri">配对链接</button>
+          <button type="button" class="seg-btn" data-add-tab="manual" data-i18n="settings.addTabManual">手动输入</button>
         </div>
 
         <div id="add-tab-pin" class="tab-panel">
           <div class="m3-field-group">
-            <label class="m3-label" for="add-pin-host">电脑地址（IP:端口）</label>
-            <input id="add-pin-host" class="m3-input" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="192.168.1.10:18795 或 100.x.x.x:18795" />
+            <label class="m3-label" for="add-pin-host" data-i18n="welcome.hostLabel">电脑地址（IP:端口）</label>
+            <input id="add-pin-host" class="m3-input" type="text" inputmode="url" autocomplete="off" spellcheck="false" data-i18n-placeholder="settings.addPinHostPlaceholder" placeholder="192.168.1.10:18795 或 100.x.x.x:18795" />
           </div>
           <div class="m3-field-group">
-            <label class="m3-label" for="add-pin-code">6 位配对码</label>
+            <label class="m3-label" for="add-pin-code" data-i18n="welcome.pinLabel">6 位配对码</label>
             <input id="add-pin-code" class="m3-input pin-input" type="text" inputmode="numeric" maxlength="8" placeholder="000000" />
           </div>
-          <button id="btn-add-pin" class="m3-btn filled full" type="button">配对并切换</button>
+          <button id="btn-add-pin" class="m3-btn filled full" type="button" data-i18n="settings.addPinBtn">配对并切换</button>
         </div>
 
         <div id="add-tab-uri" class="tab-panel hidden">
           <div class="m3-field-group">
-            <label class="m3-label" for="add-uri-input">配对链接</label>
+            <label class="m3-label" for="add-uri-input" data-i18n="settings.addUriLabel">配对链接</label>
             <input id="add-uri-input" class="m3-input" type="text" autocomplete="off" spellcheck="false" placeholder="agylink://pair?u=...&t=...&n=..." />
           </div>
-          <button id="btn-add-uri" class="m3-btn filled full" type="button">解析并添加</button>
+          <button id="btn-add-uri" class="m3-btn filled full" type="button" data-i18n="settings.addUriBtn">解析并添加</button>
         </div>
 
         <div id="add-tab-manual" class="tab-panel hidden">
           <div class="m3-field-group">
-            <label class="m3-label" for="add-manual-name">主机名称（可选）</label>
-            <input id="add-manual-name" class="m3-input" type="text" placeholder="例如 我的台式机" />
+            <label class="m3-label" for="add-manual-name" data-i18n="settings.addManualNameLabel">主机名称（可选）</label>
+            <input id="add-manual-name" class="m3-input" type="text" data-i18n-placeholder="settings.addManualNamePlaceholder" placeholder="例如 我的台式机" />
           </div>
           <div class="m3-field-group">
-            <label class="m3-label" for="add-manual-url">服务地址（Server URL）</label>
+            <label class="m3-label" for="add-manual-url" data-i18n="welcome.manualUrlLabel">服务地址（Server URL）</label>
             <input id="add-manual-url" class="m3-input" type="url" autocomplete="off" spellcheck="false" placeholder="http://192.168.1.10:18795" />
           </div>
           <div class="m3-field-group">
-            <label class="m3-label" for="add-manual-token">访问令牌（Access Token）</label>
-            <input id="add-manual-token" class="m3-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴电脑端显示的访问令牌" />
+            <label class="m3-label" for="add-manual-token" data-i18n="welcome.manualTokenLabel">访问令牌（Access Token）</label>
+            <input id="add-manual-token" class="m3-input" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="welcome.manualTokenPlaceholder" placeholder="粘贴电脑端显示的访问令牌" />
           </div>
           <div class="form-actions">
-            <button id="btn-test-manual" class="m3-btn outlined" type="button">测试连通</button>
-            <button id="btn-add-manual" class="m3-btn filled" type="button">保存并连接</button>
+            <button id="btn-test-manual" class="m3-btn outlined" type="button" data-i18n="settings.testConn">测试连通</button>
+            <button id="btn-add-manual" class="m3-btn filled" type="button" data-i18n="settings.saveAndConnect">保存并连接</button>
           </div>
         </div>
 
@@ -816,8 +836,8 @@
 
       <!-- 5G Remote & Official Info (Phone Client Only) -->
       <div class="m3-card tonal-info-card phone-only">
-        <div class="section-heading">出门在外免 VPN / 5G 远程连接</div>
-        <p class="info-text">
+        <div class="section-heading" data-i18n="settings.remoteInfoHeading">出门在外免 VPN / 5G 远程连接</div>
+        <p class="info-text" data-i18n-html="settings.remoteInfoHtml">
           1. <strong>Cloudflare 公网免 VPN 隧道（推荐）</strong>：电脑服务端自带内置隧道，直接扫描电脑 <code>/pair</code> 页的公网二维码即可加密直连，手机可同时挂着 v2rayNG / 梯子，校园网与 5G 通吃；<br />
           2. <strong>Tailscale 私有组网</strong>：也可在电脑与手机登录同一 Tailscale 账号，填入 <code>http://100.x.x.x:18795</code> 直连；<br />
           3. 或在工具箱点击「官方远程模式」，无边框全屏直达 Google 官方云端。
@@ -827,26 +847,26 @@
   </section>
 
   <!-- Desktop In-App Phone QR Pairing Modal -->
-  <section id="pair-modal" class="m3-full-view hidden" aria-label="手机扫码配对">
+  <section id="pair-modal" class="m3-full-view hidden" data-i18n-aria="pair.title" aria-label="手机扫码配对">
     <header class="m3-topbar">
-      <button class="m3-icon-btn close-modal" data-target="pair-modal" type="button" aria-label="返回工作台">
+      <button class="m3-icon-btn close-modal" data-target="pair-modal" type="button" data-i18n-aria="pair.backAria" aria-label="返回工作台">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="19" y1="12" x2="5" y2="12"></line>
           <polyline points="12 19 5 12 12 5"></polyline>
         </svg>
       </button>
       <div class="topbar-center">
-        <div class="conv-title">手机扫码配对</div>
-        <div class="conv-subtitle">本机服务已就绪 · 支持公网免 VPN 隧道与局域网扫码</div>
+        <div class="conv-title" data-i18n="pair.title">手机扫码配对</div>
+        <div class="conv-subtitle" data-i18n="pair.sub">本机服务已就绪 · 支持公网免 VPN 隧道与局域网扫码</div>
       </div>
       <div class="topbar-actions">
-        <button id="btn-pair-refresh" class="m3-icon-btn" type="button" aria-label="刷新配对页" title="刷新二维码与隧道状态">
+        <button id="btn-pair-refresh" class="m3-icon-btn" type="button" data-i18n-aria="pair.refreshAria" data-i18n-title="pair.refreshTitle" aria-label="刷新配对页" title="刷新二维码与隧道状态">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="23 4 23 10 17 10"></polyline>
             <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
           </svg>
         </button>
-        <button id="btn-pair-external" class="m3-icon-btn" type="button" aria-label="在浏览器新标签打开" title="在浏览器新标签打开">
+        <button id="btn-pair-external" class="m3-icon-btn" type="button" data-i18n-aria="pair.externalAria" data-i18n-title="pair.externalTitle" aria-label="在浏览器新标签打开" title="在浏览器新标签打开">
           <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
             <polyline points="15 3 21 3 21 9"></polyline>
@@ -855,23 +875,23 @@
         </button>
       </div>
     </header>
-    <iframe id="pair-iframe" class="pair-iframe" title="手机扫码配对"></iframe>
+    <iframe id="pair-iframe" class="pair-iframe" data-i18n-title="pair.title" title="手机扫码配对"></iframe>
   </section>
 
   <!-- Usage & Quota Dashboard Full-Screen View -->
-  <section id="usage-modal" class="m3-full-view hidden" aria-label="额度与用量统计">
+  <section id="usage-modal" class="m3-full-view hidden" data-i18n-aria="usage.title" aria-label="额度与用量统计">
     <header class="m3-topbar">
-      <button class="m3-icon-btn close-modal" type="button" data-target="usage-modal" aria-label="返回">
+      <button class="m3-icon-btn close-modal" type="button" data-target="usage-modal" data-i18n-aria="modal.back" aria-label="返回">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <line x1="19" y1="12" x2="5" y2="12"></line>
           <polyline points="12 19 5 12 12 5"></polyline>
         </svg>
       </button>
       <div class="topbar-center">
-        <div class="conv-title">额度与用量统计</div>
-        <div id="usage-subtitle" class="conv-subtitle">基于本机完整对话日志核算</div>
+        <div class="conv-title" data-i18n="usage.title">额度与用量统计</div>
+        <div id="usage-subtitle" class="conv-subtitle" data-i18n="usage.subDefault">基于本机完整对话日志核算</div>
       </div>
-      <button id="btn-usage-refresh" class="m3-icon-btn" type="button" aria-label="刷新用量" title="刷新统计">
+      <button id="btn-usage-refresh" class="m3-icon-btn" type="button" data-i18n-aria="usage.refreshAria" data-i18n-title="usage.refreshTitle" aria-label="刷新用量" title="刷新统计">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="23 4 23 10 17 10"></polyline>
           <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
@@ -879,12 +899,12 @@
       </button>
     </header>
     <div class="usage-tabs-bar">
-      <div id="usage-window-tabs" class="m3-segmented sm" role="tablist" aria-label="统计周期">
-        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-usage-win="5h">近5h</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="today">今日</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="3d">近3天</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="7d">近7天</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="conv">本会话</button>
+      <div id="usage-window-tabs" class="m3-segmented sm" role="tablist" data-i18n-aria="usage.tabsAria" aria-label="统计周期">
+        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-usage-win="5h" data-i18n="usage.tab5h">近5h</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="today" data-i18n="usage.tabToday">今日</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="3d" data-i18n="usage.tab3d">近3天</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="7d" data-i18n="usage.tab7d">近7天</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="conv" data-i18n="usage.tabConv">本会话</button>
       </div>
     </div>
     <div class="view-body settings-body">
@@ -902,29 +922,29 @@
           <line x1="12" y1="3" x2="12" y2="15"></line>
         </svg>
       </div>
-      <div class="drop-overlay-title">松开即可无损添加到当前会话</div>
-      <div class="drop-overlay-desc">原图 / 原文件直传不压缩 · 支持一次拖入多张图片与文件</div>
+      <div class="drop-overlay-title" data-i18n="drop.title">松开即可无损添加到当前会话</div>
+      <div class="drop-overlay-desc" data-i18n="drop.desc">原图 / 原文件直传不压缩 · 支持一次拖入多张图片与文件</div>
     </div>
   </div>
 
   <!-- M3 Host Pair Import Confirmation Dialog -->
   <div id="pair-confirm-dialog" class="m3-dialog-scrim hidden" role="dialog" aria-modal="true" aria-labelledby="pair-confirm-title">
     <div class="m3-dialog-card">
-      <div id="pair-confirm-title" class="m3-dialog-title">确认连接此主机？</div>
-      <p id="pair-confirm-desc" class="m3-dialog-desc">检测到外部配对信息，请核对主机名称与服务地址无误后再保存并切换连接：</p>
+      <div id="pair-confirm-title" class="m3-dialog-title" data-i18n="confirm.title">确认连接此主机？</div>
+      <p id="pair-confirm-desc" class="m3-dialog-desc" data-i18n="confirm.desc">检测到外部配对信息，请核对主机名称与服务地址无误后再保存并切换连接：</p>
       <div class="m3-dialog-kv">
         <div class="m3-dialog-kv-row">
-          <span class="m3-dialog-kv-k">主机名称</span>
+          <span class="m3-dialog-kv-k" data-i18n="confirm.hostName">主机名称</span>
           <span id="pair-confirm-name" class="m3-dialog-kv-v"></span>
         </div>
         <div class="m3-dialog-kv-row">
-          <span class="m3-dialog-kv-k">服务地址</span>
+          <span class="m3-dialog-kv-k" data-i18n="confirm.serverUrl">服务地址</span>
           <span id="pair-confirm-url" class="m3-dialog-kv-v mono"></span>
         </div>
       </div>
       <div class="m3-dialog-actions">
-        <button id="btn-pair-confirm-cancel" class="m3-btn outlined sm" type="button">取消</button>
-        <button id="btn-pair-confirm-ok" class="m3-btn filled sm" type="button">确认连接</button>
+        <button id="btn-pair-confirm-cancel" class="m3-btn outlined sm" type="button" data-i18n="confirm.cancel">取消</button>
+        <button id="btn-pair-confirm-ok" class="m3-btn filled sm" type="button" data-i18n="confirm.ok">确认连接</button>
       </div>
     </div>
   </div>
@@ -932,6 +952,7 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=1.7.5"></script>
+  <script src="./i18n.js?v=1.7.6"></script>
+  <script src="./app.js?v=1.7.6"></script>
 </body>
 </html>
