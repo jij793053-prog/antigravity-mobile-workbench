@@ -30,10 +30,15 @@
     return '';
   }
 
-  function isSameOriginHttp(urlObj) {
-    if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') return false;
+  function isRelativeSameOriginPath(raw) {
+    return typeof raw === 'string' && raw.startsWith('/') && !raw.startsWith('//');
+  }
+
+  function isSameOriginHttp(urlObj, rawStr) {
+    if (isRelativeSameOriginPath(rawStr)) return true;
     const base = currentBaseOrigin();
     if (base && urlObj.origin === base) return true;
+    if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') return false;
     return Boolean(window.location.host && urlObj.host === window.location.host);
   }
 
@@ -50,8 +55,8 @@
     if (/^(?:data|blob|javascript|mailto|tel|agylink):/i.test(trimmed)) return urlStr;
     try {
       const isRelative = !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) && !trimmed.startsWith('//');
-      const parsed = new URL(trimmed, window.location.href);
-      if (!isSameOriginHttp(parsed) && !isSameOriginWs(parsed)) {
+      const parsed = new URL(trimmed, isRelative ? 'http://127.0.0.1' : window.location.href);
+      if (!isRelative && !isSameOriginHttp(parsed, trimmed) && !isSameOriginWs(parsed)) {
         return urlStr;
       }
       parsed.searchParams.set('sidecar_token', token);
@@ -77,11 +82,13 @@
       if (!targetUrl) {
         return origFetch(input, init);
       }
-      let sameOrigin = false;
-      try {
-        sameOrigin = isSameOriginHttp(new URL(targetUrl, window.location.href));
-      } catch (_) {
-        sameOrigin = false;
+      let sameOrigin = isRelativeSameOriginPath(targetUrl);
+      if (!sameOrigin) {
+        try {
+          sameOrigin = isSameOriginHttp(new URL(targetUrl, window.location.href), targetUrl);
+        } catch (_) {
+          sameOrigin = false;
+        }
       }
       if (!sameOrigin) {
         return origFetch(input, init);

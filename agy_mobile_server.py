@@ -40,7 +40,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -987,20 +987,28 @@ def _build_cli_env() -> dict[str, str]:
 
 
 _LOCAL_BRIDGE_CACHE_LOCK = threading.Lock()
-_LOCAL_BRIDGE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_LOCAL_BRIDGE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None, "last_good_ts": 0.0, "last_good": None}
 
 
-def _fetch_local_bridge_status(force: bool = False) -> dict[str, Any] | None:
-    """Optional loopback query to a local bridge status API (127.0.0.1:8788/api/status), cached for 5s."""
+def _fetch_local_bridge_status(force: bool = False, timeout_sec: float = 0.8, allow_stale: bool = True) -> dict[str, Any] | None:
+    """Optional loopback query to a local bridge status API (127.0.0.1:8788/api/status), cached for 15s with stale-while-slow fallback."""
     now = time.time()
     if not force:
         with _LOCAL_BRIDGE_CACHE_LOCK:
-            if (now - float(_LOCAL_BRIDGE_CACHE.get("ts") or 0.0)) < 5.0:
-                cached = _LOCAL_BRIDGE_CACHE.get("data")
-                return dict(cached) if isinstance(cached, dict) else None
+            cached = _LOCAL_BRIDGE_CACHE.get("data")
+            age = now - float(_LOCAL_BRIDGE_CACHE.get("ts") or 0.0)
+            if isinstance(cached, dict) and age < 15.0:
+                return dict(cached)
+            # Short negative cache (3s) only when port refused, NOT when caller asks for a longer quota timeout
+            if cached is None and age < 3.0 and timeout_sec <= 1.0:
+                if allow_stale:
+                    lg = _LOCAL_BRIDGE_CACHE.get("last_good")
+                    if isinstance(lg, dict) and (now - float(_LOCAL_BRIDGE_CACHE.get("last_good_ts") or 0.0)) < 600.0:
+                        return dict(lg)
+                return None
     result: dict[str, Any] | None = None
     try:
-        with _DIRECT_OPENER.open("http://127.0.0.1:8788/api/status", timeout=0.6) as r:
+        with _DIRECT_OPENER.open("http://127.0.0.1:8788/api/status", timeout=timeout_sec) as r:
             if getattr(r, "status", 200) == 200:
                 data = json.loads(r.read(524288).decode("utf-8", errors="replace"))
                 if isinstance(data, dict) and any(
@@ -1012,7 +1020,15 @@ def _fetch_local_bridge_status(force: bool = False) -> dict[str, Any] | None:
     with _LOCAL_BRIDGE_CACHE_LOCK:
         _LOCAL_BRIDGE_CACHE["ts"] = now
         _LOCAL_BRIDGE_CACHE["data"] = result
-    return dict(result) if isinstance(result, dict) else None
+        if isinstance(result, dict):
+            _LOCAL_BRIDGE_CACHE["last_good"] = result
+            _LOCAL_BRIDGE_CACHE["last_good_ts"] = now
+            return dict(result)
+        if allow_stale:
+            lg = _LOCAL_BRIDGE_CACHE.get("last_good")
+            if isinstance(lg, dict) and (now - float(_LOCAL_BRIDGE_CACHE.get("last_good_ts") or 0.0)) < 600.0:
+                return dict(lg)
+    return None
 
 
 def check_qqbot_available() -> bool:
@@ -3805,8 +3821,8 @@ def _fetch_optional_external_quota() -> dict[str, Any] | None:
         except Exception:
             pass
 
-    # Automatic fallback: optional local companion bridge on 127.0.0.1:8788 (Antigravity pools ONLY)
-    bridge = _fetch_local_bridge_status()
+    # Automatic fallback: optional local companion bridge on 127.0.0.1:8788 (Antigravity pools ONLY, generous 3.5s timeout + stale cache)
+    bridge = _fetch_local_bridge_status(force=False, timeout_sec=3.5, allow_stale=True)
     if not isinstance(bridge, dict):
         return None
     quotas = bridge.get("quotas")

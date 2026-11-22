@@ -461,10 +461,15 @@
     } catch (_) {}
   }
 
+  function getApiBase(host) {
+    if (SIDECAR) return "";
+    return String((host && host.url) || "");
+  }
+
   function upsertHost({ name, url, token }, activate = true) {
-    const normUrl = normalizeServerUrl(url);
+    const normUrl = (SIDECAR && url === "same-origin") ? "same-origin" : normalizeServerUrl(url);
     const cleanTok = String(token || "").trim();
-    const cleanName = String(name || "").trim() || hostDisplayFallback(normUrl);
+    const cleanName = String(name || "").trim() || (normUrl === "same-origin" ? "本机工作台" : hostDisplayFallback(normUrl));
 
     let existing = state.hosts.find((h) => h.url.toLowerCase() === normUrl.toLowerCase());
     if (existing) {
@@ -798,13 +803,13 @@
   // =========================================================================
   async function apiFetch(path, opts = {}) {
     const host = getActiveHost();
-    if (!host || !host.url) throw new Error("未配置主机");
+    if (!host || (!SIDECAR && !host.url)) throw new Error("未配置主机");
     const headers = Object.assign({}, opts.headers || {});
     if (host.token) headers["Authorization"] = `Bearer ${host.token}`;
     if (opts.body && !(opts.body instanceof FormData) && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const resp = await fetch(`${host.url}${path}`, Object.assign({}, opts, { headers }));
+    const resp = await fetch(`${getApiBase(host)}${path}`, Object.assign({}, opts, { headers }));
     if (resp.status === 401) {
       setConnState("offline", "访问令牌无效，请在主机设置检查");
       throw new Error("身份校验失败 (401)");
@@ -1040,7 +1045,7 @@
     state.sseAbort = ctrl;
     setConnState("connecting", `正在连接 ${host.name}...`);
     try {
-      const resp = await fetch(`${host.url}/__sidecar/events`, {
+      const resp = await fetch("/__sidecar/events", {
         method: "GET",
         cache: "no-store",
         headers: {
@@ -1105,7 +1110,7 @@
   function connectWs() {
     disconnectWs();
     const host = getActiveHost();
-    if (!host || !host.url) {
+    if (!host || (!SIDECAR && !host.url)) {
       setConnState("offline", "未配置主机");
       return;
     }
@@ -1745,7 +1750,7 @@
             const imgCards = imgs
               .map((a) => {
                 const rawSrcUrl = host
-                  ? `${host.url}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path)}`}&token=${encodeURIComponent(host.token)}`
+                  ? `${getApiBase(host)}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path)}`}&token=${encodeURIComponent(host.token)}`
                   : "";
                 const srcUrl = rawSrcUrl ? withSidecarToken(rawSrcUrl) : "";
                 return `<button class="msg-img-thumb msg-att-btn" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "image")}" aria-label="查看原图 ${escHtml(a.name || "")}">` +
@@ -2309,7 +2314,7 @@
       .map((a, idx) => {
         const rawThumb =
           a.is_image && host
-            ? `${host.url}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path || "")}`}&token=${encodeURIComponent(host.token)}`
+            ? `${getApiBase(host)}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path || "")}`}&token=${encodeURIComponent(host.token)}`
             : "";
         const imgTag = rawThumb
           ? `<img src="${escHtml(withSidecarToken(rawThumb))}" alt="" />`
@@ -2666,7 +2671,7 @@
     const ext = (path.split(".").pop() || "").toLowerCase();
     if (["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext)) {
       const imgUrl = withSidecarToken(
-        `${host.url}/api/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
+        `${getApiBase(host)}/api/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
       );
       $("preview-body").innerHTML = `<img src="${escHtml(imgUrl)}" alt="${escHtml(name || "")}" />`;
       return;
@@ -2722,7 +2727,7 @@
     if (!host) return;
     const filename = name || path.split("/").pop() || "download";
     const url = withSidecarToken(
-      `${host.url}/api/files/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
+      `${getApiBase(host)}/api/files/download?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
     );
     const subdir = sanitizeSubdirInput(state.downloadSubdir);
     const ask = Boolean(state.downloadAskFolder);
@@ -3442,15 +3447,20 @@
     $("btn-scroll-bottom").addEventListener("click", () => scrollToBottom(true));
 
     // --- Unified Drawer Settings Entry & In-App Desktop Phone Pairing ---
+    function getPairUrl(withBust = true) {
+      const suffix = withBust ? `/pair?_t=${Date.now()}` : "/pair";
+      if (SIDECAR) return withSidecarToken(suffix);
+      return withSidecarToken(`${location.origin}${suffix}`);
+    }
     function openPairModal() {
       closeDrawer();
       const modal = $("pair-modal");
       const iframe = $("pair-iframe");
       if (!modal || !iframe) {
-        window.open(withSidecarToken(`${location.origin}/pair`), "_blank", "noopener");
+        window.open(getPairUrl(false), "_blank", "noopener");
         return;
       }
-      iframe.src = withSidecarToken(`${location.origin}/pair?_t=${Date.now()}`);
+      iframe.src = getPairUrl(true);
       modal.classList.remove("hidden");
     }
     $("nav-pair-qr")?.addEventListener("click", openPairModal);
@@ -3461,10 +3471,13 @@
     });
     $("btn-pair-refresh")?.addEventListener("click", () => {
       const iframe = $("pair-iframe");
-      if (iframe) iframe.src = withSidecarToken(`${location.origin}/pair?_t=${Date.now()}`);
+      if (iframe) iframe.src = getPairUrl(true);
     });
     $("btn-pair-external")?.addEventListener("click", () => {
-      window.open(withSidecarToken(`${location.origin}/pair`), "_blank", "noopener");
+      const extUrl = (SIDECAR && !/^https?:$/i.test(location.protocol))
+        ? "http://127.0.0.1:18795/pair"
+        : getPairUrl(false);
+      window.open(extUrl, "_blank", "noopener");
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
@@ -3810,8 +3823,8 @@
       if (!data || !data.ok || !data.token) return false;
       const rawOrigin = (location.origin && location.origin !== "null")
         ? location.origin
-        : `${location.protocol}//${location.host}`;
-      const localUrl = normalizeServerUrl(rawOrigin);
+        : (location.host ? `${location.protocol}//${location.host}` : "");
+      const localUrl = normalizeServerUrl(rawOrigin) || (SIDECAR ? "same-origin" : "");
       const localName = data.hostname ? `${data.hostname}（本机）` : "本机工作台";
       if (data.default_model && !state.hosts.length) {
         state.selectedModel = String(data.default_model);
