@@ -99,6 +99,17 @@
     previewFile: null,
     usageData: null,
     usageWindow: "5h",
+
+    // Task 1-3: Authenticated media, instant bottom-snap, and Turn Navigator state
+    turns: [],
+    turnAnchorEls: [],
+    activeTurnIndex: 0,
+    turnNavOpen: false,
+    turnNavFilter: "",
+    mediaRenderGen: 0,
+    bottomAnchorActive: false,
+    bottomAnchorTimer: null,
+    programmaticScrollAt: 0,
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -203,6 +214,10 @@
         el.classList.add("hidden");
         return true;
       }
+    }
+    if (state.turnNavOpen) {
+      closeTurnNavigator();
+      return true;
     }
     if (
       !$("model-sheet").classList.contains("hidden") ||
@@ -339,6 +354,13 @@
       disconnectWs();
     });
   }
+
+  window.addEventListener("pagehide", () => {
+    clearAuthMediaCache();
+  });
+  window.addEventListener("beforeunload", () => {
+    clearAuthMediaCache();
+  });
 
   // =========================================================================
   // 3. MULTI-HOST CONFIG PERSISTENCE (Universal — Zero Hardcoded Data)
@@ -1096,6 +1118,9 @@
       return;
     }
     loadHostDrafts();
+    clearAuthMediaCache();
+    closeTurnNavigator();
+    disarmBottomAnchor();
     state.openConvSeq += 1;
     state.lastRenderedConvFp = "";
     state.currentCid = "";
@@ -1914,15 +1939,821 @@
     }
   }
 
-  function scrollToBottom(force = false) {
+  // =========================================================================
+  // 7.5 AUTHENTICATED MEDIA BLOB LOADER (Sidecar Header-Auth + Bounded LRU)
+  // =========================================================================
+  const MAX_AUTH_MEDIA_ENTRIES = 80;
+  const MAX_AUTH_MEDIA_BYTES = 48 * 1024 * 1024;
+  const MAX_AUTH_MEDIA_CONCURRENCY = 3;
+  const authMediaCache = new Map(); // key -> { blobUrl, blob, size, dataUrl }
+  const authMediaInflight = new Map(); // key -> Promise<entry>
+  const authMediaControllers = new Set();
+  const authMediaQueue = [];
+  let authMediaBytes = 0;
+  let authMediaActiveCount = 0;
+  let mediaObserver = null;
+
+  function buildPreviewApiPath(previewUrl, rawPath) {
+    const pUrl = String(previewUrl || "").trim();
+    if (pUrl.startsWith("/api/files/preview")) {
+      return pUrl;
+    }
+    return `/api/files/preview?path=${encodeURIComponent(String(rawPath || ""))}`;
+  }
+
+  function buildDirectMediaUrl(host, apiPath) {
+    if (!host || !apiPath) return "";
+    const sep = apiPath.includes("?") ? "&" : "?";
+    const tokPart = host.token ? `${sep}token=${encodeURIComponent(host.token)}` : "";
+    return `${getApiBase(host)}${apiPath}${tokPart}`;
+  }
+
+  function makeMediaCacheKey(host, apiPath) {
+    return `${host ? host.id : "nohost"}|${apiPath}`;
+  }
+
+  function touchAuthMediaEntry(cacheKey) {
+    const entry = authMediaCache.get(cacheKey);
+    if (!entry) return null;
+    authMediaCache.delete(cacheKey);
+    authMediaCache.set(cacheKey, entry);
+    return entry;
+  }
+
+  function evictAuthMediaIfNeeded() {
+    const previewModal = $("preview-modal");
+    const previewOpen = Boolean(previewModal && !previewModal.classList.contains("hidden"));
+    const activePreviewImg = previewOpen ? $("preview-body")?.querySelector("img[data-media-key]") : null;
+    const protectedKey = activePreviewImg ? activePreviewImg.dataset.mediaKey : "";
+    let guard = authMediaCache.size + 2;
+    while ((authMediaCache.size > MAX_AUTH_MEDIA_ENTRIES || authMediaBytes > MAX_AUTH_MEDIA_BYTES) && guard-- > 0) {
+      const oldestKey = authMediaCache.keys().next().value;
+      if (!oldestKey) break;
+      if (protectedKey && oldestKey === protectedKey && authMediaCache.size > 1) {
+        touchAuthMediaEntry(oldestKey);
+        continue;
+      }
+      const evicted = authMediaCache.get(oldestKey);
+      authMediaCache.delete(oldestKey);
+      if (evicted) {
+        authMediaBytes = Math.max(0, authMediaBytes - (evicted.size || 0));
+        // Detach any live DOM image referencing the evicted blob URL before revoking
+        try {
+          document.querySelectorAll("img[data-media-key]").forEach((img) => {
+            if (img.dataset.mediaKey === oldestKey) {
+              img.removeAttribute("src");
+              img.dataset.mediaLoaded = "0";
+              const thumb = img.closest(".msg-img-thumb");
+              if (thumb) {
+                thumb.classList.remove("img-loaded", "img-error");
+                thumb.classList.add("img-loading");
+              }
+              if (mediaObserver && img.closest("#messages-list")) {
+                mediaObserver.observe(img);
+              }
+            }
+          });
+        } catch (_) {}
+        try {
+          URL.revokeObjectURL(evicted.blobUrl);
+        } catch (_) {}
+      }
+    }
+  }
+
+  function makeMediaAbortError() {
+    const err = new Error("Media request aborted");
+    err.name = "AbortError";
+    return err;
+  }
+
+  function abortPendingMediaQueue(scope = "messages") {
+    const matchAll = scope === "all";
+    for (let i = authMediaQueue.length - 1; i >= 0; i--) {
+      const job = authMediaQueue[i];
+      if (!job || matchAll || job.scope === scope) {
+        authMediaQueue.splice(i, 1);
+        if (job) {
+          job.cancelled = true;
+          const inflightRec = authMediaInflight.get(job.cacheKey);
+          if (inflightRec && inflightRec.job === job) {
+            authMediaInflight.delete(job.cacheKey);
+          }
+          try {
+            job.reject(makeMediaAbortError());
+          } catch (_) {}
+        }
+      }
+    }
+    for (const rec of Array.from(authMediaControllers)) {
+      if (matchAll || (rec.job && rec.job.scope === scope)) {
+        if (rec.job) {
+          rec.job.cancelled = true;
+          const inflightRec = authMediaInflight.get(rec.job.cacheKey);
+          if (inflightRec && inflightRec.job === rec.job) {
+            authMediaInflight.delete(rec.job.cacheKey);
+          }
+        }
+        authMediaControllers.delete(rec);
+        try {
+          rec.ctrl.abort();
+        } catch (_) {}
+      }
+    }
+    if (matchAll) {
+      authMediaInflight.clear();
+    }
+  }
+
+  function clearAuthMediaCache() {
+    abortPendingMediaQueue("all");
+    if (mediaObserver) {
+      try {
+        mediaObserver.disconnect();
+      } catch (_) {}
+    }
+    for (const entry of authMediaCache.values()) {
+      try {
+        URL.revokeObjectURL(entry.blobUrl);
+      } catch (_) {}
+    }
+    authMediaCache.clear();
+    authMediaBytes = 0;
+  }
+
+  function pumpAuthMediaQueue() {
+    while (authMediaActiveCount < MAX_AUTH_MEDIA_CONCURRENCY && authMediaQueue.length > 0) {
+      const job = authMediaQueue.shift();
+      if (!job || job.cancelled) continue;
+      authMediaActiveCount += 1;
+      runAuthMediaJob(job)
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          authMediaActiveCount = Math.max(0, authMediaActiveCount - 1);
+          pumpAuthMediaQueue();
+        });
+    }
+  }
+
+  async function runAuthMediaJob(job) {
+    const { cacheKey, apiPath, host } = job;
+    const cached = touchAuthMediaEntry(cacheKey);
+    if (cached) return cached;
+
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const ctrlRec = ctrl ? { ctrl, job } : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 20000) : null;
+    if (ctrlRec) authMediaControllers.add(ctrlRec);
+    try {
+      const headers = {};
+      if (host && host.token) {
+        headers["Authorization"] = `Bearer ${host.token}`;
+      }
+      const resp = await fetch(`${getApiBase(host)}${apiPath}`, {
+        method: "GET",
+        headers,
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const ct = String(resp.headers.get("content-type") || "").toLowerCase();
+      if (ct && !ct.startsWith("image/") && !ct.includes("octet-stream")) {
+        throw new Error(`Unexpected media type: ${ct}`);
+      }
+      const blob = await resp.blob();
+      if (!blob || blob.size === 0) {
+        throw new Error("Empty media response");
+      }
+      const existing = touchAuthMediaEntry(cacheKey);
+      if (existing) return existing;
+
+      const blobUrl = URL.createObjectURL(blob);
+      const entry = { blobUrl, blob, size: blob.size || 0, dataUrl: "" };
+      authMediaCache.set(cacheKey, entry);
+      authMediaBytes += entry.size;
+      evictAuthMediaIfNeeded();
+      return entry;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (ctrlRec) authMediaControllers.delete(ctrlRec);
+    }
+  }
+
+  function fetchAuthMediaEntry(apiPath, host, opts = {}) {
+    const { priority = 1, forceReload = false, scope = "messages" } = opts || {};
+    if (!host || !apiPath) {
+      return Promise.reject(new Error("Missing host or media path"));
+    }
+    const cacheKey = makeMediaCacheKey(host, apiPath);
+    if (!forceReload) {
+      const cached = touchAuthMediaEntry(cacheKey);
+      if (cached) return Promise.resolve(cached);
+    }
+    const existingRec = authMediaInflight.get(cacheKey);
+    if (existingRec && existingRec.job && !existingRec.job.cancelled) {
+      // Promote shared in-flight job to standalone + front-of-queue when lightbox/attach-tray awaits it
+      if (scope === "standalone") {
+        existingRec.job.scope = "standalone";
+      }
+      if (priority === 0) {
+        const qIdx = authMediaQueue.indexOf(existingRec.job);
+        if (qIdx > 0) {
+          authMediaQueue.splice(qIdx, 1);
+          authMediaQueue.unshift(existingRec.job);
+        }
+      }
+      return existingRec.promise;
+    }
+
+    let jobRef = null;
+    const promise = new Promise((resolve, reject) => {
+      const job = { cacheKey, apiPath, host, priority, scope, cancelled: false, resolve, reject };
+      jobRef = job;
+      if (priority === 0) {
+        authMediaQueue.unshift(job);
+      } else {
+        authMediaQueue.push(job);
+      }
+      pumpAuthMediaQueue();
+    }).finally(() => {
+      const cur = authMediaInflight.get(cacheKey);
+      if (cur && cur.job === jobRef) {
+        authMediaInflight.delete(cacheKey);
+      }
+    });
+
+    authMediaInflight.set(cacheKey, { promise, job: jobRef });
+    return promise;
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      if (typeof FileReader === "undefined") {
+        reject(new Error("FileReader unavailable"));
+        return;
+      }
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ""));
+      fr.onerror = () => reject(new Error("Blob decode failed"));
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  function markThumbState(imgEl, nextState) {
+    const thumb = imgEl && imgEl.closest ? imgEl.closest(".msg-img-thumb") : null;
+    if (!thumb) return;
+    thumb.classList.toggle("img-loading", nextState === "loading");
+    thumb.classList.toggle("img-loaded", nextState === "loaded");
+    thumb.classList.toggle("img-error", nextState === "error");
+  }
+
+  function applyMediaEntryToImg(imgEl, entry, renderGen) {
+    if (!imgEl || !imgEl.isConnected || (renderGen !== undefined && renderGen !== state.mediaRenderGen)) {
+      return;
+    }
+    const targetUrl = entry.dataUrl || entry.blobUrl;
+    if (imgEl.getAttribute("src") === targetUrl && imgEl.complete && imgEl.naturalWidth > 0) {
+      imgEl.dataset.mediaLoaded = "1";
+      markThumbState(imgEl, "loaded");
+      return;
+    }
+    imgEl.dataset.mediaLoaded = "1";
+    imgEl.onload = () => {
+      if (renderGen !== undefined && renderGen !== state.mediaRenderGen) return;
+      markThumbState(imgEl, "loaded");
+      snapBottomIfAnchored();
+    };
+    imgEl.onerror = async () => {
+      if (renderGen !== undefined && renderGen !== state.mediaRenderGen) return;
+      // Bulletproof fallback: if a strict host CSP blocks blob: img-src, upgrade once to data: URL
+      if (!imgEl.dataset.dataUrlFallback && entry.blob && entry.blob.size <= 10 * 1024 * 1024) {
+        imgEl.dataset.dataUrlFallback = "1";
+        try {
+          if (!entry.dataUrl) {
+            entry.dataUrl = await blobToDataUrl(entry.blob);
+          }
+          if (entry.dataUrl && imgEl.isConnected && (renderGen === undefined || renderGen === state.mediaRenderGen)) {
+            imgEl.src = entry.dataUrl;
+            return;
+          }
+        } catch (_) {}
+      }
+      imgEl.dataset.mediaLoaded = "0";
+      markThumbState(imgEl, "error");
+    };
+    imgEl.src = targetUrl;
+  }
+
+  async function loadThumbImgViaAuthFetch(imgEl, renderGen, opts = {}) {
+    const { priority = 0, allowRetry = true, forceReload = false, scope = "messages" } = opts || {};
+    if (!imgEl || !imgEl.isConnected) return;
+    if (renderGen !== undefined && renderGen !== state.mediaRenderGen) return;
+    if (!forceReload && (imgEl.dataset.mediaLoaded === "1" || imgEl.dataset.mediaFetching === "1")) {
+      return;
+    }
+    const apiPath = imgEl.dataset.mediaPath || "";
+    const host = getActiveHost();
+    if (!apiPath || !host) {
+      markThumbState(imgEl, "error");
+      return;
+    }
+    imgEl.dataset.mediaFetching = "1";
+    markThumbState(imgEl, "loading");
+    try {
+      const entry = await fetchAuthMediaEntry(apiPath, host, { priority, forceReload, scope });
+      if (!imgEl.isConnected || (renderGen !== undefined && renderGen !== state.mediaRenderGen)) {
+        return;
+      }
+      applyMediaEntryToImg(imgEl, entry, renderGen);
+    } catch (err) {
+      if (err && err.name === "AbortError") return;
+      if (!imgEl.isConnected || (renderGen !== undefined && renderGen !== state.mediaRenderGen)) {
+        return;
+      }
+      if (allowRetry) {
+        setTimeout(() => {
+          if (imgEl.isConnected && (renderGen === undefined || renderGen === state.mediaRenderGen)) {
+            imgEl.dataset.mediaFetching = "0";
+            loadThumbImgViaAuthFetch(imgEl, renderGen, { priority: 0, allowRetry: false, forceReload: true, scope });
+          }
+        }, 650);
+      } else {
+        markThumbState(imgEl, "error");
+      }
+    } finally {
+      imgEl.dataset.mediaFetching = "0";
+    }
+  }
+
+  function ensureMediaObserver() {
+    if (mediaObserver || typeof IntersectionObserver !== "function") return mediaObserver;
+    const scrollEl = $("chat-scroll");
+    mediaObserver = new IntersectionObserver(
+      (entries) => {
+        for (const ent of entries) {
+          if (!ent.isIntersecting) continue;
+          const img = ent.target;
+          mediaObserver.unobserve(img);
+          const gen = Number(img.dataset.mediaGen || 0);
+          if (gen === state.mediaRenderGen) {
+            loadThumbImgViaAuthFetch(img, gen, { priority: 0 });
+          }
+        }
+      },
+      {
+        root: scrollEl || null,
+        rootMargin: "1000px 0px 1000px 0px",
+        threshold: 0.01,
+      }
+    );
+    return mediaObserver;
+  }
+
+  function hydrateMessageImages(container, renderGen) {
+    if (!container) return;
+    const imgs = Array.from(container.querySelectorAll("img[data-media-path]"));
+    if (!imgs.length) return;
+    const host = getActiveHost();
+    if (!host) return;
+
+    if (SIDECAR) {
+      const obs = ensureMediaObserver();
+      // Prioritize bottom 16 images immediately, then gently pre-hydrate up to bounded cache budget
+      const eagerStartIdx = Math.max(0, imgs.length - 16);
+      const bgStartIdx = Math.max(0, imgs.length - Math.max(16, MAX_AUTH_MEDIA_ENTRIES - 8));
+      const eagerImgs = [];
+      const bgImgs = [];
+      for (let i = 0; i < imgs.length; i++) {
+        const img = imgs[i];
+        const apiPath = img.dataset.mediaPath || "";
+        const cacheKey = makeMediaCacheKey(host, apiPath);
+        img.dataset.mediaKey = cacheKey;
+        img.dataset.mediaGen = String(renderGen);
+        const cached = touchAuthMediaEntry(cacheKey);
+        if (cached) {
+          applyMediaEntryToImg(img, cached, renderGen);
+          continue;
+        }
+        if (i >= eagerStartIdx) {
+          eagerImgs.push(img);
+        } else {
+          if (obs) obs.observe(img);
+          if (i >= bgStartIdx) bgImgs.push(img);
+        }
+      }
+      for (let i = eagerImgs.length - 1; i >= 0; i--) {
+        loadThumbImgViaAuthFetch(eagerImgs[i], renderGen, { priority: 1 });
+      }
+      for (let i = bgImgs.length - 1; i >= 0; i--) {
+        loadThumbImgViaAuthFetch(bgImgs[i], renderGen, { priority: 2 });
+      }
+    } else {
+      // Non-sidecar Mobile/Browser mode: attach onload anchor-snap & auth-fetch fallback on error
+      for (const img of imgs) {
+        img.dataset.mediaGen = String(renderGen);
+        if (img.complete && img.naturalWidth > 0) {
+          markThumbState(img, "loaded");
+          continue;
+        }
+        img.addEventListener("load", () => {
+          if (renderGen !== state.mediaRenderGen) return;
+          markThumbState(img, "loaded");
+          snapBottomIfAnchored();
+        }, { once: true });
+        img.addEventListener("error", () => {
+          if (renderGen !== state.mediaRenderGen) return;
+          if (!img.dataset.authFallbackTried) {
+            img.dataset.authFallbackTried = "1";
+            loadThumbImgViaAuthFetch(img, renderGen, { priority: 0, allowRetry: false });
+          } else {
+            markThumbState(img, "error");
+          }
+        }, { once: true });
+      }
+    }
+  }
+
+  // =========================================================================
+  // 7.6 INSTANT BOTTOM-SNAP & BOTTOM-ANCHOR GUARD
+  // =========================================================================
+  function disarmBottomAnchor() {
+    state.bottomAnchorActive = false;
+    if (state.bottomAnchorTimer) {
+      clearTimeout(state.bottomAnchorTimer);
+      state.bottomAnchorTimer = null;
+    }
+  }
+
+  function activateBottomAnchorGuard(durationMs = 3000) {
+    disarmBottomAnchor();
+    state.bottomAnchorActive = true;
+    state.bottomAnchorTimer = setTimeout(() => {
+      state.bottomAnchorActive = false;
+      state.bottomAnchorTimer = null;
+    }, durationMs);
+  }
+
+  function scrollToBottomInstant() {
+    const el = $("chat-scroll");
+    if (!el) return;
+    state.programmaticScrollAt = Date.now();
+    el.style.scrollBehavior = "auto";
+    el.scrollTop = el.scrollHeight;
+    if (typeof el.scrollTo === "function") {
+      try {
+        el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
+      } catch (_) {
+        el.scrollTop = el.scrollHeight;
+      }
+    }
+    $("btn-scroll-bottom")?.classList.add("hidden");
+  }
+
+  function snapBottomIfAnchored() {
+    if (!state.bottomAnchorActive) return;
+    scrollToBottomInstant();
+    updateActiveTurnFromScroll();
+  }
+
+  function smoothScrollToPosition(el, targetTop) {
+    if (!el) return;
+    const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+    const clampedTarget = Math.max(0, Math.min(maxScroll, Math.round(targetTop)));
+    const delta = clampedTarget - el.scrollTop;
+    const MAX_SMOOTH_HOP = 2200;
+    const PRE_HOP_OFFSET = 460;
+    if (Math.abs(delta) > MAX_SMOOTH_HOP) {
+      // Pre-position instantaneously near destination so 80-turn jumps glide smoothly without multi-second blur
+      el.style.scrollBehavior = "auto";
+      el.scrollTop = delta > 0
+        ? Math.max(0, clampedTarget - PRE_HOP_OFFSET)
+        : Math.min(maxScroll, clampedTarget + PRE_HOP_OFFSET);
+    }
+    if (typeof el.scrollTo === "function") {
+      el.scrollTo({ top: clampedTarget, behavior: "smooth" });
+    } else {
+      el.scrollTop = clampedTarget;
+    }
+  }
+
+  function scrollToBottom(force = false, opts = {}) {
+    const { smooth = false } = opts || {};
     const el = $("chat-scroll");
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
-    if (force || nearBottom) {
-      requestAnimationFrame(() => {
-        el.scrollTop = el.scrollHeight;
-      });
+    if (!force && !nearBottom) return;
+    if (smooth) {
+      disarmBottomAnchor();
+      smoothScrollToPosition(el, el.scrollHeight);
+      return;
     }
+    scrollToBottomInstant();
+  }
+
+  // =========================================================================
+  // 7.7 CONVERSATION TURN GROUPING & EXPANDABLE TURN NAVIGATOR
+  // =========================================================================
+  const TURN_IMG_ICON_SVG = `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>`;
+
+  function fmtTurnTime(isoStr) {
+    if (!isoStr) return "";
+    try {
+      const d = new Date(isoStr);
+      if (isNaN(d.getTime())) return "";
+      const now = new Date();
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const sameDay =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+      if (sameDay) return `${hh}:${mm}`;
+      const mo = String(d.getMonth() + 1).padStart(2, "0");
+      const da = String(d.getDate()).padStart(2, "0");
+      return `${mo}-${da} ${hh}:${mm}`;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function makeTurnPreviewText(msg, turnIndex) {
+    const raw = String((msg && msg.text) || "")
+      .replace(/```[\s\S]*?```/g, " [代码] ")
+      .replace(/[#*_`>~]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const atts = Array.isArray(msg && msg.attachments) ? msg.attachments : [];
+    const imageCount = atts.filter((a) => a && a.is_image).length;
+    const fileCount = atts.filter((a) => a && !a.is_image).length;
+    let preview = raw;
+    if (!preview) {
+      if (imageCount > 0 && fileCount > 0) {
+        preview = `[图片 ×${imageCount} · 附件 ×${fileCount}]`;
+      } else if (imageCount > 0) {
+        preview = imageCount > 1 ? `[图片 ×${imageCount}]` : "[图片]";
+      } else if (fileCount > 0) {
+        preview = fileCount > 1 ? `[附件 ×${fileCount}]` : "[附件]";
+      } else {
+        preview = `第 ${turnIndex} 轮`;
+      }
+    } else if (preview.length > 96) {
+      preview = `${preview.slice(0, 96)}…`;
+    }
+    const attNames = atts.map((a) => (a && a.name ? String(a.name) : "")).join(" ");
+    return {
+      preview,
+      imageCount,
+      fileCount,
+      searchText: `${turnIndex} #${turnIndex} 第${turnIndex}轮 ${raw} ${preview} ${attNames}`.toLowerCase(),
+    };
+  }
+
+  function buildConversationTurns(messages) {
+    const turns = [];
+    const msgIndexToTurnIndex = new Map();
+    const list = Array.isArray(messages) ? messages : [];
+    for (let i = 0; i < list.length; i++) {
+      const msg = list[i];
+      if (!msg) continue;
+      if (msg.role === "user" || turns.length === 0) {
+        const turnIndex = turns.length + 1;
+        const meta = makeTurnPreviewText(msg, turnIndex);
+        turns.push({
+          index: turnIndex,
+          msgIndex: i,
+          role: msg.role === "user" ? "user" : "assistant",
+          preview: meta.preview,
+          imageCount: meta.imageCount,
+          fileCount: meta.fileCount,
+          time: msg.time || "",
+          timeLabel: fmtTurnTime(msg.time),
+          searchText: meta.searchText,
+        });
+        msgIndexToTurnIndex.set(i, turnIndex);
+      } else if (turns.length > 0 && !turns[turns.length - 1].time && msg.time) {
+        turns[turns.length - 1].time = msg.time;
+        turns[turns.length - 1].timeLabel = fmtTurnTime(msg.time);
+      }
+    }
+    return { turns, msgIndexToTurnIndex };
+  }
+
+  function updateTurnTriggerUi() {
+    const trigger = $("topbar-title-wrap");
+    const badge = $("turn-nav-badge");
+    const chevron = $("turn-nav-chevron");
+    const total = state.turns.length;
+    const enabled = total >= 1;
+
+    if (trigger) {
+      trigger.disabled = !enabled;
+      trigger.classList.toggle("turn-nav-ready", enabled);
+      trigger.classList.toggle("turn-nav-open", enabled && state.turnNavOpen);
+      trigger.setAttribute("aria-expanded", enabled && state.turnNavOpen ? "true" : "false");
+      trigger.title = enabled ? `共 ${total} 轮对话 · 点击展开轮次导航` : "";
+    }
+    if (badge) {
+      if (enabled) {
+        const cur = Math.min(total, Math.max(1, state.activeTurnIndex || total));
+        badge.textContent = `${cur}/${total}轮`;
+        badge.classList.remove("hidden");
+      } else {
+        badge.textContent = "";
+        badge.classList.add("hidden");
+      }
+    }
+    if (chevron) {
+      chevron.classList.toggle("hidden", !enabled);
+    }
+  }
+
+  function computeActiveTurnIndex() {
+    const anchors = state.turnAnchorEls;
+    const total = anchors.length;
+    if (!total) return 0;
+    const scrollEl = $("chat-scroll");
+    if (!scrollEl) return total;
+    const distToBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+    if (distToBottom <= 24) return total;
+
+    const anchorLineY = scrollEl.getBoundingClientRect().top + 84;
+    let lo = 0;
+    let hi = total - 1;
+    let best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const top = anchors[mid].getBoundingClientRect().top;
+      if (top <= anchorLineY) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return best + 1;
+  }
+
+  function updateActiveTurnFromScroll() {
+    const total = state.turns.length;
+    if (!total) return;
+    const nextActive = computeActiveTurnIndex();
+    if (nextActive && nextActive !== state.activeTurnIndex) {
+      state.activeTurnIndex = nextActive;
+      updateTurnTriggerUi();
+      if (state.turnNavOpen) {
+        syncTurnNavActiveHighlight();
+      }
+    }
+  }
+
+  function syncTurnNavActiveHighlight() {
+    const listEl = $("turn-nav-list");
+    if (!listEl) return;
+    const activeIdx = String(state.activeTurnIndex || state.turns.length);
+    listEl.querySelectorAll(".turn-nav-item").forEach((btn) => {
+      const isAct = btn.dataset.turnIndex === activeIdx;
+      btn.classList.toggle("active", isAct);
+      if (isAct) btn.setAttribute("aria-current", "true");
+      else btn.removeAttribute("aria-current");
+    });
+  }
+
+  function renderTurnNavList() {
+    const listEl = $("turn-nav-list");
+    const headingEl = $("turn-nav-heading");
+    const searchWrap = $("turn-nav-search-wrap");
+    if (!listEl) return;
+
+    const total = state.turns.length;
+    if (headingEl) {
+      headingEl.textContent = `对话轮次导航 · 共 ${total} 轮`;
+    }
+    if (searchWrap) {
+      searchWrap.classList.toggle("hidden", total < 8);
+    }
+
+    const q = String(state.turnNavFilter || "").trim().toLowerCase();
+    const filtered = q ? state.turns.filter((t) => t.searchText.includes(q)) : state.turns;
+
+    if (!filtered.length) {
+      listEl.innerHTML = `<div class="empty-placeholder">无匹配轮次</div>`;
+      return;
+    }
+
+    const activeIdx = state.activeTurnIndex || total;
+    listEl.innerHTML = filtered
+      .map((t) => {
+        const isAct = t.index === activeIdx;
+        const imgBadge = t.imageCount > 0
+          ? `<span class="turn-nav-att-badge" title="${t.imageCount} 张图片">${TURN_IMG_ICON_SVG}<span>${t.imageCount}</span></span>`
+          : "";
+        const fileBadge = t.fileCount > 0
+          ? `<span class="turn-nav-att-badge" title="${t.fileCount} 个文件">📎${t.fileCount}</span>`
+          : "";
+        const timeTag = t.timeLabel ? `<span class="turn-nav-time">${escHtml(t.timeLabel)}</span>` : "";
+        return `
+          <button class="turn-nav-item ${isAct ? "active" : ""}" type="button" role="listitem" data-turn-index="${t.index}"${isAct ? ' aria-current="true"' : ""}>
+            <span class="turn-nav-dot" aria-hidden="true"></span>
+            <span class="turn-nav-num">#${t.index}</span>
+            <span class="turn-nav-preview">${escHtml(t.preview)}</span>
+            <span class="turn-nav-meta">${imgBadge}${fileBadge}${timeTag}</span>
+          </button>`;
+      })
+      .join("");
+  }
+
+  function openTurnNavigator() {
+    if (state.turns.length < 1) return;
+    haptic("light");
+    closeAllSheets();
+    closeDrawer();
+    state.turnNavOpen = true;
+    state.turnNavFilter = "";
+    const searchInp = $("turn-nav-search");
+    if (searchInp) searchInp.value = "";
+    state.activeTurnIndex = computeActiveTurnIndex() || state.turns.length;
+    renderTurnNavList();
+    $("topbar")?.classList.add("turn-nav-active");
+    $("turn-nav-backdrop")?.classList.remove("hidden");
+    $("turn-nav-panel")?.classList.remove("hidden");
+    updateTurnTriggerUi();
+
+    requestAnimationFrame(() => {
+      const listEl = $("turn-nav-list");
+      const activeItem = listEl && listEl.querySelector(".turn-nav-item.active");
+      if (listEl && activeItem) {
+        const targetTop = activeItem.offsetTop - Math.max(0, (listEl.clientHeight - activeItem.offsetHeight) / 2);
+        listEl.scrollTop = Math.max(0, targetTop);
+      }
+    });
+  }
+
+  function closeTurnNavigator() {
+    if (!state.turnNavOpen) return;
+    state.turnNavOpen = false;
+    state.turnNavFilter = "";
+    $("topbar")?.classList.remove("turn-nav-active");
+    $("turn-nav-backdrop")?.classList.add("hidden");
+    $("turn-nav-panel")?.classList.add("hidden");
+    updateTurnTriggerUi();
+  }
+
+  function toggleTurnNavigator() {
+    if (state.turnNavOpen) {
+      closeTurnNavigator();
+    } else {
+      openTurnNavigator();
+    }
+  }
+
+  let _turnFlashTimer = null;
+  let _turnFlashEl = null;
+
+  function flashTurnElement(el) {
+    if (!el) return;
+    if (_turnFlashEl && _turnFlashEl !== el) {
+      _turnFlashEl.classList.remove("turn-jump-flash");
+    }
+    clearTimeout(_turnFlashTimer);
+    el.classList.remove("turn-jump-flash");
+    void el.offsetWidth;
+    el.classList.add("turn-jump-flash");
+    _turnFlashEl = el;
+    _turnFlashTimer = setTimeout(() => {
+      el.classList.remove("turn-jump-flash");
+      if (_turnFlashEl === el) _turnFlashEl = null;
+    }, 1300);
+  }
+
+  function jumpToTurn(turnIndex, opts = {}) {
+    const { smooth = true } = opts || {};
+    const idx = Number(turnIndex);
+    if (!Number.isFinite(idx) || idx < 1 || idx > state.turns.length) return;
+    disarmBottomAnchor();
+    closeTurnNavigator();
+    haptic("light");
+
+    const scrollEl = $("chat-scroll");
+    const targetEl = state.turnAnchorEls[idx - 1]
+      || document.querySelector(`#messages-list [data-turn-index="${idx}"]`);
+    if (!scrollEl || !targetEl) return;
+
+    const scRect = scrollEl.getBoundingClientRect();
+    const elRect = targetEl.getBoundingClientRect();
+    const topPadding = 14;
+    const targetTop = Math.max(0, scrollEl.scrollTop + (elRect.top - scRect.top) - topPadding);
+    if (smooth) {
+      smoothScrollToPosition(scrollEl, targetTop);
+    } else if (typeof scrollEl.scrollTo === "function") {
+      scrollEl.scrollTo({ top: targetTop, behavior: "instant" });
+    } else {
+      scrollEl.scrollTop = targetTop;
+    }
+
+    state.activeTurnIndex = idx;
+    updateTurnTriggerUi();
+    flashTurnElement(targetEl);
   }
 
   function assistantMarkSvg() {
@@ -1963,12 +2794,27 @@
     const conv = state.currentConv;
     const scrollEl = $("chat-scroll");
 
+    state.mediaRenderGen += 1;
+    const renderGen = state.mediaRenderGen;
+    abortPendingMediaQueue("messages");
+    if (mediaObserver) {
+      try {
+        mediaObserver.disconnect();
+      } catch (_) {}
+    }
+
     if (!conv || (!conv.messages.length && !state.streaming)) {
+      disarmBottomAnchor();
+      closeTurnNavigator();
+      state.turns = [];
+      state.turnAnchorEls = [];
+      state.activeTurnIndex = 0;
       state.lastRenderedConvFp = "";
       $("empty-state").classList.remove("hidden");
       list.innerHTML = "";
       $("deliverables-box").classList.add("hidden");
       $("conv-title").textContent = "Antigravity";
+      updateTurnTriggerUi();
       updateHostDisplays();
       updateSidecarHeaderActions();
       updateSendButton();
@@ -1980,17 +2826,35 @@
     const wasNearBottom = scrollEl
       ? (scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 120)
       : true;
+    const isInitialBottomSnap = !preserveScroll;
+
+    if (isInitialBottomSnap && scrollEl) {
+      scrollEl.classList.add("chat-initial-snap");
+    }
 
     $("empty-state").classList.add("hidden");
     $("conv-title").textContent = conv.title || "新对话";
-    list.innerHTML = "";
 
-    for (const msg of conv.messages) {
+    const host = getActiveHost();
+    const { turns, msgIndexToTurnIndex } = buildConversationTurns(conv.messages);
+    state.turns = turns;
+    const anchorEls = new Array(turns.length);
+    const totalMsgs = conv.messages.length;
+    const eagerMsgThreshold = Math.max(0, totalMsgs - 8);
+    const frag = document.createDocumentFragment();
+
+    for (let idx = 0; idx < totalMsgs; idx++) {
+      const msg = conv.messages[idx];
       const row = document.createElement("div");
       row.className = `msg-row ${msg.role}`;
 
+      const turnNum = msgIndexToTurnIndex.get(idx);
+      if (turnNum !== undefined) {
+        row.dataset.turnIndex = String(turnNum);
+        anchorEls[turnNum - 1] = row;
+      }
+
       if (msg.role === "user") {
-        const host = getActiveHost();
         const atts = Array.isArray(msg.attachments) ? msg.attachments : [];
         let attsHtml = "";
         if (atts.length) {
@@ -2000,12 +2864,25 @@
           if (imgs.length) {
             const imgCards = imgs
               .map((a) => {
-                const rawSrcUrl = host
-                  ? `${getApiBase(host)}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path)}`}&token=${encodeURIComponent(host.token)}`
-                  : "";
-                const srcUrl = rawSrcUrl ? withSidecarToken(rawSrcUrl) : "";
-                return `<button class="msg-img-thumb msg-att-btn" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "image")}" aria-label="查看原图 ${escHtml(a.name || "")}">` +
-                  `<img src="${escHtml(srcUrl)}" alt="${escHtml(a.name || "")}" loading="lazy" />` +
+                const apiPath = buildPreviewApiPath(a.preview_url, a.path);
+                const cacheKey = makeMediaCacheKey(host, apiPath);
+                const cached = host ? authMediaCache.get(cacheKey) : null;
+                let imgAttr = "";
+                let thumbStateCls = "img-loading";
+                if (SIDECAR) {
+                  if (cached) {
+                    imgAttr = `src="${escHtml(cached.dataUrl || cached.blobUrl)}" data-media-loaded="1"`;
+                    thumbStateCls = "img-loaded";
+                  }
+                } else {
+                  const directUrl = buildDirectMediaUrl(host, apiPath);
+                  const loadingAttr = idx >= eagerMsgThreshold ? "eager" : "lazy";
+                  imgAttr = directUrl ? `src="${escHtml(directUrl)}" loading="${loadingAttr}"` : "";
+                  thumbStateCls = directUrl ? "img-loading" : "img-error";
+                }
+                return `<button class="msg-img-thumb msg-att-btn ${thumbStateCls}" type="button" data-path="${escHtml(a.path)}" data-name="${escHtml(a.name || "image")}" data-media-path="${escHtml(apiPath)}" aria-label="查看原图 ${escHtml(a.name || "")}">` +
+                  `<img ${imgAttr} data-media-path="${escHtml(apiPath)}" data-media-key="${escHtml(cacheKey)}" alt="${escHtml(a.name || "")}" decoding="async" />` +
+                  `<span class="msg-img-retry" aria-hidden="true">加载失败<br/>点击重试</span>` +
                 `</button>`;
               })
               .join("");
@@ -2077,8 +2954,12 @@
             }
           </div>`;
       }
-      list.appendChild(row);
+      frag.appendChild(row);
     }
+
+    list.innerHTML = "";
+    list.appendChild(frag);
+    state.turnAnchorEls = anchorEls.filter(Boolean);
 
     if (state.streaming) {
       const sRow = document.createElement("div");
@@ -2114,16 +2995,38 @@
     state.lastRenderedConvFp = computeConvFingerprint(conv, state.streaming);
     updateSidecarHeaderActions();
     updateSendButton();
-    if (!preserveScroll || wasNearBottom) {
-      scrollToBottom(true);
-    } else if (scrollEl) {
-      scrollEl.scrollTop = prevScrollTop;
+
+    if (isInitialBottomSnap || wasNearBottom) {
+      if (scrollEl) {
+        void scrollEl.offsetHeight;
+      }
+      scrollToBottomInstant();
+      if (isInitialBottomSnap && scrollEl) {
+        scrollEl.classList.remove("chat-initial-snap");
+      }
+      state.activeTurnIndex = state.turns.length;
+      updateTurnTriggerUi();
+      activateBottomAnchorGuard(3000);
       requestAnimationFrame(() => {
-        scrollEl.scrollTop = prevScrollTop;
-        const away = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight > 220;
-        $("btn-scroll-bottom").classList.toggle("hidden", !away);
+        if (renderGen === state.mediaRenderGen) {
+          snapBottomIfAnchored();
+        }
       });
+    } else if (scrollEl) {
+      scrollEl.style.scrollBehavior = "auto";
+      scrollEl.scrollTop = prevScrollTop;
+      const away = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight > 220;
+      $("btn-scroll-bottom")?.classList.toggle("hidden", !away);
+      state.activeTurnIndex = computeActiveTurnIndex() || state.turns.length;
+      updateTurnTriggerUi();
     }
+
+    if (state.turnNavOpen) {
+      renderTurnNavList();
+    }
+
+    // Hydrate images AFTER bottom-snap so IntersectionObserver sees the real final viewport immediately
+    hydrateMessageImages(list, renderGen);
   }
 
   function updateStreamingRow() {
@@ -2355,6 +3258,7 @@
     const prevKey = currentDraftKey();
     const switching = cid !== state.currentCid;
     if (switching) {
+      closeTurnNavigator();
       saveCurrentDraft(prevKey);
       state.currentCid = cid;
       state.lastRenderedConvFp = "";
@@ -2432,6 +3336,7 @@
     haptic("light");
     state.sidecarUserPicked = true;
     const prevKey = currentDraftKey();
+    closeTurnNavigator();
     closeDrawer();
     if (prevKey !== NEW_DRAFT_KEY) {
       saveCurrentDraft(prevKey);
@@ -2592,13 +3497,19 @@
     tray.classList.remove("hidden");
     tray.innerHTML = state.attachments
       .map((a, idx) => {
-        const rawThumb =
-          a.is_image && host
-            ? `${getApiBase(host)}${a.preview_url || `/api/files/preview?path=${encodeURIComponent(a.path || "")}`}&token=${encodeURIComponent(host.token)}`
-            : "";
-        const imgTag = rawThumb
-          ? `<img src="${escHtml(withSidecarToken(rawThumb))}" alt="" />`
-          : "";
+        let imgTag = "";
+        if (a.is_image && host && (a.preview_url || a.path)) {
+          const apiPath = buildPreviewApiPath(a.preview_url, a.path);
+          const cacheKey = makeMediaCacheKey(host, apiPath);
+          if (SIDECAR) {
+            const cached = touchAuthMediaEntry(cacheKey);
+            const srcAttr = cached ? `src="${escHtml(cached.dataUrl || cached.blobUrl)}" data-media-loaded="1"` : "";
+            imgTag = `<img ${srcAttr} data-media-path="${escHtml(apiPath)}" data-media-key="${escHtml(cacheKey)}" alt="" />`;
+          } else {
+            const directUrl = buildDirectMediaUrl(host, apiPath);
+            imgTag = directUrl ? `<img src="${escHtml(directUrl)}" data-media-path="${escHtml(apiPath)}" alt="" />` : "";
+          }
+        }
         return `
           <div class="attach-chip">
             ${imgTag}
@@ -2607,6 +3518,13 @@
           </div>`;
       })
       .join("");
+    if (SIDECAR && host) {
+      tray.querySelectorAll("img[data-media-path]").forEach((img) => {
+        if (img.dataset.mediaLoaded !== "1") {
+          loadThumbImgViaAuthFetch(img, undefined, { priority: 0, scope: "standalone" });
+        }
+      });
+    }
     updateSendButton();
   }
 
@@ -2679,6 +3597,7 @@
 
   function openModelSheet() {
     haptic("light");
+    closeTurnNavigator();
     const body = $("model-groups");
     body.innerHTML =
       state.models
@@ -2732,6 +3651,7 @@
 
   function openHostSheet() {
     haptic("light");
+    closeTurnNavigator();
     renderHostSheetList();
     $("model-sheet").classList.add("hidden");
     $("attach-sheet")?.classList.add("hidden");
@@ -2843,6 +3763,7 @@
 
   function openAttachSheet() {
     haptic("light");
+    closeTurnNavigator();
     if (!window.AndroidBridge?.getRecentPhotosJson) {
       $("file-input")?.click();
       return;
@@ -2939,36 +3860,104 @@
     }
   }
 
+  let _previewLoadSeq = 0;
+
   async function openFilePreview(path, name) {
     const host = getActiveHost();
     if (!host) return;
+    closeTurnNavigator();
+    const previewSeq = ++_previewLoadSeq;
     state.previewFile = { path, name };
     $("preview-name").textContent = name || path.split("/").pop();
     $("preview-meta").textContent = path;
-    $("preview-body").innerHTML = `<div class="empty-placeholder">正在加载预览...</div>`;
+    const bodyEl = $("preview-body");
+    bodyEl.innerHTML = `<div class="empty-placeholder">正在加载预览...</div>`;
     $("preview-modal").classList.remove("hidden");
 
     const ext = (path.split(".").pop() || "").toLowerCase();
     if (["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext)) {
-      const imgUrl = withSidecarToken(
-        `${getApiBase(host)}/api/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(host.token)}`
-      );
-      $("preview-body").innerHTML = `<img src="${escHtml(imgUrl)}" alt="${escHtml(name || "")}" />`;
+      const apiPath = buildPreviewApiPath("", path);
+      const renderPreviewError = (errMsg) => {
+        if (previewSeq !== _previewLoadSeq) return;
+        bodyEl.innerHTML = `
+          <div class="m3-card preview-img-error">
+            <p class="info-text">图片预览加载失败${errMsg ? `（${escHtml(errMsg)}）` : ""}</p>
+            <button id="btn-preview-retry" class="m3-btn tonal sm" type="button">重新加载图片</button>
+          </div>`;
+        $("btn-preview-retry")?.addEventListener("click", () => {
+          openFilePreview(path, name);
+        }, { once: true });
+      };
+
+      const mountBlobImage = async (forceReload = false) => {
+        try {
+          const entry = await fetchAuthMediaEntry(apiPath, host, { priority: 0, forceReload, scope: "standalone" });
+          if (previewSeq !== _previewLoadSeq) return;
+          const img = document.createElement("img");
+          img.alt = name || "";
+          img.decoding = "async";
+          img.dataset.mediaKey = makeMediaCacheKey(host, apiPath);
+          img.onerror = async () => {
+            if (previewSeq !== _previewLoadSeq) return;
+            if (!img.dataset.dataUrlFallback && entry.blob && entry.blob.size <= 10 * 1024 * 1024) {
+              img.dataset.dataUrlFallback = "1";
+              try {
+                if (!entry.dataUrl) entry.dataUrl = await blobToDataUrl(entry.blob);
+                if (entry.dataUrl && previewSeq === _previewLoadSeq) {
+                  img.src = entry.dataUrl;
+                  return;
+                }
+              } catch (_) {}
+            }
+            renderPreviewError("解码异常");
+          };
+          img.src = entry.dataUrl || entry.blobUrl;
+          bodyEl.innerHTML = "";
+          bodyEl.appendChild(img);
+        } catch (err) {
+          if (previewSeq !== _previewLoadSeq || $("preview-modal")?.classList.contains("hidden")) return;
+          renderPreviewError(err && err.name === "AbortError" ? "请求超时或已取消" : (err ? err.message : ""));
+        }
+      };
+
+      if (SIDECAR) {
+        await mountBlobImage(false);
+        return;
+      }
+
+      const directUrl = buildDirectMediaUrl(host, apiPath);
+      const img = document.createElement("img");
+      img.alt = name || "";
+      img.decoding = "async";
+      img.onerror = () => {
+        if (previewSeq !== _previewLoadSeq) return;
+        if (!img.dataset.authFallbackTried) {
+          img.dataset.authFallbackTried = "1";
+          mountBlobImage(true);
+        } else {
+          renderPreviewError("网络异常");
+        }
+      };
+      img.src = directUrl;
+      bodyEl.innerHTML = "";
+      bodyEl.appendChild(img);
       return;
     }
 
     try {
       const data = await apiFetch(`/api/files/preview?path=${encodeURIComponent(path)}`);
+      if (previewSeq !== _previewLoadSeq) return;
       if (typeof Response !== "undefined" && data instanceof Response) {
         const txt = await data.text();
-        $("preview-body").innerHTML = `<pre>${escHtml(txt.slice(0, 65536) || "(空文件)")}</pre>`;
+        bodyEl.innerHTML = `<pre>${escHtml(txt.slice(0, 65536) || "(空文件)")}</pre>`;
       } else if (data.binary) {
-        $("preview-body").innerHTML = `<div class="m3-card"><p class="info-text">该文件为二进制格式（${formatSize(data.size)}），请点击右上角「下载」保存到手机查看。</p></div>`;
+        bodyEl.innerHTML = `<div class="m3-card"><p class="info-text">该文件为二进制格式（${formatSize(data.size)}），请点击右上角「下载」保存到手机查看。</p></div>`;
       } else {
-        $("preview-body").innerHTML = `<pre>${escHtml(data.content || "(空文件)")}</pre>`;
+        bodyEl.innerHTML = `<pre>${escHtml(data.content || "(空文件)")}</pre>`;
       }
     } catch (e) {
-      $("preview-body").innerHTML = `<div class="m3-card"><p class="info-text">预览失败：${escHtml(e.message)}</p></div>`;
+      if (previewSeq !== _previewLoadSeq) return;
+      bodyEl.innerHTML = `<div class="m3-card"><p class="info-text">预览失败：${escHtml(e.message)}</p></div>`;
     }
   }
 
@@ -3029,6 +4018,34 @@
         return;
       } catch (_) {}
     }
+    if (SIDECAR) {
+      const dlApiPath = `/api/files/download?path=${encodeURIComponent(path)}`;
+      fetch(dlApiPath, {
+        method: "GET",
+        headers: host.token ? { Authorization: `Bearer ${host.token}` } : {},
+      })
+        .then((resp) => {
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          return resp.blob();
+        })
+        .then((blob) => {
+          const blobUrl = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = blobUrl;
+          a.download = filename;
+          a.style.display = "none";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => {
+            try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+          }, 60000);
+        })
+        .catch(() => {
+          window.open(url, "_blank", "noopener");
+        });
+      return;
+    }
     window.open(url, "_blank", "noopener");
   }
 
@@ -3054,6 +4071,7 @@
   }
 
   function openUsageModal() {
+    closeTurnNavigator();
     closeDrawer();
     $("settings-modal")?.classList.add("hidden");
     $("usage-modal")?.classList.remove("hidden");
@@ -3381,6 +4399,7 @@
   }
 
   function openSettingsModal() {
+    closeTurnNavigator();
     closeDrawer();
     closeAllSheets();
     renderSettingsHosts();
@@ -3397,6 +4416,7 @@
   // =========================================================================
   function openDrawer() {
     haptic("light");
+    closeTurnNavigator();
     updateHostDisplays();
     $("drawer-backdrop").classList.remove("hidden");
     $("drawer").classList.add("open");
@@ -3469,6 +4489,7 @@
     $("btn-new-chat").addEventListener("click", startNewChat);
 
     $("sidecar-follow-btn")?.addEventListener("click", () => {
+      closeTurnNavigator();
       if (!SIDECAR) return;
       const hostCid = getSidecarConversationId();
       if (!hostCid) return;
@@ -3701,6 +4722,16 @@
 
       const attBtn = e.target.closest(".msg-att-btn");
       if (attBtn) {
+        if (attBtn.classList.contains("msg-img-thumb") && attBtn.classList.contains("img-error")) {
+          const img = attBtn.querySelector("img[data-media-path]");
+          if (img) {
+            haptic("light");
+            img.dataset.dataUrlFallback = "";
+            img.dataset.mediaLoaded = "0";
+            loadThumbImgViaAuthFetch(img, state.mediaRenderGen, { priority: 0, allowRetry: false, forceReload: true });
+            return;
+          }
+        }
         const fp = attBtn.dataset.path;
         if (fp) openFilePreview(fp, attBtn.dataset.name || fp.split("/").pop());
         return;
@@ -3719,14 +4750,76 @@
       if (chip) openFilePreview(chip.dataset.path, chip.dataset.name);
     });
 
-    // --- Scroll State & Scroll FAB ---
-    $("chat-scroll").addEventListener("scroll", () => {
-      const el = $("chat-scroll");
-      $("topbar").classList.toggle("scrolled", el.scrollTop > 6);
-      const away = el.scrollHeight - el.scrollTop - el.clientHeight > 220;
-      $("btn-scroll-bottom").classList.toggle("hidden", !away);
+    // --- Expandable Turn Navigator Events ---
+    $("topbar-title-wrap")?.addEventListener("click", () => {
+      if (state.turns.length < 1) return;
+      toggleTurnNavigator();
     });
-    $("btn-scroll-bottom").addEventListener("click", () => scrollToBottom(true));
+    $("turn-nav-backdrop")?.addEventListener("click", closeTurnNavigator);
+    $("btn-turn-first")?.addEventListener("click", () => {
+      if (state.turns.length >= 1) jumpToTurn(1, { smooth: true });
+    });
+    $("btn-turn-latest")?.addEventListener("click", () => {
+      if (state.turns.length < 1) return;
+      disarmBottomAnchor();
+      closeTurnNavigator();
+      haptic("light");
+      scrollToBottom(true, { smooth: true });
+      state.activeTurnIndex = state.turns.length;
+      updateTurnTriggerUi();
+      const lastEl = state.turnAnchorEls[state.turnAnchorEls.length - 1];
+      if (lastEl) flashTurnElement(lastEl);
+    });
+    $("turn-nav-search")?.addEventListener("input", (e) => {
+      state.turnNavFilter = e.target.value || "";
+      renderTurnNavList();
+    });
+    $("turn-nav-list")?.addEventListener("click", (e) => {
+      const item = e.target.closest(".turn-nav-item[data-turn-index]");
+      if (!item) return;
+      const idx = Number(item.dataset.turnIndex);
+      if (idx >= 1) jumpToTurn(idx, { smooth: true });
+    });
+
+    // --- Scroll State, Active Turn Tracking, Bottom-Anchor Guard & Scroll FAB ---
+    const chatScrollEl = $("chat-scroll");
+    let scrollRafId = 0;
+    chatScrollEl.addEventListener("wheel", (e) => {
+      if (e.deltaY < 0) disarmBottomAnchor();
+    }, { passive: true });
+    chatScrollEl.addEventListener("touchstart", () => {
+      disarmBottomAnchor();
+    }, { passive: true });
+    chatScrollEl.addEventListener("pointerdown", (e) => {
+      if (e.pointerType === "mouse" || e.pointerType === "touch") {
+        disarmBottomAnchor();
+      }
+    }, { passive: true });
+    chatScrollEl.addEventListener("scroll", () => {
+      const distFromBottom = chatScrollEl.scrollHeight - chatScrollEl.scrollTop - chatScrollEl.clientHeight;
+      if (state.bottomAnchorActive && distFromBottom > 100 && Date.now() - state.programmaticScrollAt > 90) {
+        disarmBottomAnchor();
+      }
+      if (scrollRafId) return;
+      scrollRafId = requestAnimationFrame(() => {
+        scrollRafId = 0;
+        $("topbar").classList.toggle("scrolled", chatScrollEl.scrollTop > 6);
+        const away = chatScrollEl.scrollHeight - chatScrollEl.scrollTop - chatScrollEl.clientHeight > 220;
+        $("btn-scroll-bottom").classList.toggle("hidden", !away);
+        updateActiveTurnFromScroll();
+      });
+    }, { passive: true });
+    $("btn-scroll-bottom").addEventListener("click", () => scrollToBottom(true, { smooth: true }));
+
+    // Keep viewport pinned to bottom during initial-open async image/layout height growth
+    if (typeof ResizeObserver === "function") {
+      const msgListEl = $("messages-list");
+      if (msgListEl) {
+        new ResizeObserver(() => {
+          snapBottomIfAnchored();
+        }).observe(msgListEl);
+      }
+    }
 
     // --- Unified Drawer Settings Entry & In-App Desktop Phone Pairing ---
     function getPairUrl(withBust = true) {
@@ -3735,6 +4828,7 @@
       return withSidecarToken(`${location.origin}${suffix}`);
     }
     function openPairModal() {
+      closeTurnNavigator();
       closeDrawer();
       const modal = $("pair-modal");
       const iframe = $("pair-iframe");
@@ -3762,6 +4856,12 @@
       window.open(extUrl, "_blank", "noopener");
     });
     document.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") {
+        const tag = (e.target && e.target.tagName) || "";
+        if (tag !== "INPUT" && tag !== "TEXTAREA") {
+          disarmBottomAnchor();
+        }
+      }
       if (e.key === "Escape") {
         const confirmDlg = $("pair-confirm-dialog");
         if (confirmDlg && !confirmDlg.classList.contains("hidden")) {
@@ -3776,6 +4876,11 @@
             e.preventDefault();
             return;
           }
+        }
+        if (state.turnNavOpen) {
+          closeTurnNavigator();
+          e.preventDefault();
+          return;
         }
       }
     });
