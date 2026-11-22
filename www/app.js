@@ -858,6 +858,12 @@
     state.reconnectTimer = null;
     clearTimeout(_refreshConvsTimer);
     _refreshConvsTimer = null;
+    if (state.sseAbort) {
+      try {
+        state.sseAbort.abort();
+      } catch (_) {}
+      state.sseAbort = null;
+    }
     if (state.ws) {
       try {
         state.ws.onopen = null;
@@ -1022,7 +1028,78 @@
     updateSidecarHeaderActions();
     renderConversation();
     renderConvList();
+    // Kick off HTTP bootstrap immediately so sidebar/models populate even while stream connects
+    fetchServerInfo();
+    refreshConversations();
+    loadModels();
     connectWs();
+  }
+
+  async function connectSidecarSse(host, epoch) {
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    state.sseAbort = ctrl;
+    setConnState("connecting", `正在连接 ${host.name}...`);
+    try {
+      const resp = await fetch(`${host.url}/__sidecar/events`, {
+        method: "GET",
+        cache: "no-store",
+        headers: {
+          Authorization: `Bearer ${host.token}`,
+          Accept: "text/event-stream",
+        },
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      if (epoch !== state.connectEpoch) return;
+      if (!resp.ok || !resp.body || typeof resp.body.getReader !== "function") {
+        throw new Error(`SSE HTTP ${resp.status}`);
+      }
+
+      state.wsConnected = true;
+      updateHostDisplays();
+      updateSendButton();
+      fetchServerInfo();
+      refreshConversations();
+      loadModels();
+      if (state.currentCid && !state.streaming) {
+        openConversation(state.currentCid, { silent: true });
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buf = "";
+      while (epoch === state.connectEpoch) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (epoch !== state.connectEpoch) break;
+        buf += decoder.decode(value, { stream: true });
+        let splitIdx = buf.indexOf("\n\n");
+        while (splitIdx !== -1) {
+          const frame = buf.slice(0, splitIdx);
+          buf = buf.slice(splitIdx + 2);
+          for (const rawLine of frame.split(/\r?\n/)) {
+            if (!rawLine.startsWith("data:")) continue;
+            const payload = rawLine.slice(5).trim();
+            if (!payload) continue;
+            try {
+              onWsEvent(JSON.parse(payload));
+            } catch (_) {}
+          }
+          splitIdx = buf.indexOf("\n\n");
+        }
+      }
+    } catch (_) {
+      // Fall through to clean disconnect/reconnect below
+    } finally {
+      if (state.sseAbort === ctrl) state.sseAbort = null;
+      if (epoch === state.connectEpoch) {
+        state.wsConnected = false;
+        updateHostDisplays();
+        updateSendButton();
+        if (getActiveHost()) {
+          state.reconnectTimer = setTimeout(connectWs, 2500);
+        }
+      }
+    }
   }
 
   function connectWs() {
@@ -1034,6 +1111,11 @@
     }
 
     const epoch = state.connectEpoch;
+    if (SIDECAR) {
+      connectSidecarSse(host, epoch);
+      return;
+    }
+
     const wsUrl = host.url.replace(/^http/i, "ws") + `/ws?token=${encodeURIComponent(host.token)}`;
     setConnState("connecting", `正在连接 ${host.name}...`);
 

@@ -32,6 +32,7 @@ const SAFE_STATIC_PATHS = new Set([
 const HEADER_ONLY_AUTH_PATHS = new Set([
   '/api/local-auth',
   '/__sidecar/start-server',
+  '/__sidecar/events',
 ]);
 
 const STRIP_REQ_HEADER_EXACT = new Set([
@@ -634,6 +635,228 @@ function proxyStreamingHttp(req, res, upstreamPath) {
   req.pipe(upReq);
 }
 
+function buildMaskedClientWsFrame(opcode, payloadBuf) {
+  const payload = Buffer.isBuffer(payloadBuf) ? payloadBuf : Buffer.from(payloadBuf || '');
+  const len = payload.length;
+  const mask = crypto.randomBytes(4);
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(6);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 0x80 | len;
+    mask.copy(header, 2);
+  } else if (len < 65536) {
+    header = Buffer.alloc(8);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(len, 2);
+    mask.copy(header, 4);
+  } else {
+    header = Buffer.alloc(14);
+    header[0] = 0x80 | (opcode & 0x0f);
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+    mask.copy(header, 10);
+  }
+  const masked = Buffer.allocUnsafe(len);
+  for (let i = 0; i < len; i += 1) {
+    masked[i] = payload[i] ^ mask[i & 3];
+  }
+  return Buffer.concat([header, masked]);
+}
+
+function bridgeUpstreamWsToSse(req, res, urlObj) {
+  const authHdr = String(req.headers.authorization || '').trim();
+  const bearerFromHdr = authHdr.toLowerCase().startsWith('bearer ') ? authHdr.slice(7).trim() : '';
+  const bearerToken = bearerFromHdr || String(urlObj.searchParams.get('token') || '').trim();
+  if (!bearerToken) {
+    sendJson(res, 401, { ok: false, error: 'Missing upstream bearer token' });
+    return;
+  }
+
+  const wsKey = crypto.randomBytes(16).toString('base64');
+  const upstreamPath = `/ws?token=${encodeURIComponent(bearerToken)}`;
+  const handshake =
+    `GET ${upstreamPath} HTTP/1.1\r\n` +
+    `Host: ${UPSTREAM_HOST}:${UPSTREAM_PORT}\r\n` +
+    `Upgrade: websocket\r\n` +
+    `Connection: Upgrade\r\n` +
+    `Sec-WebSocket-Key: ${wsKey}\r\n` +
+    `Sec-WebSocket-Version: 13\r\n\r\n`;
+
+  const upstream = net.connect({ host: UPSTREAM_HOST, port: UPSTREAM_PORT });
+  let handshakeDone = false;
+  let sseStarted = false;
+  let closed = false;
+  let rxBuf = Buffer.alloc(0);
+  let fragOpcode = 0;
+  let fragChunks = [];
+  let keepaliveTimer = null;
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+    if (!upstream.destroyed) upstream.destroy();
+    if (sseStarted && !res.writableEnded) {
+      try { res.end(); } catch {}
+    }
+  };
+
+  const emitSseText = (text) => {
+    if (closed || !sseStarted || res.writableEnded) return;
+    const singleLine = String(text || '').replace(/\r?\n/g, ' ');
+    try {
+      res.write(`data: ${singleLine}\n\n`);
+    } catch {
+      cleanup();
+    }
+  };
+
+  const drainWsFrames = () => {
+    while (!closed && rxBuf.length >= 2) {
+      const b0 = rxBuf[0];
+      const b1 = rxBuf[1];
+      const fin = Boolean(b0 & 0x80);
+      const opcode = b0 & 0x0f;
+      const masked = Boolean(b1 & 0x80);
+      let payloadLen = b1 & 0x7f;
+      let offset = 2;
+
+      if (payloadLen === 126) {
+        if (rxBuf.length < 4) return;
+        payloadLen = rxBuf.readUInt16BE(2);
+        offset = 4;
+      } else if (payloadLen === 127) {
+        if (rxBuf.length < 10) return;
+        const bigLen = rxBuf.readBigUInt64BE(2);
+        if (bigLen > 16n * 1024n * 1024n) {
+          cleanup();
+          return;
+        }
+        payloadLen = Number(bigLen);
+        offset = 10;
+      }
+
+      const maskLen = masked ? 4 : 0;
+      if (rxBuf.length < offset + maskLen + payloadLen) return;
+
+      let payload = rxBuf.subarray(offset + maskLen, offset + maskLen + payloadLen);
+      if (masked) {
+        const maskKey = rxBuf.subarray(offset, offset + 4);
+        const unmasked = Buffer.allocUnsafe(payloadLen);
+        for (let i = 0; i < payloadLen; i += 1) {
+          unmasked[i] = payload[i] ^ maskKey[i & 3];
+        }
+        payload = unmasked;
+      } else {
+        payload = Buffer.from(payload);
+      }
+
+      rxBuf = rxBuf.subarray(offset + maskLen + payloadLen);
+
+      if (opcode === 0x8) {
+        cleanup();
+        return;
+      }
+      if (opcode === 0x9) {
+        // Respond to server Ping with masked Pong
+        try {
+          upstream.write(buildMaskedClientWsFrame(0xA, payload));
+        } catch {
+          cleanup();
+        }
+        continue;
+      }
+      if (opcode === 0xA) {
+        continue;
+      }
+
+      if (opcode === 0x1 || opcode === 0x2) {
+        if (fin) {
+          if (opcode === 0x1) emitSseText(payload.toString('utf8'));
+        } else {
+          fragOpcode = opcode;
+          fragChunks = [payload];
+        }
+      } else if (opcode === 0x0 && fragOpcode) {
+        fragChunks.push(payload);
+        if (fin) {
+          if (fragOpcode === 0x1) {
+            emitSseText(Buffer.concat(fragChunks).toString('utf8'));
+          }
+          fragOpcode = 0;
+          fragChunks = [];
+        }
+      }
+    }
+  };
+
+  upstream.on('connect', () => {
+    upstream.write(handshake);
+  });
+
+  upstream.on('data', (chunk) => {
+    if (closed) return;
+    rxBuf = rxBuf.length ? Buffer.concat([rxBuf, chunk]) : Buffer.from(chunk);
+    if (!handshakeDone) {
+      const sepIdx = rxBuf.indexOf('\r\n\r\n');
+      if (sepIdx === -1) {
+        if (rxBuf.length > 16384) {
+          if (!res.headersSent) sendJson(res, 502, { ok: false, error: 'Malformed upstream WS handshake' });
+          cleanup();
+        }
+        return;
+      }
+      const headText = rxBuf.subarray(0, sepIdx).toString('latin1');
+      const statusLine = headText.split('\r\n')[0] || '';
+      const statusMatch = /^HTTP\/1\.\d\s+(\d{3})/.exec(statusLine);
+      const upStatus = statusMatch ? Number(statusMatch[1]) : 502;
+      rxBuf = rxBuf.subarray(sepIdx + 4);
+      handshakeDone = true;
+
+      if (upStatus !== 101) {
+        if (!res.headersSent) {
+          sendJson(res, upStatus === 401 ? 401 : 502, { ok: false, error: `Upstream WS rejected (${upStatus})` });
+        }
+        cleanup();
+        return;
+      }
+
+      sseStarted = true;
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store, no-transform',
+        'connection': 'keep-alive',
+        'x-accel-buffering': 'no',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
+      });
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      res.write(': connected\n\n');
+      keepaliveTimer = setInterval(() => {
+        if (!closed && sseStarted && !res.writableEnded) {
+          try { res.write(': keepalive\n\n'); } catch { cleanup(); }
+        }
+      }, 15000);
+    }
+    drainWsFrames();
+  });
+
+  upstream.on('error', () => {
+    if (!res.headersSent) {
+      sendJson(res, 502, { ok: false, error: 'Upstream Link Server WS unavailable' });
+    }
+    cleanup();
+  });
+  upstream.on('close', cleanup);
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+}
+
 function buildUpstreamPath(urlObj, stripAllQuery = false) {
   if (stripAllQuery) {
     return urlObj.pathname;
@@ -763,6 +986,15 @@ const server = http.createServer(async (req, res) => {
       }
       const result = await startLocalLinkServer();
       sendJson(res, result.statusCode, result.body);
+      return;
+    }
+
+    if (pathname === '/__sidecar/events') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { ok: false, error: 'Method Not Allowed' });
+        return;
+      }
+      bridgeUpstreamWsToSse(req, res, urlObj);
       return;
     }
 
