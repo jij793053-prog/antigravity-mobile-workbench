@@ -5877,3 +5877,478 @@ body.agy-sidecar-auxpane .swarm-topbar-pill {
   background: var(--md-primary-container);
   color: var(--md-on-primary-container);
 }
+
+/* ==========================================================================
+   v1.7.1: Top QR Action, Clickable Swarm Link, Error Retry Card,
+   User Copy/Revert Footer & Modal, Usage Calendar + All-Time Summary
+   ========================================================================== */
+
+#btn-settings-qr-scan.m3-card {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  border-color: rgba(11, 87, 208, 0.28);
+  transition: transform 140ms var(--md-motion), background-color 140ms var(--md-motion), border-color 140ms var(--md-motion);
+}
+[data-theme="dark"] #btn-settings-qr-scan.m3-card {
+  border-color: rgba(168, 199, 250, 0.28);
+}
+#btn-settings-qr-scan.m3-card:hover {
+  background: var(--md-surface);
+  border-color: var(--md-primary);
+}
+#btn-settings-qr-scan.m3-card:active {
+  transform: scale(0.99);
+}
+
+/* Clickable Swarm UI Link inside Assistant Markdown */
+.md-swarm-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 2px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(217, 119, 6, 0.38);
+  background: rgba(251, 191, 36, 0.14);
+  color: var(--md-warn);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+  vertical-align: middle;
+  transition: background-color 140ms var(--md-motion), border-color 140ms var(--md-motion), transform 120ms var(--md-motion);
+}
+[data-theme="dark"] .md-swarm-link {
+  border-color: rgba(251, 191, 36, 0.36);
+  background: rgba(251, 191, 36, 0.12);
+  color: #FCD34D;
+}
+.md-swarm-link:hover {
+  background: rgba(251, 191, 36, 0.24);
+  border-color: rgba(245, 158, 11, 0.6);
+}
+.md-swarm-link:active {
+  transform: scale(0.97);
+}
+.md-swarm-link-ic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+/* Persistent Structured Failure Card + Retry / Switch Model */
+.msg-row.error-row {
+  justify-content: flex-start;
+  padding-top: 2px;
+}
+.msg-error-card {
+  width: 100%;
+  max-width: 100%;
+  border-radius: 16px;
+  border: 1px solid rgba(179, 38, 30, 0.30);
+  background: rgba(179, 38, 30, 0.06);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+[data-theme="dark"] .msg-error-card {
+  border-color: rgba(242, 184, 181, 0.28);
+  background: rgba(242, 184, 181, 0.08);
+}
+.msg-error-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+.msg-error-badge {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.msg-error-titles {
+  flex: 1;
+  min-width: 0;
+}
+.msg-error-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--md-error);
+  line-height: 1.35;
+}
+.msg-error-hint {
+  font-size: 12.5px;
+  color: var(--md-text-secondary);
+  line-height: 1.45;
+  margin-top: 2px;
+}
+.btn-dismiss-error {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--md-text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.btn-dismiss-error:hover {
+  background: var(--md-state-hover);
+  color: var(--md-text);
+}
+.msg-error-details {
+  font-size: 12px;
+}
+.msg-error-details summary {
+  cursor: pointer;
+  color: var(--md-text-muted);
+  user-select: none;
+  font-size: 11.5px;
+}
+.msg-error-raw {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--md-code-bg);
+  border: 1px solid var(--md-outline-variant);
+  color: var(--md-text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.msg-error-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 2px;
+}
+.msg-error-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 32px;
+  padding: 0 13px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--md-outline-variant);
+  background: var(--md-bg);
+  color: var(--md-text);
+  transition: background-color 140ms var(--md-motion), transform 120ms var(--md-motion);
+}
+.msg-error-btn.primary {
+  background: var(--md-error);
+  border-color: var(--md-error);
+  color: #FFFFFF;
+}
+[data-theme="dark"] .msg-error-btn.primary {
+  color: #370B08;
+}
+.msg-error-btn.tonal {
+  background: var(--md-primary-container);
+  border-color: transparent;
+  color: var(--md-on-primary-container);
+}
+.msg-error-btn:active {
+  transform: scale(0.97);
+}
+.msg-error-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* User Message Footer (Timestamp, Copy & Revert) */
+.user-msg-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 4px;
+  padding-right: 4px;
+  color: var(--md-text-muted);
+  font-size: 11.5px;
+}
+.user-msg-time {
+  margin-right: 2px;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+.user-msg-icon-btn {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--md-text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 130ms var(--md-motion), color 130ms var(--md-motion);
+}
+.user-msg-icon-btn:hover:not(:disabled) {
+  background: var(--md-state-hover);
+  color: var(--md-text);
+}
+.user-msg-icon-btn:active:not(:disabled) {
+  background: var(--md-state-pressed);
+}
+.user-msg-icon-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Revert Confirmation Dialog */
+.revert-preview-box {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--md-text);
+  max-height: 92px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.revert-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--md-text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.revert-checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--md-primary);
+  cursor: pointer;
+}
+.m3-btn.danger {
+  background: var(--md-error);
+  color: #FFFFFF;
+}
+[data-theme="dark"] .m3-btn.danger {
+  color: #370B08;
+}
+
+/* Compact 6-Tab Usage Bar + Calendar Header Toggle + Reset Timestamps */
+#usage-window-tabs {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  width: 100%;
+  gap: 2px;
+}
+#usage-window-tabs .seg-btn {
+  min-width: 0;
+  padding: 6px 2px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#btn-usage-calendar[aria-pressed="true"] {
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+.usage-quota-subreset {
+  font-size: 10.5px;
+  color: var(--md-text-muted);
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* All-Time Summary Banner + Monthly Calendar Heatmap */
+.usage-alltime-banner {
+  background: linear-gradient(135deg, var(--md-surface) 0%, var(--md-surface-low) 100%);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: 18px;
+  padding: 13px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.usage-alltime-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--md-text);
+}
+.usage-alltime-sub {
+  font-size: 12px;
+  color: var(--md-text-secondary);
+}
+
+.usage-cal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.usage-cal-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.usage-cal-nav-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  border: 1px solid var(--md-outline-variant);
+  background: var(--md-surface-low);
+  color: var(--md-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.usage-cal-nav-btn:hover {
+  background: var(--md-surface-high);
+}
+.usage-cal-month-lbl {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--md-text);
+  min-width: 78px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.usage-cal-weekdays {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.usage-cal-wd {
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--md-text-muted);
+  padding: 2px 0;
+}
+.usage-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+}
+.usage-cal-pad {
+  min-height: 44px;
+}
+.usage-cal-cell {
+  min-height: 44px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: var(--md-surface-low);
+  color: var(--md-text);
+  padding: 4px 2px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  cursor: pointer;
+  transition: transform 110ms var(--md-motion), border-color 130ms var(--md-motion);
+}
+.usage-cal-cell:active {
+  transform: scale(0.95);
+}
+.usage-cal-cell.lvl-1 {
+  background: rgba(11, 87, 208, 0.12);
+}
+.usage-cal-cell.lvl-2 {
+  background: rgba(11, 87, 208, 0.24);
+}
+.usage-cal-cell.lvl-3 {
+  background: rgba(11, 87, 208, 0.40);
+  color: #041E49;
+}
+.usage-cal-cell.lvl-4 {
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+}
+[data-theme="dark"] .usage-cal-cell.lvl-1 {
+  background: rgba(168, 199, 250, 0.14);
+}
+[data-theme="dark"] .usage-cal-cell.lvl-2 {
+  background: rgba(168, 199, 250, 0.26);
+}
+[data-theme="dark"] .usage-cal-cell.lvl-3 {
+  background: rgba(168, 199, 250, 0.42);
+  color: #062E6F;
+}
+.usage-cal-cell.today {
+  border-color: var(--md-primary);
+}
+.usage-cal-cell.selected {
+  outline: 2px solid var(--md-primary);
+  outline-offset: -1px;
+}
+.usage-cal-day-num {
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.usage-cal-day-val {
+  font-size: 9.5px;
+  line-height: 1.1;
+  opacity: 0.88;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.usage-cal-detail {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.usage-cal-detail-head {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--md-text);
+}
+.usage-cal-detail-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  font-size: 12px;
+  color: var(--md-text-secondary);
+}
+.usage-cal-detail-metrics strong {
+  color: var(--md-text);
+}

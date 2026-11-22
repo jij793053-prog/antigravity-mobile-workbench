@@ -165,6 +165,13 @@
     swarmLoading: false,
     swarmLastError: "",
     swarmLastRenderFp: "",
+
+    // v1.7.1: Usage Calendar, Persistent Error Retry Cards & Turn Revert
+    usageCalendarOpen: false,
+    usageCalMonth: "",
+    usageCalSelectedDate: "",
+    convErrors: {},
+    pendingRevertTarget: null,
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -1690,6 +1697,8 @@
     if (ev.type === "run_start" || ev.type === "run_init") {
       adoptPendingCid();
       if (cid && cid === state.currentCid) {
+        clearConvError(NEW_DRAFT_KEY);
+        clearConvError(cid);
         state.interruptPendingUntil = 0;
         if (Array.isArray(ev.queue)) {
           setCurrentQueue(ev.queue);
@@ -1725,6 +1734,8 @@
       adoptPendingCid();
       haptic("success");
       if (cid === state.currentCid || (ev.aliased_cid && ev.aliased_cid === state.currentCid)) {
+        clearConvError(NEW_DRAFT_KEY);
+        clearConvError(state.currentCid);
         state.interruptPendingUntil = 0;
         state.streaming = false;
         if (ev.context_window && typeof ev.context_window === "object") {
@@ -1771,18 +1782,50 @@
         state.streamBuffer = "";
         state.streamTools = [];
         const errText = String(ev.error || t("err.unknown"));
-        if (state.currentConv) {
-          state.currentConv.messages.push({
-            role: "assistant",
-            text: t("chat.execError", { err: errText }),
-            model: state.selectedModel,
-          });
+        const errKey = getConvErrKey(state.currentCid);
+        if (ev.run_id) clearConvError(`pending-${ev.run_id}`);
+        clearConvError(NEW_DRAFT_KEY);
+        let fallbackPrompt = String(ev.prompt || "");
+        let fallbackAtts = Array.isArray(ev.attachments) ? ev.attachments : [];
+        if (!fallbackPrompt && state.currentConv && Array.isArray(state.currentConv.messages)) {
+          for (let k = state.currentConv.messages.length - 1; k >= 0; k--) {
+            const um = state.currentConv.messages[k];
+            if (um && um.role === "user") {
+              fallbackPrompt = String(um.text || "");
+              if (!fallbackAtts.length && Array.isArray(um.attachments)) {
+                fallbackAtts = um.attachments;
+              }
+              break;
+            }
+          }
         }
+        setConvError(
+          errKey,
+          buildErrorCardRecord(errText, ev.error_category, {
+            prompt: fallbackPrompt,
+            attachments: fallbackAtts,
+            model: String(ev.model || state.selectedModel || ""),
+            swarmMode: Boolean(ev.swarm_mode ?? state.swarmMode),
+          })
+        );
         renderConversation({ preserveScroll: true });
         renderQueueTray();
         showToast(t("toast.execFail", { err: errText.slice(0, 80) }));
       }
       refreshConversationsThrottled(400);
+    } else if (ev.type === "conversation_reverted") {
+      const aliasedCid = ev.canonical_cid || "";
+      const matchesCurrent = Boolean(state.currentCid) && (
+        cid === state.currentCid || (aliasedCid && aliasedCid === state.currentCid)
+      );
+      if (matchesCurrent) {
+        clearConvError(state.currentCid);
+        clearConvError(cid);
+        if (!state.streaming) {
+          openConversation(state.currentCid, { silent: true });
+        }
+      }
+      refreshConversationsThrottled(300);
     } else if (ev.type === "queue_updated") {
       const aliasedCid = ev.aliased_cid || "";
       const matchesCurrent = Boolean(state.currentCid) && (
@@ -1857,6 +1900,19 @@
     return out;
   }
 
+  const SWARM_LINK_ICON_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.2"></circle><circle cx="5.5" cy="17.5" r="2.2"></circle><circle cx="18.5" cy="17.5" r="2.2"></circle><path d="M10.7 6.9L6.8 15.6M13.3 6.9l3.9 8.7M7.7 17.5h8.6"></path></svg>`;
+  const SWARM_LINK_CHEV_SVG = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>`;
+
+  function buildSwarmLinkHtml(renderedLabelHtml) {
+    return (
+      `<button type="button" class="md-swarm-link" data-open-swarm="1">` +
+        `<span class="md-swarm-link-ic" aria-hidden="true">${SWARM_LINK_ICON_SVG}</span>` +
+        `<span>${renderedLabelHtml}</span>` +
+        `${SWARM_LINK_CHEV_SVG}` +
+      `</button>`
+    );
+  }
+
   function renderInline(text) {
     const nonce = makeRenderNonce();
     let s = escHtml(text);
@@ -1887,6 +1943,11 @@
     s = s.replace(/\[([^\]]+)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g, (_, lbl, href) => {
       const cleanHref = unescHtml(restoreIcRaw(href)).trim();
       const renderedLbl = restoreIcHtml(applyEmphasis(lbl));
+      if (/^sidecar:\/\/swarm/i.test(cleanHref)) {
+        const idx = linkTokens.length;
+        linkTokens.push(buildSwarmLinkHtml(renderedLbl));
+        return `@@LK_${nonce}_${idx}@@`;
+      }
       if (cleanHref.startsWith("file:///")) {
         let fp = "";
         try {
@@ -1950,6 +2011,13 @@
       const idx = linkTokens.length;
       linkTokens.push(`<a href="${safeUrl}" target="_blank" rel="noopener">${safeUrl}</a>`);
       return `${lead}@@LK_${nonce}_${idx}@@${trail}`;
+    });
+
+    // 3b. Tokenize plain-text "Open the Swarm UI" so unlinked Sidecar output is also clickable
+    s = s.replace(/\bOpen the Swarm UI\b/g, (lbl) => {
+      const idx = linkTokens.length;
+      linkTokens.push(buildSwarmLinkHtml(escHtml(lbl)));
+      return `@@LK_${nonce}_${idx}@@`;
     });
 
     // 4. Bold, strikethrough, italic (cannot corrupt tokenized URLs or inline code)
@@ -4287,6 +4355,239 @@
   // =========================================================================
   // 8. CHAT & STREAMING RENDER
   // =========================================================================
+  const REVERT_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"></path><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"></path></svg>`;
+  const ERROR_ICON_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>`;
+  const RETRY_ICON_SVG = `<svg viewBox="0 0 24 24" width="13.5" height="13.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>`;
+  const CLOSE_ERR_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
+
+  function fmtRelativeOrClockTime(isoStr) {
+    if (!isoStr) return "";
+    try {
+      const d = new Date(isoStr);
+      const ms = d.getTime();
+      if (isNaN(ms)) return "";
+      const diffSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      if (diffSec < 60) return t("chat.timeJustNow");
+      if (diffSec < 3600) return t("chat.timeMinAgo", { n: Math.floor(diffSec / 60) });
+      if (diffSec < 24 * 3600) {
+        const nowD = new Date();
+        if (d.getDate() === nowD.getDate() && d.getMonth() === nowD.getMonth() && d.getFullYear() === nowD.getFullYear()) {
+          return t("chat.timeHrAgo", { n: Math.floor(diffSec / 3600) });
+        }
+      }
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mi = String(d.getMinutes()).padStart(2, "0");
+      return `${mm}-${dd} ${hh}:${mi}`;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function classifyClientError(errText) {
+    const low = String(errText || "").toLowerCase();
+    if (!low) return "unknown";
+    if (/(quota|exhausted|resource_exhausted|insufficient|limit exceeded|额度|配额|积分)/.test(low)) return "quota";
+    if (/(rate limit|too many requests|\b429\b|\brpm\b|\btpm\b|频率|限流)/.test(low)) return "rate_limit";
+    if (/(unauthorized|unauthenticated|\b401\b|\b403\b|permission denied|token expired|api key|登录|认证|鉴权)/.test(low)) return "auth";
+    if (/(timeout|timed out|deadline exceeded|超时)/.test(low)) return "timeout";
+    if (/(econnrefused|connection refused|connection reset|fetch failed|socket|dns|ssl|tls|unreachable|network|broken pipe|offline|failed to fetch|网络|连接)/.test(low)) return "network";
+    if (/(model not found|unsupported model|invalid model|模型)/.test(low)) return "model";
+    return "unknown";
+  }
+
+  function getErrCardMeta(cat) {
+    const c = String(cat || "unknown");
+    const showSwitchModel = c === "quota" || c === "rate_limit" || c === "model" || c === "auth";
+    if (c === "quota") return { title: t("errCard.quotaTitle"), hint: t("errCard.quotaHint"), showSwitchModel };
+    if (c === "rate_limit") return { title: t("errCard.rateLimitTitle"), hint: t("errCard.rateLimitHint"), showSwitchModel };
+    if (c === "network") return { title: t("errCard.networkTitle"), hint: t("errCard.networkHint"), showSwitchModel: false };
+    if (c === "auth") return { title: t("errCard.authTitle"), hint: t("errCard.authHint"), showSwitchModel };
+    if (c === "timeout") return { title: t("errCard.timeoutTitle"), hint: t("errCard.timeoutHint"), showSwitchModel: false };
+    if (c === "model") return { title: t("errCard.modelTitle"), hint: t("errCard.modelHint"), showSwitchModel };
+    return { title: t("errCard.unknownTitle"), hint: t("errCard.unknownHint"), showSwitchModel: false };
+  }
+
+  function getConvErrKey(cid) {
+    return String(cid || "").trim() || NEW_DRAFT_KEY;
+  }
+
+  function setConvError(cidKey, rec) {
+    if (!rec) return;
+    state.convErrors[getConvErrKey(cidKey)] = rec;
+  }
+
+  function clearConvError(cidKey) {
+    if (!cidKey) return;
+    delete state.convErrors[getConvErrKey(cidKey)];
+  }
+
+  function normalizeRetryAttachments(rawAtts) {
+    if (!Array.isArray(rawAtts)) return [];
+    return rawAtts
+      .map((a) => {
+        if (!a) return null;
+        if (typeof a === "string") {
+          const p = a.trim();
+          if (!p) return null;
+          const name = p.split("/").pop() || p;
+          return { path: p, name, is_image: /\.(png|jpe?g|webp|gif|bmp)$/i.test(name) };
+        }
+        if (typeof a === "object" && a.path) {
+          return a;
+        }
+        return null;
+      })
+      .filter(Boolean);
+  }
+
+  function buildErrorCardRecord(errText, category, retryPayload = null) {
+    const clean = String(errText || t("err.unknown")).trim();
+    const cat = category && category !== "unknown" ? String(category) : classifyClientError(clean);
+    const meta = getErrCardMeta(cat);
+    const rp = retryPayload && typeof retryPayload === "object"
+      ? {
+          prompt: String(retryPayload.prompt || ""),
+          attachments: normalizeRetryAttachments(retryPayload.attachments),
+          model: String(retryPayload.model || state.selectedModel || ""),
+          swarmMode: Boolean(retryPayload.swarmMode ?? state.swarmMode),
+        }
+      : null;
+    return {
+      category: cat,
+      title: meta.title,
+      hint: meta.hint,
+      showSwitchModel: meta.showSwitchModel,
+      rawError: clean,
+      timestamp: Date.now(),
+      retryPayload: rp,
+    };
+  }
+
+  function renderErrorCardHtml(errRec) {
+    if (!errRec) return "";
+    const meta = getErrCardMeta(errRec.category);
+    const rp = errRec.retryPayload;
+    const canRetry = Boolean(rp && (rp.prompt || (rp.attachments && rp.attachments.length)));
+    return `
+      <div class="msg-error-card" data-err-cat="${escHtml(errRec.category || "unknown")}">
+        <div class="msg-error-head">
+          <span class="msg-error-badge">${ERROR_ICON_SVG}</span>
+          <div class="msg-error-titles">
+            <div class="msg-error-title">${escHtml(meta.title)}</div>
+            <div class="msg-error-hint">${escHtml(meta.hint)}</div>
+          </div>
+          <button class="btn-dismiss-error" type="button" aria-label="${escHtml(t("errCard.dismissAria"))}" title="${escHtml(t("errCard.dismissAria"))}">${CLOSE_ERR_SVG}</button>
+        </div>
+        ${
+          errRec.rawError
+            ? `<details class="msg-error-details">
+                 <summary>${escHtml(t("errCard.detailToggle"))}</summary>
+                 <pre class="msg-error-raw">${escHtml(errRec.rawError)}</pre>
+               </details>`
+            : ""
+        }
+        <div class="msg-error-actions">
+          ${canRetry ? `<button class="msg-error-btn primary btn-retry-error" type="button">${RETRY_ICON_SVG}<span>${escHtml(t("errCard.retryBtn"))}</span></button>` : ""}
+          ${meta.showSwitchModel ? `<button class="msg-error-btn tonal btn-switch-model-error" type="button"><span>${escHtml(t("errCard.switchModelBtn"))}</span></button>` : ""}
+        </div>
+      </div>`;
+  }
+
+  function closeRevertConfirmDialog() {
+    state.pendingRevertTarget = null;
+    const dlg = $("revert-confirm-dialog");
+    if (dlg) dlg.classList.add("hidden");
+    const okBtn = $("btn-revert-ok");
+    if (okBtn) {
+      okBtn.disabled = false;
+      okBtn.textContent = t("revert.ok");
+    }
+  }
+
+  function openRevertConfirmDialog(targetInfo) {
+    if (!targetInfo || !state.currentCid) return;
+    if (state.streaming) {
+      showToast(t("revert.busyError"));
+      return;
+    }
+    const msgs = (state.currentConv && Array.isArray(state.currentConv.messages)) ? state.currentConv.messages : [];
+    const undoCount = Math.max(1, msgs.length - Number(targetInfo.msgIndex || 0));
+    const isDesk = state.currentConv && state.currentConv.source === "desktop";
+    const descEl = $("revert-confirm-desc");
+    if (descEl) {
+      descEl.textContent = t("revert.descCount", { count: undoCount }) + (isDesk ? ` ${t("revert.descDesktopNote")}` : "");
+    }
+    const prevEl = $("revert-confirm-preview");
+    if (prevEl) {
+      const txt = String(targetInfo.text || "").trim();
+      prevEl.textContent = txt.length > 260 ? `${txt.slice(0, 260)}…` : (txt || "—");
+    }
+    const chk = $("revert-restore-input");
+    if (chk) chk.checked = true;
+    const okBtn = $("btn-revert-ok");
+    if (okBtn) {
+      okBtn.disabled = false;
+      okBtn.textContent = t("revert.ok");
+    }
+    state.pendingRevertTarget = targetInfo;
+    $("revert-confirm-dialog")?.classList.remove("hidden");
+    haptic("light");
+  }
+
+  async function confirmRevertAction() {
+    const tgt = state.pendingRevertTarget;
+    const cid = state.currentCid;
+    if (!tgt || !cid) {
+      closeRevertConfirmDialog();
+      return;
+    }
+    const okBtn = $("btn-revert-ok");
+    if (okBtn) {
+      okBtn.disabled = true;
+      okBtn.textContent = t("revert.doing");
+    }
+    const restoreToInput = Boolean($("revert-restore-input")?.checked);
+    try {
+      const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/revert`, {
+        method: "POST",
+        body: JSON.stringify({
+          msg_index: tgt.msgIndex,
+          user_index: tgt.userIndex,
+          time: tgt.time || "",
+          text: tgt.text || "",
+        }),
+      });
+      closeRevertConfirmDialog();
+      clearConvError(cid);
+      clearConvError(res.canonical_cid || "");
+      if (res.conversation) {
+        state.currentConv = res.conversation;
+        state.currentCid = res.conversation.id || cid;
+      }
+      if (restoreToInput && typeof res.restored_prompt === "string" && res.restored_prompt) {
+        const inp = $("prompt-input");
+        if (inp) {
+          inp.value = res.restored_prompt;
+          resizePromptInput();
+          saveCurrentDraft();
+          inp.focus();
+        }
+      }
+      renderConversation({ preserveScroll: false });
+      refreshConversationsThrottled(300);
+      haptic("success");
+      showToast(t("revert.success"));
+    } catch (e) {
+      if (okBtn) {
+        okBtn.disabled = false;
+        okBtn.textContent = t("revert.ok");
+      }
+      showToast(t("revert.fail", { err: e.message || t("err.unknown") }));
+    }
+  }
+
   function computeConvFingerprint(conv, isRunning) {
     if (!conv) return "";
     const cid = conv.id || state.currentCid || "";
@@ -4305,7 +4606,9 @@
     const delivs = Array.isArray(conv.deliverables) ? conv.deliverables : [];
     const running = isRunning ? 1 : 0;
     const title = conv.title || "";
-    return `${cid}|${msgs.length}|${lastRole}|${lastTime}|${lastTextLen}|${totalTextLen}|${lastToolsLen}|${lastAttsLen}|${running}|${delivs.length}|${title}`;
+    const errRec = state.convErrors[getConvErrKey(cid)];
+    const errTag = errRec ? String(errRec.timestamp || 1) : "";
+    return `${cid}|${msgs.length}|${lastRole}|${lastTime}|${lastTextLen}|${totalTextLen}|${lastToolsLen}|${lastAttsLen}|${running}|${delivs.length}|${title}|${errTag}`;
   }
 
   function renderConversation(opts = {}) {
@@ -4313,6 +4616,8 @@
     const list = $("messages-list");
     const conv = state.currentConv;
     const scrollEl = $("chat-scroll");
+    const errKey = getConvErrKey(state.currentCid);
+    const activeErrRec = !state.streaming ? (state.convErrors[errKey] || null) : null;
 
     state.mediaRenderGen += 1;
     const renderGen = state.mediaRenderGen;
@@ -4330,10 +4635,15 @@
       state.turnAnchorEls = [];
       state.activeTurnIndex = 0;
       state.lastRenderedConvFp = "";
-      $("empty-state").classList.remove("hidden");
-      list.innerHTML = "";
+      if (activeErrRec) {
+        $("empty-state").classList.add("hidden");
+        list.innerHTML = `<div class="msg-row error-row">${renderErrorCardHtml(activeErrRec)}</div>`;
+      } else {
+        $("empty-state").classList.remove("hidden");
+        list.innerHTML = "";
+      }
       $("deliverables-box").classList.add("hidden");
-      $("conv-title").textContent = "Antigravity";
+      $("conv-title").textContent = (conv && conv.title) ? conv.title : "Antigravity";
       updateTurnTriggerUi();
       updateHostDisplays();
       updateSidecarHeaderActions();
@@ -4362,6 +4672,7 @@
     const totalMsgs = conv.messages.length;
     const eagerMsgThreshold = Math.max(0, totalMsgs - 8);
     const frag = document.createDocumentFragment();
+    let userOrdinal = 0;
 
     for (let idx = 0; idx < totalMsgs; idx++) {
       const msg = conv.messages[idx];
@@ -4375,6 +4686,7 @@
       }
 
       if (msg.role === "user") {
+        const curUserOrdinal = userOrdinal++;
         const atts = Array.isArray(msg.attachments) ? msg.attachments : [];
         let attsHtml = "";
         if (atts.length) {
@@ -4422,7 +4734,14 @@
           attsHtml = parts.join("");
         }
         const bubbleHtml = msg.text ? `<div class="user-bubble">${escHtml(msg.text)}</div>` : "";
-        row.innerHTML = `<div class="user-msg-stack">${attsHtml}${bubbleHtml}</div>`;
+        const timeLabel = fmtRelativeOrClockTime(msg.time);
+        const canRevert = Boolean(state.currentCid && !String(state.currentCid).startsWith("pending-") && !state.streaming);
+        const footerHtml = `<div class="user-msg-footer">` +
+          (timeLabel ? `<span class="user-msg-time">${escHtml(timeLabel)}</span>` : "") +
+          `<button class="user-msg-icon-btn user-copy-btn" type="button" data-raw="${encodeURIComponent(msg.text || "")}" aria-label="${escHtml(t("chat.copyUserAria"))}" title="${escHtml(t("chat.copyUserAria"))}">${COPY_SVG}</button>` +
+          `<button class="user-msg-icon-btn user-revert-btn" type="button" data-msg-idx="${idx}" data-user-idx="${curUserOrdinal}" data-msg-time="${escHtml(msg.time || "")}" data-raw="${encodeURIComponent(msg.text || "")}" ${canRevert ? "" : "disabled"} aria-label="${escHtml(t("chat.revertAria"))}" title="${escHtml(t("chat.revertAria"))}">${REVERT_SVG}</button>` +
+          `</div>`;
+        row.innerHTML = `<div class="user-msg-stack">${attsHtml}${bubbleHtml}${footerHtml}</div>`;
       } else {
         let toolsHtml = "";
         const hasTools = Boolean(msg.tools && msg.tools.length);
@@ -4487,6 +4806,11 @@
       sRow.className = "msg-row assistant";
       list.appendChild(sRow);
       updateStreamingRow();
+    } else if (activeErrRec) {
+      const eRow = document.createElement("div");
+      eRow.className = "msg-row error-row";
+      eRow.innerHTML = renderErrorCardHtml(activeErrRec);
+      list.appendChild(eRow);
     }
 
     // Inline Deliverables (Default Collapsed; preserve expanded state on silent refresh)
@@ -4967,6 +5291,7 @@
     const sendDraftKey = currentDraftKey();
     const prevAttachments = state.attachments.slice();
     const attPaths = prevAttachments.map((a) => a.path);
+    clearConvError(sendDraftKey);
 
     // Queue or Cut-in while streaming on an active conversation
     if (normalizedMode === "queue" || normalizedMode === "interrupt") {
@@ -5147,6 +5472,19 @@
       if (msgIdx !== -1) {
         targetConv.messages.splice(msgIdx, 1);
       }
+      setConvError(
+        sendDraftKey,
+        buildErrorCardRecord(
+          e.message || t("err.unknown"),
+          e.errorCategory || classifyClientError(e.message),
+          {
+            prompt: rawText,
+            attachments: prevAttachments,
+            model: state.selectedModel,
+            swarmMode: state.swarmMode,
+          }
+        )
+      );
       if (sendSeq === state.openConvSeq) {
         state.streaming = false;
         state.streamBuffer = "";
@@ -6167,19 +6505,23 @@
     loadUsageData();
   }
 
-  async function loadUsageData() {
+  async function loadUsageData(opts = {}) {
+    const force = Boolean(opts && opts.force);
     const body = $("usage-body");
     if (!body) return;
     body.innerHTML = `<div class="empty-placeholder">${escHtml(t("usage.loading"))}</div>`;
     try {
-      const qs = state.currentCid ? `?cid=${encodeURIComponent(state.currentCid)}` : "";
+      const q = new URLSearchParams();
+      if (state.currentCid) q.set("cid", state.currentCid);
+      if (force) q.set("force", "1");
+      const qs = q.toString() ? `?${q.toString()}` : "";
       const data = await apiFetch(`/api/usage${qs}`);
       state.usageData = data;
       const sub = $("usage-subtitle");
       if (sub) {
-        const cnt = Number(data.scanned_conversations || 0);
+        const cnt = Number(data.total_conversations || data.scanned_conversations || 0);
         const tStr = fmtLocalTime(data.generated_at);
-        sub.textContent = t("usage.subScanned", { cnt, time: tStr || t("usage.justNow") });
+        sub.textContent = t("usage.subScannedAll", { cnt, time: tStr || t("usage.justNow") });
       }
       renderUsageView();
     } catch (e) {
@@ -6207,6 +6549,138 @@
     }
   }
 
+  function stepCalendarMonth(ymStr, delta) {
+    const parts = String(ymStr || "").split("-");
+    const nowD = new Date();
+    let y = Number(parts[0]) || nowD.getFullYear();
+    let m = Number(parts[1]) || (nowD.getMonth() + 1);
+    m += delta;
+    while (m < 1) { m += 12; y -= 1; }
+    while (m > 12) { m -= 12; y += 1; }
+    return `${y}-${String(m).padStart(2, "0")}`;
+  }
+
+  function renderUsageCalendarHtml(data) {
+    const cal = Array.isArray(data && data.daily_calendar) ? data.daily_calendar : [];
+    const isEn = I18N.isEn();
+    if (!cal.length) {
+      return `
+        <div id="usage-calendar-card" class="m3-card usage-calendar-card">
+          <div class="section-heading">${escHtml(t("usage.calendarHeading"))}</div>
+          <div class="empty-placeholder">${escHtml(t("usage.calendarEmpty"))}</div>
+        </div>`;
+    }
+
+    const calMap = new Map();
+    let maxTok = 1;
+    for (const d of cal) {
+      if (d && d.date) {
+        calMap.set(d.date, d);
+        const tv = Number(d.total_tokens || 0);
+        if (tv > maxTok) maxTok = tv;
+      }
+    }
+
+    const lastDate = cal[cal.length - 1].date;
+    const nowD = new Date();
+    const todayIso = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, "0")}-${String(nowD.getDate()).padStart(2, "0")}`;
+    let activeYm = state.usageCalMonth;
+    if (!/^\d{4}-\d{2}$/.test(activeYm)) {
+      activeYm = lastDate.slice(0, 7);
+      state.usageCalMonth = activeYm;
+    }
+
+    const [yNum, mNum] = activeYm.split("-").map((v) => Number(v));
+    const daysInMonth = new Date(yNum, mNum, 0).getDate();
+    const firstWeekday = (new Date(yNum, mNum - 1, 1).getDay() + 6) % 7;
+
+    if (!state.usageCalSelectedDate || !state.usageCalSelectedDate.startsWith(activeYm)) {
+      let bestInMonth = "";
+      for (let i = cal.length - 1; i >= 0; i--) {
+        if (cal[i].date.startsWith(activeYm)) {
+          bestInMonth = cal[i].date;
+          break;
+        }
+      }
+      state.usageCalSelectedDate = bestInMonth || `${activeYm}-01`;
+    }
+    const selIso = state.usageCalSelectedDate;
+
+    const weekdays = String(t("usage.calendarWeekdays") || "一,二,三,四,五,六,日").split(",").slice(0, 7);
+    const wdHtml = weekdays.map((w) => `<div class="usage-cal-wd">${escHtml(w)}</div>`).join("");
+
+    const cells = [];
+    for (let p = 0; p < firstWeekday; p++) {
+      cells.push(`<div class="usage-cal-pad" aria-hidden="true"></div>`);
+    }
+    for (let day = 1; day <= daysInMonth; day++) {
+      const iso = `${activeYm}-${String(day).padStart(2, "0")}`;
+      const rec = calMap.get(iso) || null;
+      const tok = rec ? Number(rec.total_tokens || 0) : 0;
+      const ratio = tok > 0 ? tok / maxTok : 0;
+      const lvl = tok <= 0 ? "lvl-0" : ratio >= 0.7 ? "lvl-4" : ratio >= 0.4 ? "lvl-3" : ratio >= 0.15 ? "lvl-2" : "lvl-1";
+      const clsList = ["usage-cal-cell", lvl];
+      if (iso === todayIso) clsList.push("today");
+      if (iso === selIso) clsList.push("selected");
+      let valTxt = "";
+      if (rec && tok > 0) {
+        const cny = Number(rec.cost_cny || 0);
+        const usd = Number(rec.cost_usd || (cny / 7.25));
+        if (isEn) {
+          valTxt = usd >= 100 ? `$${Math.round(usd)}` : `$${usd.toFixed(1)}`;
+        } else {
+          valTxt = cny >= 1000 ? `¥${(cny / 1000).toFixed(1)}k` : `¥${Math.round(cny)}`;
+        }
+      }
+      cells.push(
+        `<button type="button" class="${clsList.join(" ")}" data-cal-date="${escHtml(iso)}" aria-pressed="${iso === selIso ? "true" : "false"}">` +
+          `<span class="usage-cal-day-num">${day}</span>` +
+          `<span class="usage-cal-day-val">${escHtml(valTxt)}</span>` +
+        `</button>`
+      );
+    }
+
+    const selRec = calMap.get(selIso) || null;
+    let detailHtml = "";
+    if (selRec) {
+      const sCny = Number(selRec.cost_cny || 0);
+      const sUsd = Number(selRec.cost_usd || (sCny / 7.25));
+      const costMain = isEn ? `$${sUsd.toFixed(2)} (¥${sCny.toFixed(2)})` : `¥${sCny.toFixed(2)} ($${sUsd.toFixed(2)})`;
+      const qPct = Number(selRec.quota_used_est_pct || 0).toFixed(1);
+      detailHtml = `
+        <div id="usage-cal-detail" class="usage-cal-detail">
+          <div class="usage-cal-detail-head">${escHtml(t("usage.calendarDayDetail", { date: selIso, convs: Number(selRec.conversations || 0), steps: Number(selRec.steps || 0) }))}</div>
+          <div class="usage-cal-detail-metrics">
+            <span><strong>${escHtml(costMain)}</strong></span>
+            <span>Token <strong>${escHtml(fmtTokens(selRec.total_tokens || 0))}</strong></span>
+            <span>${escHtml(t("usage.statInOut"))} <strong>${escHtml(fmtTokens(selRec.input_tokens || 0))} / ${escHtml(fmtTokens(selRec.output_tokens || 0))}</strong></span>
+            <span>${escHtml(t("usage.statCacheHit", { pct: Number(selRec.cache_hit_pct || 0).toFixed(1) }))}</span>
+            <span>~${qPct}% quota</span>
+          </div>
+        </div>`;
+    } else {
+      detailHtml = `
+        <div id="usage-cal-detail" class="usage-cal-detail">
+          <div class="usage-cal-detail-head">${escHtml(t("usage.calendarDayNone", { date: selIso }))}</div>
+        </div>`;
+    }
+
+    return `
+      <div id="usage-calendar-card" class="m3-card usage-calendar-card">
+        <div class="usage-cal-header">
+          <span class="section-heading" style="margin:0">${escHtml(t("usage.calendarHeading"))}</span>
+          <div class="usage-cal-nav">
+            <button type="button" class="usage-cal-nav-btn" data-cal-nav="-1" aria-label="${escHtml(t("usage.calendarPrev"))}" title="${escHtml(t("usage.calendarPrev"))}">‹</button>
+            <span class="usage-cal-month-lbl">${escHtml(activeYm)}</span>
+            <button type="button" class="usage-cal-nav-btn" data-cal-nav="1" aria-label="${escHtml(t("usage.calendarNext"))}" title="${escHtml(t("usage.calendarNext"))}">›</button>
+          </div>
+        </div>
+        <div class="usage-cal-weekdays">${wdHtml}</div>
+        <div class="usage-cal-grid">${cells.join("")}</div>
+        ${detailHtml}
+      </div>`;
+  }
+
   function renderUsageView() {
     const body = $("usage-body");
     const data = state.usageData;
@@ -6220,6 +6694,11 @@
       btn.setAttribute("aria-selected", active ? "true" : "false");
     });
 
+    const calBtn = $("btn-usage-calendar");
+    if (calBtn) {
+      calBtn.setAttribute("aria-pressed", state.usageCalendarOpen ? "true" : "false");
+    }
+
     const bucket =
       win === "5h"
         ? data.window_5h
@@ -6229,6 +6708,8 @@
         ? data.window_3d
         : win === "7d"
         ? data.window_7d
+        : win === "all"
+        ? data.window_all
         : data.current_conversation;
 
     const parts = [];
@@ -6246,23 +6727,33 @@
           const h5 = hasH5 ? Math.max(0, Math.min(100, Number(p.h5_pct))) : null;
           const wk = hasWk ? Math.max(0, Math.min(100, Number(p.weekly_pct))) : (p.remaining_pct !== null && p.remaining_pct !== undefined ? Math.max(0, Math.min(100, Number(p.remaining_pct))) : null);
           const barCls = (v) => (v === null ? "" : v <= 20 ? "low" : v <= 50 ? "warn" : "ok");
-          const rst = p.reset_at ? escHtml(t("usage.resetPrefix", { time: fmtResetTime(p.reset_at) })) : "";
+          const h5ResetIso = p.h5_reset_at || "";
+          const wkResetIso = p.weekly_reset_at || p.reset_at || "";
+          const h5RstLine = h5ResetIso
+            ? `<div class="usage-quota-subreset">${escHtml(t("usage.h5ResetShort", { time: fmtResetTime(h5ResetIso) }))}</div>`
+            : "";
+          const wkRstLine = wkResetIso
+            ? `<div class="usage-quota-subreset">${escHtml(t("usage.wkResetShort", { time: fmtResetTime(wkResetIso) }))}</div>`
+            : "";
+          const rstFallback = wkResetIso ? escHtml(t("usage.resetPrefix", { time: fmtResetTime(wkResetIso) })) : "";
 
           if (h5 !== null && wk !== null) {
             return `
               <div class="usage-pool-row">
                 <div class="usage-pool-top">
                   <span class="usage-pool-name">${escHtml(p.name || t("usage.poolFallback"))}</span>
-                  <span class="usage-pool-meta">${rst || escHtml(p.note || "")}</span>
+                  <span class="usage-pool-meta">${escHtml(p.note || "") || rstFallback}</span>
                 </div>
                 <div class="usage-quota-subbars">
                   <div>
                     <div class="usage-quota-mini-label"><span>${escHtml(t("usage.h5Remain"))}</span><strong>${h5.toFixed(1)}%</strong></div>
                     <div class="usage-bar-track"><div class="usage-bar-fill ${barCls(h5)}" style="width:${h5}%"></div></div>
+                    ${h5RstLine}
                   </div>
                   <div>
                     <div class="usage-quota-mini-label"><span>${escHtml(t("usage.wkRemain"))}</span><strong>${wk.toFixed(1)}%</strong></div>
                     <div class="usage-bar-track"><div class="usage-bar-fill ${barCls(wk)}" style="width:${wk}%"></div></div>
+                    ${wkRstLine}
                   </div>
                 </div>
               </div>`;
@@ -6274,7 +6765,7 @@
             <div class="usage-pool-row">
               <div class="usage-pool-top">
                 <span class="usage-pool-name">${escHtml(p.name || t("usage.poolFallback"))}</span>
-                <span class="usage-pool-meta">${pctTxt}${rst ? ` · ${rst}` : ""}${note}</span>
+                <span class="usage-pool-meta">${pctTxt}${rstFallback ? ` · ${rstFallback}` : ""}${note}</span>
               </div>
               <div class="usage-bar-track"><div class="usage-bar-fill ${barCls(pct)}" style="width:${pct !== null ? pct : 0}%"></div></div>
             </div>`;
@@ -6291,9 +6782,24 @@
     }
 
     if (!bucket) {
+      if (state.usageCalendarOpen) {
+        parts.push(renderUsageCalendarHtml(data));
+      }
       parts.push(`<div class="m3-card"><div class="empty-placeholder">${escHtml(win === "conv" ? t("usage.openConvFirst") : t("usage.noWindowData"))}</div></div>`);
       body.innerHTML = parts.join("");
       return;
+    }
+
+    if (win === "all") {
+      const firstD = bucket.first_date || "--";
+      const lastD = bucket.last_date || "--";
+      const actDays = Number(bucket.active_days || 0);
+      const totConvs = Number(bucket.total_conversations || data.total_conversations || data.scanned_conversations || 0);
+      parts.push(`
+        <div class="usage-alltime-banner">
+          <div class="usage-alltime-title">${escHtml(t("usage.allTimeRange", { first: firstD, last: lastD }))}</div>
+          <div class="usage-alltime-sub">${escHtml(t("usage.allTimeMeta", { days: actDays, convs: totConvs }))}</div>
+        </div>`);
     }
 
     const totalTok = Number(bucket.total_tokens || 0);
@@ -6315,6 +6821,8 @@
     const stepsHeading = win === "conv" && bucket.turns ? t("usage.statStepsTurns") : t("usage.statSteps");
     const stepsVal = win === "conv" && bucket.turns
       ? t("usage.statStepsTurnsVal", { steps, turns: bucket.turns })
+      : win === "all" && bucket.total_conversations
+      ? `${t("usage.statStepsVal", { steps })} · ${t("usage.convCountVal", { convs: bucket.total_conversations })}`
       : t("usage.statStepsVal", { steps });
 
     parts.push(`
@@ -6331,13 +6839,17 @@
         </div>
         <div class="stat-box">
           <div class="stat-k">${escHtml(stepsHeading)}</div>
-          <div class="stat-v">${escHtml(stepsVal)}</div>
+          <div class="stat-v" style="font-size:${win === "all" ? "14px" : ""}">${escHtml(stepsVal)}</div>
         </div>
         <div class="stat-box">
           <div class="stat-k">${escHtml(t("usage.statInOut"))}</div>
           <div class="stat-v" style="font-size:13.5px">${escHtml(fmtTokens(inTok))} / ${escHtml(fmtTokens(outTok))}</div>
         </div>
       </div>`);
+
+    if (win === "all" || state.usageCalendarOpen) {
+      parts.push(renderUsageCalendarHtml(data));
+    }
 
     const pools = Array.isArray(bucket.pools) ? bucket.pools : [];
     if (pools.length) {
@@ -6695,6 +7207,10 @@
       }
     });
 
+    $("btn-host-sheet-qr-scan")?.addEventListener("click", () => {
+      closeAllSheets();
+      openQrScanner();
+    });
     $("btn-host-sheet-add").addEventListener("click", openSettingsModal);
 
     // --- Conversation Search, Source Filter Bar & Foreground Visibility Sync ---
@@ -6729,6 +7245,15 @@
     $("pair-confirm-dialog")?.addEventListener("click", (e) => {
       if (e.target === $("pair-confirm-dialog")) {
         closePairConfirmDialog(true);
+      }
+    });
+
+    // --- Revert Turn Confirmation Dialog ---
+    $("btn-revert-cancel")?.addEventListener("click", closeRevertConfirmDialog);
+    $("btn-revert-ok")?.addEventListener("click", confirmRevertAction);
+    $("revert-confirm-dialog")?.addEventListener("click", (e) => {
+      if (e.target === $("revert-confirm-dialog")) {
+        closeRevertConfirmDialog();
       }
     });
 
@@ -6847,6 +7372,7 @@
     const isAnyBlockingOverlayOpen = () => {
       if (!$("welcome-view")?.classList.contains("hidden")) return true;
       if (!$("pair-confirm-dialog")?.classList.contains("hidden")) return true;
+      if (!$("revert-confirm-dialog")?.classList.contains("hidden")) return true;
       for (const id of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
         if (!$(id)?.classList.contains("hidden")) return true;
       }
@@ -7095,11 +7621,73 @@
       }
     }, { passive: false });
 
-    // --- Message Actions (Copy code, Copy reply, Preview file:///, Open Swarm) ---
+    // --- Message Actions (Copy code, Copy reply, Preview file:///, Open Swarm, Revert, Retry) ---
     $("messages-list").addEventListener("click", (e) => {
-      const swarmStrip = e.target.closest(".swarm-live-strip[data-open-swarm]");
+      const swarmStrip = e.target.closest(".swarm-live-strip[data-open-swarm], .md-swarm-link[data-open-swarm]");
       if (swarmStrip) {
         openSwarmDrawer();
+        return;
+      }
+
+      const dismissErrBtn = e.target.closest(".btn-dismiss-error");
+      if (dismissErrBtn) {
+        clearConvError(getConvErrKey(state.currentCid));
+        renderConversation({ preserveScroll: true });
+        return;
+      }
+
+      const switchModelBtn = e.target.closest(".btn-switch-model-error");
+      if (switchModelBtn) {
+        openModelSheet();
+        return;
+      }
+
+      const retryBtn = e.target.closest(".btn-retry-error");
+      if (retryBtn) {
+        const errKey = getConvErrKey(state.currentCid);
+        const errRec = state.convErrors[errKey];
+        const rp = errRec && errRec.retryPayload;
+        if (!rp) return;
+        clearConvError(errKey);
+        const inp = $("prompt-input");
+        if (inp) {
+          inp.value = String(rp.prompt || "");
+          resizePromptInput();
+        }
+        state.attachments = normalizeRetryAttachments(rp.attachments);
+        renderAttachTray();
+        if (Boolean(rp.swarmMode) !== state.swarmMode) {
+          state.swarmMode = Boolean(rp.swarmMode);
+          const sBtn = $("btn-swarm");
+          if (sBtn) {
+            sBtn.classList.toggle("active", state.swarmMode);
+            sBtn.setAttribute("aria-pressed", String(state.swarmMode));
+            sBtn.querySelector(".swarm-ic-off")?.classList.toggle("hidden", state.swarmMode);
+            sBtn.querySelector(".swarm-ic-on")?.classList.toggle("hidden", !state.swarmMode);
+          }
+          updateSwarmTopbarPill();
+        }
+        showToast(t("errCard.retrying"));
+        sendPromptWithMode("normal");
+        return;
+      }
+
+      const userCopyBtn = e.target.closest(".user-copy-btn");
+      if (userCopyBtn) {
+        bridgeCopyText(decodeURIComponent(userCopyBtn.dataset.raw || ""));
+        haptic("light");
+        showToast(t("chat.copiedUser"));
+        return;
+      }
+
+      const userRevertBtn = e.target.closest(".user-revert-btn");
+      if (userRevertBtn) {
+        openRevertConfirmDialog({
+          msgIndex: Number(userRevertBtn.dataset.msgIdx || 0),
+          userIndex: Number(userRevertBtn.dataset.userIdx || 0),
+          time: userRevertBtn.dataset.msgTime || "",
+          text: decodeURIComponent(userRevertBtn.dataset.raw || ""),
+        });
         return;
       }
 
@@ -7273,6 +7861,12 @@
           e.preventDefault();
           return;
         }
+        const revertDlg = $("revert-confirm-dialog");
+        if (revertDlg && !revertDlg.classList.contains("hidden")) {
+          closeRevertConfirmDialog();
+          e.preventDefault();
+          return;
+        }
         for (const mid of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
           const el = $(mid);
           if (el && !el.classList.contains("hidden")) {
@@ -7309,7 +7903,38 @@
     });
     $("nav-usage")?.addEventListener("click", openUsageModal);
     $("nav-settings")?.addEventListener("click", openSettingsModal);
-    $("btn-usage-refresh")?.addEventListener("click", loadUsageData);
+    $("btn-usage-refresh")?.addEventListener("click", () => loadUsageData({ force: true }));
+    $("btn-usage-calendar")?.addEventListener("click", () => {
+      haptic("light");
+      if (state.usageWindow === "all") {
+        $("usage-calendar-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
+      state.usageCalendarOpen = !state.usageCalendarOpen;
+      renderUsageView();
+      if (state.usageCalendarOpen) {
+        $("usage-calendar-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    });
+    $("usage-body")?.addEventListener("click", (e) => {
+      const navBtn = e.target.closest("[data-cal-nav]");
+      if (navBtn) {
+        const delta = Number(navBtn.dataset.calNav || 0);
+        if (delta) {
+          haptic("light");
+          state.usageCalMonth = stepCalendarMonth(state.usageCalMonth, delta);
+          state.usageCalSelectedDate = "";
+          renderUsageView();
+        }
+        return;
+      }
+      const cell = e.target.closest("[data-cal-date]");
+      if (cell && cell.dataset.calDate) {
+        haptic("light");
+        state.usageCalSelectedDate = cell.dataset.calDate;
+        renderUsageView();
+      }
+    });
     document.querySelectorAll("[data-usage-win]").forEach((btn) => {
       btn.addEventListener("click", () => {
         haptic("light");

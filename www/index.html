@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.7.0" />
+  <link rel="stylesheet" href="./app.css?v=1.7.1" />
 </head>
 <body>
   <!-- =========================================================
@@ -603,6 +603,13 @@
       </button>
     </div>
     <div class="sheet-body">
+      <button id="btn-host-sheet-qr-scan" class="m3-btn filled full phone-only" type="button" style="margin-bottom:10px;">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
+          <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
+        </svg>
+        <span data-i18n="settings.scanAddBtn">扫描电脑二维码一键添加</span>
+      </button>
       <div id="host-sheet-list" class="host-sheet-list"></div>
       <button id="btn-host-sheet-add" class="m3-btn tonal full" type="button" data-i18n="sheet.hostAdd">＋ 添加或配对新主机</button>
     </div>
@@ -711,6 +718,25 @@
     </header>
 
     <div class="view-body settings-body">
+      <!-- Primary Phone Quick Action: Scan QR to Add/Switch Host (Topmost) -->
+      <button id="btn-settings-qr-scan" class="m3-card setup-card action-card phone-only" type="button">
+        <div class="setup-card-head">
+          <div class="m3-icon-badge primary">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
+              <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
+            </svg>
+          </div>
+          <div class="setup-card-titles">
+            <div class="setup-card-title" data-i18n="settings.scanAddBtn">扫描电脑二维码一键添加</div>
+            <div class="setup-card-desc" data-i18n="settings.scanAddDesc">直接扫电脑 /pair 二维码秒连或切换主机 · 支持相册选图</div>
+          </div>
+          <svg class="trailing-ic" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
+        </div>
+      </button>
+
       <!-- Unified Tools Section -->
       <div class="m3-card">
         <div class="section-heading" data-i18n="settings.toolbox">工具箱</div>
@@ -853,13 +879,6 @@
       <!-- Add New Host Card (Phone Client Only) -->
       <div class="m3-card phone-only">
         <div class="section-heading" data-i18n="settings.addHostHeading">添加新主机</div>
-        <button id="btn-settings-qr-scan" class="m3-btn tonal full" type="button" style="margin-bottom:12px;">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"></path>
-            <rect x="8" y="8" width="8" height="8" rx="1.5"></rect>
-          </svg>
-          <span data-i18n="settings.scanAddBtn">扫描电脑二维码一键添加</span>
-        </button>
         <div class="m3-segmented sm" role="tablist" data-i18n-aria="settings.addTabAria" aria-label="添加主机方式">
           <button type="button" class="seg-btn active" data-add-tab="pin" data-i18n="settings.addTabPin">6 位配对码</button>
           <button type="button" class="seg-btn" data-add-tab="uri" data-i18n="settings.addTabUri">配对链接</button>
@@ -965,12 +984,22 @@
         <div class="conv-title" data-i18n="usage.title">额度与用量统计</div>
         <div id="usage-subtitle" class="conv-subtitle" data-i18n="usage.subDefault">基于本机完整对话日志核算</div>
       </div>
-      <button id="btn-usage-refresh" class="m3-icon-btn" type="button" data-i18n-aria="usage.refreshAria" data-i18n-title="usage.refreshTitle" aria-label="刷新用量" title="刷新统计">
-        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="23 4 23 10 17 10"></polyline>
-          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
-        </svg>
-      </button>
+      <div class="topbar-actions">
+        <button id="btn-usage-calendar" class="m3-icon-btn" type="button" aria-pressed="false" data-i18n-aria="usage.calendarAria" data-i18n-title="usage.calendarTitle" aria-label="用量日历" title="展开/收起用量日历">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="18" rx="2.5"></rect>
+            <line x1="16" y1="2" x2="16" y2="6"></line>
+            <line x1="8" y1="2" x2="8" y2="6"></line>
+            <line x1="3" y1="10" x2="21" y2="10"></line>
+          </svg>
+        </button>
+        <button id="btn-usage-refresh" class="m3-icon-btn" type="button" data-i18n-aria="usage.refreshAria" data-i18n-title="usage.refreshTitle" aria-label="刷新用量" title="刷新统计">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+        </button>
+      </div>
     </header>
     <div class="usage-tabs-bar">
       <div id="usage-window-tabs" class="m3-segmented sm" role="tablist" data-i18n-aria="usage.tabsAria" aria-label="统计周期">
@@ -978,6 +1007,7 @@
         <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="today" data-i18n="usage.tabToday">今日</button>
         <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="3d" data-i18n="usage.tab3d">近3天</button>
         <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="7d" data-i18n="usage.tab7d">近7天</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="all" data-i18n="usage.tabAll">总计</button>
         <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="conv" data-i18n="usage.tabConv">本会话</button>
       </div>
     </div>
@@ -1023,10 +1053,27 @@
     </div>
   </div>
 
+  <!-- M3 Revert Turn Confirmation Dialog -->
+  <div id="revert-confirm-dialog" class="m3-dialog-scrim hidden" role="dialog" aria-modal="true" aria-labelledby="revert-confirm-title">
+    <div class="m3-dialog-card">
+      <div id="revert-confirm-title" class="m3-dialog-title" data-i18n="revert.title">撤回此轮对话？</div>
+      <p id="revert-confirm-desc" class="m3-dialog-desc"></p>
+      <div id="revert-confirm-preview" class="revert-preview-box"></div>
+      <label class="revert-checkbox-row">
+        <input id="revert-restore-input" type="checkbox" checked />
+        <span data-i18n="revert.restoreCheck">将撤回的提示词放回输入框以便重新编辑</span>
+      </label>
+      <div class="m3-dialog-actions">
+        <button id="btn-revert-cancel" class="m3-btn outlined sm" type="button" data-i18n="confirm.cancel">取消</button>
+        <button id="btn-revert-ok" class="m3-btn filled danger sm" type="button" data-i18n="revert.ok">确认撤回</button>
+      </div>
+    </div>
+  </div>
+
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./i18n.js?v=1.7.0"></script>
-  <script src="./app.js?v=1.7.0"></script>
+  <script src="./i18n.js?v=1.7.1"></script>
+  <script src="./app.js?v=1.7.1"></script>
 </body>
 </html>

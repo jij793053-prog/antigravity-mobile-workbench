@@ -84,7 +84,7 @@ public class MainActivity extends Activity {
     private static final String LOCAL_ENTRY_URL = VIRTUAL_APP_ORIGIN + "/www/index.html";
     private static final String MEDIA_THUMB_PATH = "/media-thumb";
     private static final String OFFICIAL_WEB_URL = "https://antigravity.google";
-    private static final String APP_VERSION_NAME = "1.7.0";
+    private static final String APP_VERSION_NAME = "1.7.1";
     private static final int FILE_CHOOSER_REQUEST_CODE = 1001;
     private static final int QR_SCAN_REQUEST_CODE = 1002;
     private static final int SAVE_FILE_REQUEST_CODE = 1003;

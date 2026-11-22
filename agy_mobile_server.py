@@ -18,6 +18,7 @@ import asyncio
 import atexit
 import collections
 from datetime import datetime, timezone
+import hashlib
 import html as html_lib
 import ipaddress
 import json
@@ -40,7 +41,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -233,7 +234,10 @@ _CF_QUICK_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 _USAGE_CACHE_LOCK = threading.Lock()
 _USAGE_FILE_CACHE: dict[str, tuple[int, int, list[tuple[float, str, int, int, int]], int]] = {}
-_USAGE_CACHE_MAX = 512
+_USAGE_CACHE_MAX = 4096
+_USAGE_GLOBAL_CACHE_LOCK = threading.Lock()
+_USAGE_GLOBAL_CACHE: tuple[float, dict[str, Any]] | None = None
+_USAGE_GLOBAL_TTL_SEC = 15.0
 
 _CTX_CACHE_LOCK = threading.Lock()
 _CTX_FILE_CACHE: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
@@ -693,6 +697,9 @@ def _load_config_unlocked() -> dict[str, Any]:
     if not isinstance(cfg.get("mobile_own_cids"), list):
         cfg["mobile_own_cids"] = []
         changed = True
+    if not isinstance(cfg.get("conv_reverts"), dict):
+        cfg["conv_reverts"] = {}
+        changed = True
     if changed:
         _save_config_unlocked(cfg)
     return cfg
@@ -825,6 +832,339 @@ def set_desktop_bridge_watermark(cli_cid: str, iso_time: str) -> None:
                 wm.pop(k, None)
 
     _update_config(_mut)
+
+
+def _msg_text_sha16(text: str) -> str:
+    return hashlib.sha1(str(text or "").encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _msg_sig(msg: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(msg.get("role") or ""),
+        str(msg.get("time") or ""),
+        _msg_text_sha16(str(msg.get("text") or "")),
+    )
+
+
+def get_conv_revert_cutoff(cid: str) -> dict[str, Any]:
+    if not cid:
+        return {}
+    canon, _ = _resolve_queue_canonical_cid(cid)
+    cfg = load_or_create_config()
+    revs = cfg.get("conv_reverts")
+    if not isinstance(revs, dict):
+        return {}
+    entry = revs.get(canon or cid) or revs.get(cid)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _filter_reverted_messages(msgs: list[dict[str, Any]], rev_info: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not msgs or not isinstance(rev_info, dict):
+        return msgs
+    raw_sigs = rev_info.get("desktop_reverted_sigs") or []
+    sig_counts: dict[tuple[str, str, str], int] = {}
+    for item in raw_sigs:
+        if isinstance(item, (list, tuple)) and len(item) >= 3:
+            key = (str(item[0] or ""), str(item[1] or ""), str(item[2] or ""))
+            sig_counts[key] = sig_counts.get(key, 0) + 1
+    if not sig_counts:
+        return msgs
+    filtered: list[dict[str, Any]] = []
+    for m in msgs:
+        if str(m.get("_src") or "desktop") == "desktop":
+            sig = _msg_sig(m)
+            cnt = sig_counts.get(sig, 0)
+            if cnt > 0:
+                sig_counts[sig] = cnt - 1
+                continue
+        filtered.append(m)
+    return filtered
+
+
+def _truncate_cli_transcript_from(
+    cli_cid: str,
+    cut_user_msg: dict[str, Any] | None,
+    cut_after_iso: str = "",
+    truncate_all: bool = False,
+) -> tuple[bool, int]:
+    """Safely back up and truncate a CLI conversation's transcript JSONL files from a target turn."""
+    if not _is_valid_cid(cli_cid):
+        return False, 0
+    cli_t = CLI_BRAIN / cli_cid / ".system_generated" / "logs" / "transcript.jsonl"
+    if not cli_t.is_file():
+        return False, 0
+    try:
+        raw_lines = [ln for ln in cli_t.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    except Exception:
+        return False, 0
+    if not raw_lines:
+        return False, 0
+
+    cut_line_idx: int | None = 0 if truncate_all else None
+    if cut_line_idx is None:
+        parsed: list[dict[str, Any]] = []
+        needed_full: set[int] = set()
+        for ln in raw_lines:
+            try:
+                o = json.loads(ln)
+            except Exception:
+                o = {}
+            parsed.append(o if isinstance(o, dict) else {})
+            if isinstance(o, dict) and o.get("type") == "USER_INPUT" and "content" in (o.get("truncated_fields") or []):
+                si = o.get("step_index")
+                if isinstance(si, int):
+                    needed_full.add(si)
+        full_map = _load_full_steps(cli_t, needed_full) if needed_full else {}
+        target_time = str((cut_user_msg or {}).get("time") or "").strip()
+        target_sha = _msg_text_sha16(str((cut_user_msg or {}).get("text") or ""))
+
+        def _norm_user_step_text(step: dict[str, Any]) -> str:
+            si = step.get("step_index")
+            src_step = full_map.get(si, step) if isinstance(si, int) else step
+            raw_u = str(src_step.get("content") or "")
+            atts = _extract_user_attachments(raw_u, src_step.get("media"))
+            return _clean_user_text(raw_u, strip_att_note=bool(atts))
+
+        for i in range(len(parsed) - 1, -1, -1):
+            st = parsed[i]
+            if st.get("type") == "USER_INPUT" and st.get("source") == "USER_EXPLICIT":
+                st_time = str(st.get("created_at") or "").strip()
+                if target_time and st_time == target_time and _msg_text_sha16(_norm_user_step_text(st)) == target_sha:
+                    cut_line_idx = i
+                    break
+        if cut_line_idx is None and cut_user_msg is not None:
+            for i in range(len(parsed) - 1, -1, -1):
+                st = parsed[i]
+                if st.get("type") == "USER_INPUT" and st.get("source") == "USER_EXPLICIT":
+                    if _msg_text_sha16(_norm_user_step_text(st)) == target_sha:
+                        cut_line_idx = i
+                        break
+        if cut_line_idx is None and cut_after_iso:
+            cut_ts = _parse_iso_ts(cut_after_iso)
+            if cut_ts > 0.0:
+                for i, st in enumerate(parsed):
+                    st_ts = _parse_iso_ts(str(st.get("created_at") or "").strip())
+                    if st_ts >= cut_ts:
+                        cut_line_idx = i
+                        break
+        if cut_line_idx is None:
+            return False, 0
+
+    keep_lines = raw_lines[:cut_line_idx]
+    removed_count = len(raw_lines) - len(keep_lines)
+    if removed_count <= 0:
+        return False, 0
+
+    ts_tag = int(time.time())
+    try:
+        bak = cli_t.with_name(f"transcript.jsonl.bak.{ts_tag}")
+        bak.write_bytes(cli_t.read_bytes())
+        tmp = cli_t.with_name(f".transcript.jsonl.tmp.{ts_tag}")
+        tmp.write_text(("\n".join(keep_lines) + "\n") if keep_lines else "", encoding="utf-8")
+        os.replace(tmp, cli_t)
+    except Exception:
+        return False, 0
+
+    cli_full = cli_t.with_name("transcript_full.jsonl")
+    if cli_full.is_file():
+        try:
+            full_raw = [ln for ln in cli_full.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+            cut_step_indices: set[int] = set()
+            for ln in raw_lines[cut_line_idx:]:
+                try:
+                    o = json.loads(ln)
+                    if isinstance(o, dict) and isinstance(o.get("step_index"), int):
+                        cut_step_indices.add(int(o["step_index"]))
+                except Exception:
+                    continue
+            if truncate_all:
+                keep_full: list[str] = []
+            else:
+                keep_full = []
+                for ln in full_raw:
+                    try:
+                        o = json.loads(ln)
+                        si = o.get("step_index") if isinstance(o, dict) else None
+                        if isinstance(si, int) and si in cut_step_indices:
+                            continue
+                    except Exception:
+                        pass
+                    keep_full.append(ln)
+            cli_full.with_name(f"transcript_full.jsonl.bak.{ts_tag}").write_bytes(cli_full.read_bytes())
+            tmp_full = cli_full.with_name(f".transcript_full.jsonl.tmp.{ts_tag}")
+            tmp_full.write_text(("\n".join(keep_full) + "\n") if keep_full else "", encoding="utf-8")
+            os.replace(tmp_full, cli_full)
+        except Exception:
+            pass
+
+    return True, removed_count
+
+
+def _revert_conversation_sync(
+    cid: str,
+    msg_index: int | None = None,
+    msg_time: str = "",
+    text_sha16: str = "",
+    user_index: int | None = None,
+) -> dict[str, Any]:
+    if not _is_valid_cid(cid):
+        return {"ok": False, "error": "invalid cid", "status": 400}
+    if _find_active_run(cid) is not None:
+        return {"ok": False, "error": "对话正在运行中，请先停止后再撤回", "status": 409}
+
+    canon, aliased_cli = _resolve_queue_canonical_cid(cid)
+    canon = canon or cid
+    detail = load_conversation_detail(cid, _keep_internal_src=True)
+    msgs = detail.get("messages") or []
+    if not msgs:
+        return {"ok": False, "error": "会话没有可撤回的消息", "status": 404}
+
+    target_idx: int | None = None
+    if isinstance(msg_index, int) and 0 <= msg_index < len(msgs) and msgs[msg_index].get("role") == "user":
+        cand = msgs[msg_index]
+        cand_sha = _msg_text_sha16(str(cand.get("text") or ""))
+        if (not text_sha16 or cand_sha == text_sha16) and (not msg_time or str(cand.get("time") or "") == msg_time):
+            target_idx = msg_index
+
+    if target_idx is None and text_sha16:
+        user_matches = [
+            i for i, m in enumerate(msgs)
+            if m.get("role") == "user" and _msg_text_sha16(str(m.get("text") or "")) == text_sha16
+        ]
+        if msg_time:
+            exact = [i for i in user_matches if str(msgs[i].get("time") or "") == msg_time]
+            if exact:
+                user_matches = exact
+        if user_matches:
+            if isinstance(msg_index, int):
+                target_idx = min(user_matches, key=lambda idx: abs(idx - msg_index))
+            else:
+                target_idx = user_matches[-1]
+
+    if target_idx is None and isinstance(user_index, int) and user_index >= 0:
+        user_positions = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+        if user_index < len(user_positions):
+            target_idx = user_positions[user_index]
+
+    if target_idx is None:
+        return {"ok": False, "error": "未找到目标用户消息，可能已被撤回或刷新", "status": 404}
+
+    target_msg = msgs[target_idx]
+    restored_prompt = str(target_msg.get("text") or "")
+    tail_msgs = msgs[target_idx:]
+    reverted_count = len(tail_msgs)
+    desk_sigs = [list(_msg_sig(m)) for m in tail_msgs if str(m.get("_src") or "desktop") == "desktop"]
+    cli_tail = [m for m in tail_msgs if str(m.get("_src") or "") == "cli"]
+    prior_cli = [m for m in msgs[:target_idx] if str(m.get("_src") or "") == "cli"]
+    prior_desk = [m for m in msgs[:target_idx] if str(m.get("_src") or "") == "desktop"]
+
+    cli_cid_to_cut = ""
+    if str(detail.get("source") or "") == "mobile":
+        cli_cid_to_cut = cid
+    elif aliased_cli:
+        cli_cid_to_cut = aliased_cli
+
+    cli_truncated = False
+    drop_alias = False
+    if cli_cid_to_cut and (cli_tail or str(target_msg.get("_src") or "") == "cli"):
+        cut_all = len(prior_cli) == 0
+        cut_user = next((m for m in cli_tail if m.get("role") == "user"), None)
+        cli_truncated, _ = _truncate_cli_transcript_from(
+            cli_cid_to_cut,
+            cut_user_msg=cut_user,
+            cut_after_iso=str(target_msg.get("time") or ""),
+            truncate_all=cut_all,
+        )
+        if cut_all and aliased_cli:
+            drop_alias = True
+
+    def _mut(cfg: dict[str, Any]) -> None:
+        if desk_sigs:
+            revs = cfg.setdefault("conv_reverts", {})
+            if not isinstance(revs, dict):
+                revs = {}
+                cfg["conv_reverts"] = revs
+            cur = revs.get(canon)
+            if not isinstance(cur, dict):
+                cur = {}
+            sigs = list(cur.get("desktop_reverted_sigs") or [])
+            sigs.extend(desk_sigs)
+            if len(sigs) > 1000:
+                sigs = sigs[-1000:]
+            revs[canon] = {
+                "desktop_reverted_sigs": sigs,
+                "reverted_at_ts": time.time(),
+                "cutoff_turn": target_idx,
+            }
+            if len(revs) > 500:
+                for k in list(revs.keys())[:-500]:
+                    revs.pop(k, None)
+        if drop_alias:
+            aliases = cfg.get("desktop_to_cli_alias")
+            if isinstance(aliases, dict):
+                aliases.pop(canon, None)
+            wm = cfg.get("desktop_bridge_watermark")
+            if isinstance(wm, dict):
+                wm.pop(cli_cid_to_cut, None)
+        elif cli_cid_to_cut and cli_truncated and aliased_cli:
+            wm = cfg.get("desktop_bridge_watermark")
+            if isinstance(wm, dict):
+                last_d_ts = ""
+                for dm in reversed(prior_desk):
+                    if dm.get("time"):
+                        last_d_ts = str(dm["time"])
+                        break
+                if last_d_ts:
+                    wm[cli_cid_to_cut] = last_d_ts
+                else:
+                    wm.pop(cli_cid_to_cut, None)
+
+    _update_config(_mut)
+
+    # Clear pending revert-invalidated failure state cleanly and refresh snapshot
+    after_detail = load_conversation_detail(canon if drop_alias else cid)
+    return {
+        "ok": True,
+        "conversation_id": cid,
+        "canonical_cid": canon,
+        "reverted_count": reverted_count,
+        "restored_prompt": restored_prompt,
+        "cli_truncated": cli_truncated,
+        "desktop_masked": len(desk_sigs),
+        "conversation": after_detail,
+    }
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _sanitize_error_text(raw: str) -> str:
+    txt = _ANSI_ESCAPE_RE.sub("", str(raw or ""))
+    txt = re.sub(r"[A-Za-z]:\\(?:[^\s\"'<>]+)", "<path>", txt)
+    txt = re.sub(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", "<email>", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt[:400]
+
+
+def _classify_run_error(err_text: str) -> str:
+    low = str(err_text or "").lower()
+    if not low:
+        return "unknown"
+    if any(k in low for k in ("quota", "exhausted", "resource_exhausted", "insufficient", "limit exceeded", "额度", "配额", "积分")):
+        return "quota"
+    if any(k in low for k in ("rate limit", "too many requests", "429", "rpm", "tpm", "频率限制")):
+        return "rate_limit"
+    if any(k in low for k in ("unauthorized", "unauthenticated", "401", "403", "permission denied", "token expired", "api key", "登录", "认证", "鉴权")):
+        return "auth"
+    if any(k in low for k in ("timeout", "timed out", "deadline exceeded", "超时")):
+        return "timeout"
+    if any(k in low for k in ("econnrefused", "connection refused", "connection reset", "fetch failed", "socket", "dns", "ssl", "tls", "unreachable", "network", "broken pipe", "offline", "网络", "连接")):
+        return "network"
+    if any(k in low for k in ("model not found", "unsupported model", "invalid model", "model", "模型")):
+        return "model"
+    if any(k in low for k in ("cancelled", "aborted", "interrupted", "sigterm", "已取消", "停止")):
+        return "cancelled"
+    return "unknown"
 
 
 def register_mobile_own_cid(cid: str) -> None:
@@ -2248,6 +2588,8 @@ def load_conversation_detail(
     cid: str,
     _include_parent: bool = True,
     _include_cli_alias: bool = True,
+    _keep_internal_src: bool = False,
+    _apply_revert_filter: bool = True,
 ) -> dict[str, Any]:
     tf, source = _locate_transcript(cid)
     title = _read_pbtxt_title(cid)
@@ -2271,13 +2613,20 @@ def load_conversation_detail(
     if _include_parent and source == "mobile":
         parent_desk = get_desktop_parent_for_cli(cid)
         if parent_desk and parent_desk != cid:
-            parent_detail = load_conversation_detail(parent_desk, _include_parent=False, _include_cli_alias=False)
+            parent_detail = load_conversation_detail(
+                parent_desk,
+                _include_parent=False,
+                _include_cli_alias=False,
+                _keep_internal_src=True,
+                _apply_revert_filter=False,
+            )
             p_msgs = parent_detail.get("messages") or []
             if p_msgs:
-                parent_msgs = list(p_msgs[-60:])
+                parent_msgs = list(p_msgs)
             if not title and parent_detail.get("title"):
                 title = str(parent_detail["title"])
 
+    own_src = "desktop" if source == "desktop" else "cli"
     own_messages: list[dict[str, Any]] = []
     deliverable_cands: list[str] = []
     last_model = ""
@@ -2303,6 +2652,7 @@ def load_conversation_detail(
                     "thinking": "\n".join(pending_thinking)[-1200:],
                     "model": last_model,
                     "time": pending_tool_time or msg_time or last_step_time,
+                    "_src": own_src,
                 })
                 pending_tools.clear()
                 pending_thinking.clear()
@@ -2319,6 +2669,7 @@ def load_conversation_detail(
                 "role": "user",
                 "text": u_txt,
                 "time": msg_time,
+                "_src": own_src,
             }
             if u_atts:
                 u_msg["attachments"] = u_atts
@@ -2357,6 +2708,7 @@ def load_conversation_detail(
                     "model": last_model,
                     "time": msg_time,
                     "isFinal": not bool(tcs),
+                    "_src": own_src,
                 })
                 pending_tools.clear()
                 pending_thinking.clear()
@@ -2371,13 +2723,20 @@ def load_conversation_detail(
             "model": last_model,
             "time": pending_tool_time or last_step_time,
             "isFinal": False,
+            "_src": own_src,
         })
 
     # If opening a Desktop conversation that also has mobile CLI continuation turns, merge them chronologically
     child_msgs: list[dict[str, Any]] = []
     aliased_cli = get_desktop_cli_alias(cid) if (_include_cli_alias and source == "desktop") else ""
     if aliased_cli and aliased_cli != cid:
-        child_detail = load_conversation_detail(aliased_cli, _include_parent=False, _include_cli_alias=False)
+        child_detail = load_conversation_detail(
+            aliased_cli,
+            _include_parent=False,
+            _include_cli_alias=False,
+            _keep_internal_src=True,
+            _apply_revert_filter=False,
+        )
         c_msgs = child_detail.get("messages") or []
         if c_msgs:
             child_msgs = list(c_msgs)
@@ -2394,6 +2753,10 @@ def load_conversation_detail(
     else:
         messages = own_messages
 
+    if _apply_revert_filter:
+        messages = _filter_reverted_messages(messages, get_conv_revert_cutoff(cid))
+
+    last_model = ""
     for m in reversed(messages):
         if m.get("model"):
             last_model = str(m["model"])
@@ -2436,13 +2799,16 @@ def load_conversation_detail(
                 "startedAt": ar.get("started_at"),
             }
 
+    out_slice = messages[-120:] if _apply_revert_filter else messages
+    out_msgs = out_slice if _keep_internal_src else [{k: v for k, v in m.items() if k != "_src"} for m in out_slice]
+
     detail_out: dict[str, Any] = {
         "id": cid,
         "title": title or f"对话 {cid[:8]}",
         "source": source,
         "model": last_model or load_or_create_config().get("default_model", "gemini-4-neon-medium"),
         "status": "running" if active_run_snap else "idle",
-        "messages": messages[-120:],
+        "messages": out_msgs,
         "deliverables": deliverables,
         "activeRun": active_run_snap,
     }
@@ -2826,11 +3192,18 @@ def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
                     q_re.insert(0, item)
                 re_snap = [_clone_queue_item(x) for x in q_re]
             _broadcast_queue_updated(canon, re_snap)
+            err_clean = _sanitize_error_text(str(res.get("error") or "队列任务启动失败"))
+            err_cat = _classify_run_error(err_clean)
             _broadcast_ws({
                 "type": "run_error",
                 "conversation_id": canon,
                 "run_id": "",
-                "error": str(res.get("error") or "队列任务启动失败")[:400],
+                "error": err_clean,
+                "error_category": err_cat,
+                "prompt": str(item.get("prompt") or ""),
+                "attachments": list(item.get("attachments") or []),
+                "model": str(item.get("model") or ""),
+                "swarm_mode": bool(item.get("swarm_mode", False)),
             })
         return res
     finally:
@@ -3152,13 +3525,24 @@ def start_cli_chat_run(
                 if cancel_reason == "interrupt":
                     should_drain = True
             elif proc.returncode not in (0, None) and not final_resp:
+                err_clean = _sanitize_error_text(run_rec.get("stderr") or f"exit code {proc.returncode}")
+                err_cat = _classify_run_error(err_clean)
                 _broadcast_ws({
                     "type": "run_error",
                     "conversation_id": cid_end,
                     "run_id": run_id,
-                    "error": (run_rec.get("stderr") or f"exit code {proc.returncode}")[:400],
+                    "error": err_clean,
+                    "error_category": err_cat,
+                    "prompt": str(run_rec.get("prompt") or ""),
+                    "attachments": [
+                        str(a.get("path") or "")
+                        for a in (run_rec.get("attachments") or [])
+                        if isinstance(a, dict) and a.get("path")
+                    ],
+                    "model": eff_model,
+                    "swarm_mode": bool(run_rec.get("swarm_mode", False)),
                 })
-                should_drain = True
+                should_drain = err_cat not in ("quota", "rate_limit", "auth")
             else:
                 _broadcast_ws({
                     "type": "run_done",
@@ -3185,9 +3569,11 @@ def start_cli_chat_run(
 
     final_cid = str(run_rec.get("display_cid") or run_rec.get("cid") or resume_cli_cid or pending_key)
     if (not run_rec["running"]) and (not run_rec.get("canceled")) and (proc.returncode not in (0, None)) and (not run_rec.get("chunks")):
+        err_sync = _sanitize_error_text(run_rec.get("stderr") or f"agy CLI 执行失败 (exit code {proc.returncode})")
         return {
             "ok": False,
-            "error": (run_rec.get("stderr") or f"agy CLI 执行失败 (exit code {proc.returncode})")[:400],
+            "error": err_sync,
+            "error_category": _classify_run_error(err_sync),
             "conversation_id": final_cid,
             "run_id": run_id,
         }
@@ -3522,6 +3908,50 @@ async def handle_conversation_swarm(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
     swarm = await asyncio.to_thread(load_conversation_swarm_status, cid, include_details=True)
     return web.json_response({"ok": True, "conversation_id": cid, "swarm": swarm})
+
+
+async def handle_conversation_revert(request: web.Request) -> web.Response:
+    global _USAGE_GLOBAL_CACHE
+    cid = str(request.match_info.get("cid") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+    msg_index = body.get("msg_index")
+    if isinstance(msg_index, bool) or not isinstance(msg_index, int):
+        msg_index = None
+    user_index = body.get("user_index")
+    if isinstance(user_index, bool) or not isinstance(user_index, int):
+        user_index = None
+    msg_time = str(body.get("time") or "").strip()
+    text_sha16 = str(body.get("text_sha16") or "").strip()
+    if not text_sha16 and isinstance(body.get("text"), str) and body.get("text"):
+        text_sha16 = _msg_text_sha16(body["text"])
+    res = await asyncio.to_thread(
+        _revert_conversation_sync,
+        cid,
+        msg_index,
+        msg_time,
+        text_sha16,
+        user_index,
+    )
+    if not res.get("ok"):
+        status = int(res.pop("status", 400))
+        return web.json_response(res, status=status)
+    if res.get("cli_truncated"):
+        with _USAGE_GLOBAL_CACHE_LOCK:
+            _USAGE_GLOBAL_CACHE = None
+    _broadcast_ws({
+        "type": "conversation_reverted",
+        "conversation_id": cid,
+        "canonical_cid": str(res.get("canonical_cid") or cid),
+        "reverted_count": int(res.get("reverted_count") or 0),
+    })
+    return web.json_response(res)
 
 
 async def handle_chat_send(request: web.Request) -> web.Response:
@@ -5501,7 +5931,9 @@ def _fetch_optional_external_quota() -> dict[str, Any] | None:
                                     "remaining_pct": float(p["remaining_pct"]) if p.get("remaining_pct") is not None else None,
                                     "h5_pct": float(p["h5_pct"]) if p.get("h5_pct") is not None else None,
                                     "weekly_pct": float(p["weekly_pct"]) if p.get("weekly_pct") is not None else None,
-                                    "reset_at": str(p.get("reset_at") or "")[:48],
+                                    "reset_at": str(p.get("reset_at") or p.get("reset_time") or "")[:48],
+                                    "h5_reset_at": str(p.get("h5_reset_at") or p.get("h5_reset_time") or "")[:48],
+                                    "weekly_reset_at": str(p.get("weekly_reset_at") or p.get("weekly_reset_time") or "")[:48],
                                     "note": str(p.get("note") or "")[:80],
                                 })
                             return {"source": str(data.get("source") or "custom")[:48], "plan": str(data.get("plan") or "")[:48], "pools": clean_pools}
@@ -5522,8 +5954,9 @@ def _fetch_optional_external_quota() -> dict[str, Any] | None:
     acct = quotas.get("account") if isinstance(quotas.get("account"), dict) else {}
     plan = str(acct.get("plan") or "").strip()[:48]
     agy_pool_specs = [
-        ("gemini", "Gemini 4 共享池 (Neon / Hydrogen / Carbon / Argon / Flash)"),
+        ("gemini", "Gemini 4 共享池 (Neon / Hydrogen / Carbon / Flash)"),
         ("opus", "Claude 5.5 池 (Opus 5.5 / Sonnet 5.5)"),
+        ("argon", "Gemini 4 Argon 独立池"),
     ]
     out_pools: list[dict[str, Any]] = []
     for key, default_label in agy_pool_specs:
@@ -5542,6 +5975,8 @@ def _fetch_optional_external_quota() -> dict[str, Any] | None:
             "h5_pct": round(float(h5), 1) if h5 is not None else None,
             "weekly_pct": round(float(wk), 1) if wk is not None else None,
             "reset_at": str(p.get("reset_time") or p.get("reset_at") or "")[:48],
+            "h5_reset_at": str(p.get("h5_reset_time") or p.get("h5_reset_at") or "")[:48],
+            "weekly_reset_at": str(p.get("weekly_reset_time") or p.get("weekly_reset_at") or "")[:48],
             "note": str(p.get("remaining_text") or "")[:80],
         })
     if not out_pools:
@@ -5554,8 +5989,7 @@ def _fetch_optional_external_quota() -> dict[str, Any] | None:
     }
 
 
-def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
-    now = time.time()
+def _compute_global_usage_buckets(now: float) -> dict[str, Any]:
     local_now = datetime.now()
     today_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     cut_7d = now - 7.0 * 86400.0
@@ -5568,6 +6002,9 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
     rec_24h: list[tuple[float, str, int, int, int]] = []
     rec_3d: list[tuple[float, str, int, int, int]] = []
     rec_7d: list[tuple[float, str, int, int, int]] = []
+    rec_all: list[tuple[float, str, int, int, int]] = []
+    daily_map: dict[str, dict[str, Any]] = {}
+    daily_conv_sets: dict[str, set[str]] = {}
     scanned_convs = 0
     seen_paths: set[str] = set()
 
@@ -5584,7 +6021,7 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
                         st = tf.stat()
                     except OSError:
                         continue
-                    if st.st_size <= 0 or st.st_mtime < cut_7d:
+                    if st.st_size <= 0:
                         continue
                     norm_p = tf.as_posix()
                     if norm_p in seen_paths:
@@ -5593,9 +6030,13 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
                     recs, _ = _parse_transcript_usage_file(tf)
                     if not recs:
                         continue
-                    scanned_convs += 1
+                    conv_has_agy = False
                     for r in recs:
-                        ts = r[0]
+                        ts, mod, in_t, ca_t, out_t = r
+                        if not _is_antigravity_usage_model(mod):
+                            continue
+                        conv_has_agy = True
+                        rec_all.append(r)
                         if ts >= cut_7d:
                             rec_7d.append(r)
                             if ts >= cut_3d:
@@ -5606,8 +6047,79 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
                                 rec_today.append(r)
                             if ts >= cut_5h:
                                 rec_5h.append(r)
+                        if ts > 0.0:
+                            day_iso = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                            d_rec = daily_map.get(day_iso)
+                            if d_rec is None:
+                                d_rec = {
+                                    "date": day_iso,
+                                    "steps": 0,
+                                    "input_tokens": 0,
+                                    "cache_read_tokens": 0,
+                                    "output_tokens": 0,
+                                    "total_tokens": 0,
+                                    "cost_usd": 0.0,
+                                    "cost_cny": 0.0,
+                                    "quota_used_est_pct": 0.0,
+                                }
+                                daily_map[day_iso] = d_rec
+                            step_usd, step_qpct = _calc_step_cost_and_quota(mod, in_t, ca_t, out_t)
+                            d_rec["steps"] += 1
+                            d_rec["input_tokens"] += in_t
+                            d_rec["cache_read_tokens"] += ca_t
+                            d_rec["output_tokens"] += out_t
+                            d_rec["total_tokens"] += in_t + ca_t + out_t
+                            d_rec["cost_usd"] += step_usd
+                            d_rec["cost_cny"] += step_usd * _USD_TO_CNY
+                            d_rec["quota_used_est_pct"] += step_qpct
+                            daily_conv_sets.setdefault(day_iso, set()).add(norm_p)
+                    if conv_has_agy:
+                        scanned_convs += 1
         except OSError:
             continue
+
+    daily_calendar: list[dict[str, Any]] = []
+    for day_iso in sorted(daily_map.keys()):
+        d_item = dict(daily_map[day_iso])
+        p_tot = d_item["input_tokens"] + d_item["cache_read_tokens"]
+        d_item["cache_hit_pct"] = round((d_item["cache_read_tokens"] * 100.0 / p_tot), 1) if p_tot > 0 else 0.0
+        d_item["cost_usd"] = round(float(d_item["cost_usd"]), 4)
+        d_item["cost_cny"] = round(float(d_item["cost_cny"]), 2)
+        d_item["quota_used_est_pct"] = round(float(d_item["quota_used_est_pct"]), 2)
+        d_item["conversations"] = len(daily_conv_sets.get(day_iso) or ())
+        daily_calendar.append(d_item)
+
+    window_all = _aggregate_usage_bucket(rec_all)
+    window_all["first_date"] = daily_calendar[0]["date"] if daily_calendar else ""
+    window_all["last_date"] = daily_calendar[-1]["date"] if daily_calendar else ""
+    window_all["active_days"] = len(daily_calendar)
+    window_all["total_conversations"] = scanned_convs
+
+    return {
+        "scanned_conversations": scanned_convs,
+        "total_conversations": scanned_convs,
+        "window_5h": _aggregate_usage_bucket(rec_5h, window_sec=5.0 * 3600.0),
+        "window_today": _aggregate_usage_bucket(rec_today, window_sec=86400.0),
+        "window_24h": _aggregate_usage_bucket(rec_24h, window_sec=86400.0),
+        "window_3d": _aggregate_usage_bucket(rec_3d, window_sec=3.0 * 86400.0, daily_days=3),
+        "window_7d": _aggregate_usage_bucket(rec_7d, window_sec=7.0 * 86400.0, daily_days=7),
+        "window_all": window_all,
+        "daily_calendar": daily_calendar,
+    }
+
+
+def compute_usage_summary(current_cid: str = "", force: bool = False) -> dict[str, Any]:
+    global _USAGE_GLOBAL_CACHE
+    now = time.time()
+    cached_global: dict[str, Any] | None = None
+    if not force:
+        with _USAGE_GLOBAL_CACHE_LOCK:
+            if _USAGE_GLOBAL_CACHE is not None and (now - _USAGE_GLOBAL_CACHE[0]) < _USAGE_GLOBAL_TTL_SEC:
+                cached_global = _USAGE_GLOBAL_CACHE[1]
+    if cached_global is None:
+        cached_global = _compute_global_usage_buckets(now)
+        with _USAGE_GLOBAL_CACHE_LOCK:
+            _USAGE_GLOBAL_CACHE = (now, cached_global)
 
     conv_usage: dict[str, Any] | None = None
     if current_cid and _is_valid_cid(current_cid):
@@ -5639,12 +6151,15 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
     return {
         "ok": True,
         "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "scanned_conversations": scanned_convs,
-        "window_5h": _aggregate_usage_bucket(rec_5h, window_sec=5.0 * 3600.0),
-        "window_today": _aggregate_usage_bucket(rec_today, window_sec=86400.0),
-        "window_24h": _aggregate_usage_bucket(rec_24h, window_sec=86400.0),
-        "window_3d": _aggregate_usage_bucket(rec_3d, window_sec=3.0 * 86400.0, daily_days=3),
-        "window_7d": _aggregate_usage_bucket(rec_7d, window_sec=7.0 * 86400.0, daily_days=7),
+        "scanned_conversations": cached_global["scanned_conversations"],
+        "total_conversations": cached_global["total_conversations"],
+        "window_5h": cached_global["window_5h"],
+        "window_today": cached_global["window_today"],
+        "window_24h": cached_global["window_24h"],
+        "window_3d": cached_global["window_3d"],
+        "window_7d": cached_global["window_7d"],
+        "window_all": cached_global["window_all"],
+        "daily_calendar": cached_global["daily_calendar"],
         "current_conversation": conv_usage,
         "external_quota": _fetch_optional_external_quota(),
     }
@@ -5654,7 +6169,8 @@ async def handle_usage(request: web.Request) -> web.Response:
     cid = str(request.query.get("cid") or "").strip()
     if cid and not _is_valid_cid(cid):
         cid = ""
-    summary = await asyncio.to_thread(compute_usage_summary, cid)
+    force = str(request.query.get("force") or "").strip().lower() in ("1", "true", "yes")
+    summary = await asyncio.to_thread(compute_usage_summary, cid, force)
     return web.json_response(summary)
 
 
@@ -6691,6 +7207,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/conversations/{cid}", handle_conversation_detail)
     app.router.add_get("/api/conversations/{cid}/context", handle_conversation_context)
     app.router.add_get("/api/conversations/{cid}/swarm", handle_conversation_swarm)
+    app.router.add_post("/api/conversations/{cid}/revert", handle_conversation_revert)
     app.router.add_post("/api/chat/send", handle_chat_send)
     app.router.add_get("/api/chat/queue/{cid}", handle_chat_queue_get)
     app.router.add_post("/api/chat/queue/{cid}/resume", handle_chat_queue_resume)
