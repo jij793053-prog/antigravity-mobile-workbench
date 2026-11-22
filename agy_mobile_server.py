@@ -40,8 +40,8 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.6"
-APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
+APP_VERSION = "1.7.0"
+APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
 WWW_DIR = PROJECT_DIR / "www"
@@ -86,6 +86,11 @@ HOST = os.environ.get("AGY_MOBILE_HOST", "0.0.0.0")
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _STEP_IDX_RE = re.compile(r'"step_index"\s*:\s*(\d+)')
 _CID_RE = re.compile(r"^[A-Za-z0-9_-]{6,80}$")
+_QUEUE_ITEM_ID_RE = re.compile(r"^q_[0-9a-f]{6,24}$")
+_SAFE_HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_WIN_ABS_PATH_RE = re.compile(r"\b[A-Za-z]:[/\\][^\s\"'<>|()]+")
+_UNIX_HOME_PATH_RE = re.compile(r"/(?:Users|home)/[^\s\"'<>|()]+")
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 _LOOPBACK_HOST_RE = re.compile(r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$", re.IGNORECASE)
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -182,6 +187,10 @@ _KNOWN_MODEL_IDS: frozenset[str] = frozenset(
 _CONFIG_LOCK = threading.Lock()
 _ACTIVE_RUNS_LOCK = threading.Lock()
 _ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
+_CONV_QUEUES_LOCK = threading.Lock()
+_CONV_QUEUES: dict[str, list[dict[str, Any]]] = {}
+_CONV_QUEUE_MAX = 20
+_DRAINING_CIDS: set[str] = set()
 _PENDING_SPAWNS: int = 0
 _MAX_CONCURRENT_RUNS = 4
 _WS_CLIENTS: set[web.WebSocketResponse] = set()
@@ -225,6 +234,19 @@ _CF_QUICK_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 _USAGE_CACHE_LOCK = threading.Lock()
 _USAGE_FILE_CACHE: dict[str, tuple[int, int, list[tuple[float, str, int, int, int]], int]] = {}
 _USAGE_CACHE_MAX = 512
+
+_CTX_CACHE_LOCK = threading.Lock()
+_CTX_FILE_CACHE: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+_CTX_CACHE_MAX = 256
+
+_LIVE_CTX_CACHE_LOCK = threading.Lock()
+_LIVE_CTX_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_LIVE_CTX_CACHE_TTL_SEC = 3.0
+_LIVE_CTX_CACHE_MAX = 128
+
+_SWARM_ACTION_CACHE_LOCK = threading.Lock()
+_SWARM_ACTION_CACHE: dict[str, tuple[int, int, str]] = {}
+_SWARM_ACTION_CACHE_MAX = 256
 
 
 # ---------------------------------------------------------------------------
@@ -2414,7 +2436,7 @@ def load_conversation_detail(
                 "startedAt": ar.get("started_at"),
             }
 
-    return {
+    detail_out: dict[str, Any] = {
         "id": cid,
         "title": title or f"对话 {cid[:8]}",
         "source": source,
@@ -2424,6 +2446,11 @@ def load_conversation_detail(
         "deliverables": deliverables,
         "activeRun": active_run_snap,
     }
+    if _include_parent or _include_cli_alias:
+        detail_out["queue"] = get_conv_queue_snapshot(cid)
+        detail_out["context_window"] = compute_conversation_context_window(cid)
+        detail_out["swarm_summary"] = load_conversation_swarm_summary(cid)
+    return detail_out
 
 
 def _build_desktop_initial_bridge(desktop_cid: str) -> tuple[str, str]:
@@ -2561,6 +2588,256 @@ def _broadcast_ws(payload: dict[str, Any]) -> None:
         pass
 
 
+def _resolve_queue_canonical_cid(cid: str) -> tuple[str, str]:
+    """Resolve (canonical_cid, aliased_cid) across desktop_to_cli_alias and pending-<run_id>."""
+    c = str(cid or "").strip()
+    if not c or c == "__new__":
+        return "", ""
+    if c.startswith("pending-"):
+        with _ACTIVE_RUNS_LOCK:
+            rec = _ACTIVE_RUNS.get(c)
+            if rec:
+                real = str(rec.get("display_cid") or rec.get("cid") or "").strip()
+                if real and not real.startswith("pending-"):
+                    c = real
+    parent_desk = get_desktop_parent_for_cli(c)
+    if parent_desk and parent_desk != c:
+        return parent_desk, c
+    cli_alias = get_desktop_cli_alias(c)
+    if cli_alias and cli_alias != c:
+        return c, cli_alias
+    return c, ""
+
+
+def _get_cid_alias_candidates(cid: str) -> tuple[str, str, list[str]]:
+    canon, alias = _resolve_queue_canonical_cid(cid)
+    cands: list[str] = []
+    for k in (cid, canon, alias):
+        if k and k not in cands:
+            cands.append(k)
+    return canon, alias, cands
+
+
+def _find_active_run(cid: str) -> dict[str, Any] | None:
+    if not cid or cid == "__new__":
+        return None
+    _, _, cands = _get_cid_alias_candidates(cid)
+    with _ACTIVE_RUNS_LOCK:
+        for k in cands:
+            rec = _ACTIVE_RUNS.get(k)
+            if rec and rec.get("running"):
+                return rec
+    return None
+
+
+def _clone_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(item.get("id") or ""),
+        "prompt": str(item.get("prompt") or ""),
+        "model": str(item.get("model") or ""),
+        "attachments": list(item.get("attachments") or []),
+        "swarm_mode": bool(item.get("swarm_mode", False)),
+        "priority": "urgent" if str(item.get("priority") or "") == "urgent" else "normal",
+        "created_at": str(item.get("created_at") or ""),
+    }
+
+
+def _consolidate_queue_unlocked(canon: str, cands: list[str]) -> list[dict[str, Any]]:
+    """Merge any queue entries stored under alternate keys (pending-*/cli alias) into `canon`."""
+    if not canon:
+        return []
+    target = _CONV_QUEUES.get(canon)
+    seen_ids = {str(it.get("id") or "") for it in (target or [])}
+    for k in cands:
+        if not k or k == canon:
+            continue
+        other = _CONV_QUEUES.pop(k, None)
+        if not other:
+            continue
+        if target is None:
+            target = []
+            _CONV_QUEUES[canon] = target
+        for it in other:
+            it_id = str(it.get("id") or "")
+            if it_id and it_id in seen_ids:
+                continue
+            if len(target) >= _CONV_QUEUE_MAX:
+                break
+            target.append(it)
+            if it_id:
+                seen_ids.add(it_id)
+    if target is not None and not target:
+        _CONV_QUEUES.pop(canon, None)
+        return []
+    return target if target is not None else []
+
+
+def _migrate_conv_queue(old_cid: str, new_cid: str) -> list[dict[str, Any]] | None:
+    """Move queued items from `old_cid` (e.g. pending-<run_id> or CLI alias) to `new_cid`."""
+    o = str(old_cid or "").strip()
+    n = str(new_cid or "").strip()
+    if not o or not n or o == n:
+        return None
+    canon, _ = _resolve_queue_canonical_cid(n)
+    dest = canon or n
+    if dest == o:
+        return None
+    migrated = False
+    snap: list[dict[str, Any]] = []
+    with _CONV_QUEUES_LOCK:
+        old_items = _CONV_QUEUES.pop(o, None)
+        if old_items:
+            migrated = True
+            dst_list = _CONV_QUEUES.setdefault(dest, [])
+            seen_ids = {str(it.get("id") or "") for it in dst_list}
+            for it in old_items:
+                it_id = str(it.get("id") or "")
+                if it_id and it_id in seen_ids:
+                    continue
+                if len(dst_list) >= _CONV_QUEUE_MAX:
+                    break
+                dst_list.append(it)
+                if it_id:
+                    seen_ids.add(it_id)
+            snap = [_clone_queue_item(it) for it in dst_list]
+    if migrated:
+        _broadcast_queue_updated(dest, snap)
+        return snap
+    return None
+
+
+def get_conv_queue_snapshot(cid: str) -> list[dict[str, Any]]:
+    c = str(cid or "").strip()
+    if not c or c == "__new__":
+        return []
+    canon, _, cands = _get_cid_alias_candidates(c)
+    if not canon:
+        return []
+    with _CONV_QUEUES_LOCK:
+        items = _consolidate_queue_unlocked(canon, cands)
+        return [_clone_queue_item(it) for it in items]
+
+
+def _broadcast_queue_updated(cid: str, queue_snap: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    canon, alias = _resolve_queue_canonical_cid(cid)
+    target_cid = canon or str(cid or "").strip()
+    snap = queue_snap if queue_snap is not None else get_conv_queue_snapshot(target_cid)
+    payload: dict[str, Any] = {
+        "type": "queue_updated",
+        "conversation_id": target_cid,
+        "queue": snap,
+    }
+    if alias and alias != target_cid:
+        payload["aliased_cid"] = alias
+    _broadcast_ws(payload)
+    return snap
+
+
+def _terminate_proc_safely(proc: subprocess.Popen[Any] | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    if os.name != "nt":
+        def _kill_if_stuck(p: subprocess.Popen[Any]) -> None:
+            try:
+                p.wait(timeout=3.0)
+            except Exception:
+                try:
+                    if p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
+        threading.Thread(target=_kill_if_stuck, args=(proc,), daemon=True).start()
+
+
+def _validate_chat_attachments(attachments: list[Any] | None) -> tuple[list[pathlib.Path] | None, str]:
+    att_roots: tuple[pathlib.Path, ...] = tuple(r.resolve() for r in (UPLOAD_DIR, WORKSPACE_ROOT))
+    valid_att_paths: list[pathlib.Path] = []
+    for raw_a in (attachments or []):
+        s_a = str(raw_a or "").strip()
+        if not s_a:
+            continue
+        if _has_unsafe_raw_path(s_a, allow_absolute=True):
+            return None, "附件路径格式无效"
+        try:
+            ap = pathlib.Path(s_a).resolve()
+        except Exception:
+            return None, "附件路径解析失败"
+        if not ap.is_file() or not _is_within_allowed_roots(ap, att_roots) or _is_sensitive_path(ap):
+            return None, "附件不存在或超出允许目录范围"
+        valid_att_paths.append(ap)
+    return valid_att_paths, ""
+
+
+def _build_queue_item(
+    prompt: str,
+    model: str,
+    attachments: list[str],
+    swarm_mode: bool = False,
+    priority: str = "normal",
+) -> dict[str, Any]:
+    return {
+        "id": f"q_{secrets.token_hex(5)}",
+        "prompt": str(prompt or "").strip(),
+        "model": str(model or "").strip(),
+        "attachments": list(attachments),
+        "swarm_mode": bool(swarm_mode),
+        "priority": "urgent" if priority == "urgent" else "normal",
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
+    """Atomically pop queue[0] for `cid` when idle and launch the next CLI chat run."""
+    canon, _, cands = _get_cid_alias_candidates(cid)
+    if not canon:
+        return None
+    with _CONV_QUEUES_LOCK:
+        if canon in _DRAINING_CIDS:
+            return None
+        _DRAINING_CIDS.add(canon)
+    try:
+        if _find_active_run(canon) is not None:
+            return None
+        with _CONV_QUEUES_LOCK:
+            q = _consolidate_queue_unlocked(canon, cands)
+            if not q:
+                return None
+            item = q.pop(0)
+            if not q:
+                _CONV_QUEUES.pop(canon, None)
+            snap = [_clone_queue_item(x) for x in q]
+        _broadcast_queue_updated(canon, snap)
+        res = start_cli_chat_run(
+            canon,
+            str(item.get("prompt") or ""),
+            str(item.get("model") or ""),
+            list(item.get("attachments") or []),
+            bool(item.get("swarm_mode", False)),
+        )
+        if not res.get("ok"):
+            # Re-insert at index 0 so the user's queued message is never silently lost
+            with _CONV_QUEUES_LOCK:
+                q_re = _CONV_QUEUES.setdefault(canon, [])
+                if len(q_re) < _CONV_QUEUE_MAX:
+                    q_re.insert(0, item)
+                re_snap = [_clone_queue_item(x) for x in q_re]
+            _broadcast_queue_updated(canon, re_snap)
+            _broadcast_ws({
+                "type": "run_error",
+                "conversation_id": canon,
+                "run_id": "",
+                "error": str(res.get("error") or "队列任务启动失败")[:400],
+            })
+        return res
+    finally:
+        with _CONV_QUEUES_LOCK:
+            _DRAINING_CIDS.discard(canon)
+
+
 def start_cli_chat_run(
     requested_cid: str,
     prompt: str,
@@ -2574,7 +2851,7 @@ def start_cli_chat_run(
         return {"ok": False, "error": "未找到官方 agy CLI（请安装 Antigravity CLI 或设置环境变量 AGY_CLI_BIN）"}
 
     req_cid = str(requested_cid or "").strip()
-    is_new = (not req_cid) or req_cid == "__new__"
+    is_new = (not req_cid) or req_cid == "__new__" or req_cid.startswith("pending-")
     if not is_new and not _is_valid_cid(req_cid):
         return {"ok": False, "error": "无效的会话 ID"}
 
@@ -2583,21 +2860,9 @@ def start_cli_chat_run(
         return {"ok": False, "error": "无效的模型名称"}
 
     # Validate attachments strictly against UPLOAD_DIR / WORKSPACE_ROOT before building prompt
-    att_roots: tuple[pathlib.Path, ...] = tuple(r.resolve() for r in (UPLOAD_DIR, WORKSPACE_ROOT))
-    valid_att_paths: list[pathlib.Path] = []
-    for raw_a in (attachments or []):
-        s_a = str(raw_a or "").strip()
-        if not s_a:
-            continue
-        if _has_unsafe_raw_path(s_a, allow_absolute=True):
-            return {"ok": False, "error": "附件路径格式无效"}
-        try:
-            ap = pathlib.Path(s_a).resolve()
-        except Exception:
-            return {"ok": False, "error": "附件路径解析失败"}
-        if not ap.is_file() or not _is_within_allowed_roots(ap, att_roots) or _is_sensitive_path(ap):
-            return {"ok": False, "error": "附件不存在或超出允许目录范围"}
-        valid_att_paths.append(ap)
+    valid_att_paths, att_err = _validate_chat_attachments(attachments)
+    if valid_att_paths is None:
+        return {"ok": False, "error": att_err}
 
     resume_cli_cid = ""
     source_desktop_cid = ""
@@ -2709,10 +2974,12 @@ def start_cli_chat_run(
         "prompt": prompt,
         "attachments": att_metas,
         "model": eff_model,
+        "swarm_mode": bool(swarm_mode),
         "tools": [],
         "chunks": [],
         "running": True,
         "canceled": False,
+        "cancel_reason": "",
         "started_at": time.time(),
         "stderr": "",
     }
@@ -2755,6 +3022,7 @@ def start_cli_chat_run(
                 return
             if source_desktop_cid and source_desktop_cid != cli_id:
                 set_desktop_cli_alias(source_desktop_cid, cli_id)
+                _migrate_conv_queue(cli_id, source_desktop_cid)
                 if pending_watermark and not wm_persisted:
                     set_desktop_bridge_watermark(cli_id, pending_watermark)
                     wm_persisted = True
@@ -2785,6 +3053,7 @@ def start_cli_chat_run(
                                 _ACTIVE_RUNS[cid_i] = run_rec
                                 _ACTIVE_RUNS[disp_cid] = run_rec
                             _persist_binding(cid_i)
+                            _migrate_conv_queue(pending_key, disp_cid)
                             _broadcast_ws({
                                 "type": "run_init",
                                 "conversation_id": disp_cid,
@@ -2805,6 +3074,7 @@ def start_cli_chat_run(
                                 _ACTIVE_RUNS[bound_cid] = run_rec
                                 _ACTIVE_RUNS[disp_cid] = run_rec
                             _persist_binding(bound_cid)
+                            _migrate_conv_queue(pending_key, disp_cid)
                             init_evt.set()
                         st_type = str(su.get("step_type") or "")
                         if st_type == "tool":
@@ -2847,6 +3117,7 @@ def start_cli_chat_run(
                             run_rec["cid"] = bound_cid
                             run_rec["display_cid"] = disp_cid
                             _persist_binding(bound_cid)
+                            _migrate_conv_queue(pending_key, disp_cid)
                             init_evt.set()
                         final_resp = _clean_assistant_text(str(ro.get("response") or ""))
                         if isinstance(ro.get("usage"), dict):
@@ -2860,13 +3131,26 @@ def start_cli_chat_run(
             if not final_resp and run_rec["chunks"]:
                 final_resp = _clean_assistant_text("".join(run_rec["chunks"]))
             cid_end = disp_cid or bound_cid or run_rec.get("display_cid") or run_rec.get("cid") or pending_key
+            if cid_end != pending_key:
+                _migrate_conv_queue(pending_key, cid_end)
+            if bound_cid and bound_cid != cid_end:
+                _migrate_conv_queue(bound_cid, cid_end)
             with _ACTIVE_RUNS_LOCK:
                 for k_rm in (pending_key, cid_end, bound_cid, run_rec.get("display_cid") or "", run_rec.get("cid") or ""):
                     if k_rm and _ACTIVE_RUNS.get(k_rm) is run_rec:
                         _ACTIVE_RUNS.pop(k_rm, None)
             init_evt.set()
+            cancel_reason = str(run_rec.get("cancel_reason") or ("user" if run_rec.get("canceled") else ""))
+            should_drain = False
             if run_rec.get("canceled"):
-                _broadcast_ws({"type": "run_canceled", "conversation_id": cid_end, "run_id": run_id})
+                _broadcast_ws({
+                    "type": "run_canceled",
+                    "conversation_id": cid_end,
+                    "run_id": run_id,
+                    "reason": cancel_reason or "user",
+                })
+                if cancel_reason == "interrupt":
+                    should_drain = True
             elif proc.returncode not in (0, None) and not final_resp:
                 _broadcast_ws({
                     "type": "run_error",
@@ -2874,6 +3158,7 @@ def start_cli_chat_run(
                     "run_id": run_id,
                     "error": (run_rec.get("stderr") or f"exit code {proc.returncode}")[:400],
                 })
+                should_drain = True
             else:
                 _broadcast_ws({
                     "type": "run_done",
@@ -2884,6 +3169,15 @@ def start_cli_chat_run(
                     "usage": usage,
                     "model": eff_model,
                 })
+                should_drain = True
+
+            if should_drain and get_conv_queue_snapshot(cid_end):
+                threading.Thread(
+                    target=_drain_next_queued_run,
+                    args=(cid_end,),
+                    name=f"queue-drain-{cid_end[:8]}",
+                    daemon=True,
+                ).start()
 
     threading.Thread(target=_stream_worker, daemon=True).start()
     if not run_rec["display_cid"]:
@@ -2995,7 +3289,7 @@ async def cors_and_auth_middleware(request: web.Request, handler):
             status=204,
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With",
                 "Access-Control-Max-Age": "86400",
                 "X-Content-Type-Options": "nosniff",
@@ -3214,6 +3508,22 @@ async def handle_conversation_detail(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "conversation": detail})
 
 
+async def handle_conversation_context(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    cw = await asyncio.to_thread(compute_conversation_context_window, cid)
+    return web.json_response({"ok": True, "conversation_id": cid, "context_window": cw})
+
+
+async def handle_conversation_swarm(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    swarm = await asyncio.to_thread(load_conversation_swarm_status, cid, include_details=True)
+    return web.json_response({"ok": True, "conversation_id": cid, "swarm": swarm})
+
+
 async def handle_chat_send(request: web.Request) -> web.Response:
     try:
         body = await request.json()
@@ -3230,29 +3540,367 @@ async def handle_chat_send(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "invalid model"}, status=400)
     attachments = body.get("attachments") if isinstance(body.get("attachments"), list) else []
     swarm_mode = bool(body.get("swarm_mode", False))
+    mode = str(body.get("mode") or "normal").strip().lower()
+    if mode not in ("normal", "queue", "interrupt"):
+        return web.json_response({"ok": False, "error": "invalid mode"}, status=400)
+    priority = "urgent" if str(body.get("priority") or "").strip().lower() == "urgent" else "normal"
+
+    valid_att_paths, att_err = await asyncio.to_thread(_validate_chat_attachments, attachments)
+    if valid_att_paths is None:
+        return web.json_response({"ok": False, "error": att_err}, status=400)
+    norm_atts = [ap.as_posix() for ap in valid_att_paths]
+    if not prompt.strip() and not norm_atts:
+        return web.json_response({"ok": False, "error": "消息内容不能为空"}, status=400)
+
     if model:
         _update_config(lambda cfg: cfg.__setitem__("default_model", model))
-    res = await asyncio.to_thread(start_cli_chat_run, cid, prompt, model, attachments, swarm_mode)
-    return web.json_response(res, status=200 if res.get("ok") else 400)
+    eff_model = model or str(load_or_create_config().get("default_model") or "gemini-4-neon-medium").strip()
+
+    is_new = (not cid) or cid == "__new__"
+    canon = ""
+    cands: list[str] = []
+    active_rec: dict[str, Any] | None = None
+    if not is_new:
+        canon, _, cands = _get_cid_alias_candidates(cid)
+        active_rec = _find_active_run(canon or cid)
+
+    # Idle conversation (or new chat): execute immediately
+    if active_rec is None:
+        res = await asyncio.to_thread(start_cli_chat_run, canon or cid, prompt, eff_model, norm_atts, swarm_mode)
+        if res.get("ok"):
+            res["queued"] = False
+        return web.json_response(res, status=200 if res.get("ok") else 400)
+
+    target_cid = canon or cid
+    item_priority = "urgent" if (mode == "interrupt" or priority == "urgent") else "normal"
+    item = _build_queue_item(prompt, eff_model, norm_atts, swarm_mode=swarm_mode, priority=item_priority)
+    with _CONV_QUEUES_LOCK:
+        q = _consolidate_queue_unlocked(target_cid, cands)
+        if len(q) >= _CONV_QUEUE_MAX:
+            return web.json_response(
+                {"ok": False, "error": f"当前会话排队消息已达上限（{_CONV_QUEUE_MAX} 条），请先等待或删减后再试"},
+                status=400,
+            )
+        if target_cid not in _CONV_QUEUES:
+            _CONV_QUEUES[target_cid] = q
+        if item_priority == "urgent":
+            q.insert(0, item)
+        else:
+            q.append(item)
+        snap = [_clone_queue_item(x) for x in q]
+
+    item_snap = _clone_queue_item(item)
+
+    if mode == "interrupt":
+        proc = None
+        still_running = False
+        with _ACTIVE_RUNS_LOCK:
+            for k in cands:
+                cur_rec = _ACTIVE_RUNS.get(k)
+                if cur_rec and cur_rec.get("running"):
+                    cur_rec["canceled"] = True
+                    cur_rec["cancel_reason"] = "interrupt"
+                    proc = cur_rec.get("proc")
+                    still_running = True
+                    break
+        _broadcast_queue_updated(target_cid, snap)
+        if proc is not None:
+            _terminate_proc_safely(proc)
+        elif not still_running:
+            threading.Thread(
+                target=_drain_next_queued_run,
+                args=(target_cid,),
+                name=f"queue-drain-{target_cid[:8]}",
+                daemon=True,
+            ).start()
+        return web.json_response({
+            "ok": True,
+            "queued": True,
+            "interrupting": True,
+            "conversation_id": target_cid,
+            "item": item_snap,
+            "queue": snap,
+        })
+
+    _broadcast_queue_updated(target_cid, snap)
+    # Race guard: if the active run finished just before enqueue landed (and wasn't user-canceled), drain now
+    if (
+        not active_rec.get("running")
+        and str(active_rec.get("cancel_reason") or "") != "user"
+        and _find_active_run(target_cid) is None
+    ):
+        threading.Thread(
+            target=_drain_next_queued_run,
+            args=(target_cid,),
+            name=f"queue-drain-{target_cid[:8]}",
+            daemon=True,
+        ).start()
+    return web.json_response({
+        "ok": True,
+        "queued": True,
+        "conversation_id": target_cid,
+        "item": item_snap,
+        "queue": snap,
+    })
+
+
+async def handle_chat_queue_get(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    canon, _ = _resolve_queue_canonical_cid(cid)
+    target_cid = canon or cid
+    snap = get_conv_queue_snapshot(target_cid)
+    return web.json_response({"ok": True, "conversation_id": target_cid, "queue": snap})
+
+
+async def handle_chat_queue_update(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    item_id = str(request.match_info.get("item_id") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    if not item_id or not _QUEUE_ITEM_ID_RE.match(item_id):
+        return web.json_response({"ok": False, "error": "invalid item_id"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+
+    has_model = "model" in body
+    new_model = ""
+    if has_model:
+        new_model = str(body.get("model") or "").strip()
+        if new_model and not _is_valid_model_id(new_model):
+            return web.json_response({"ok": False, "error": "invalid model"}, status=400)
+
+    has_atts = "attachments" in body
+    norm_atts: list[str] | None = None
+    if has_atts:
+        if not isinstance(body.get("attachments"), list):
+            return web.json_response({"ok": False, "error": "invalid attachments"}, status=400)
+        valid_att_paths, att_err = await asyncio.to_thread(_validate_chat_attachments, body.get("attachments"))
+        if valid_att_paths is None:
+            return web.json_response({"ok": False, "error": att_err}, status=400)
+        norm_atts = [ap.as_posix() for ap in valid_att_paths]
+
+    has_prompt = "prompt" in body
+    new_prompt = str(body.get("prompt") or "").strip() if has_prompt else ""
+    has_swarm = "swarm_mode" in body
+    new_swarm = bool(body.get("swarm_mode")) if has_swarm else False
+    has_priority = "priority" in body
+    new_priority = str(body.get("priority") or "").strip().lower() if has_priority else ""
+    if has_priority and new_priority not in ("normal", "urgent"):
+        return web.json_response({"ok": False, "error": "invalid priority"}, status=400)
+    move_to_front = bool(body.get("move_to_front", False))
+
+    canon, _, cands = _get_cid_alias_candidates(cid)
+    target_cid = canon or cid
+    item_snap: dict[str, Any] | None = None
+    snap: list[dict[str, Any]] = []
+    empty_err = False
+    with _CONV_QUEUES_LOCK:
+        q = _consolidate_queue_unlocked(target_cid, cands)
+        idx = -1
+        for i, it in enumerate(q):
+            if str(it.get("id") or "") == item_id:
+                idx = i
+                break
+        if idx >= 0:
+            it = q[idx]
+            eff_prompt = new_prompt if has_prompt else str(it.get("prompt") or "").strip()
+            eff_atts = norm_atts if (has_atts and norm_atts is not None) else list(it.get("attachments") or [])
+            if not eff_prompt and not eff_atts:
+                empty_err = True
+            else:
+                if has_prompt:
+                    it["prompt"] = eff_prompt
+                if has_atts and norm_atts is not None:
+                    it["attachments"] = list(norm_atts)
+                if has_model and new_model:
+                    it["model"] = new_model
+                if has_swarm:
+                    it["swarm_mode"] = new_swarm
+                if has_priority:
+                    it["priority"] = new_priority
+                if move_to_front:
+                    q.pop(idx)
+                    if not has_priority:
+                        it["priority"] = "urgent"
+                    q.insert(0, it)
+                item_snap = _clone_queue_item(it)
+                snap = [_clone_queue_item(x) for x in q]
+    if empty_err:
+        return web.json_response({"ok": False, "error": "消息内容不能为空"}, status=400)
+    if item_snap is None:
+        return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
+    _broadcast_queue_updated(target_cid, snap)
+    return web.json_response({"ok": True, "conversation_id": target_cid, "item": item_snap, "queue": snap})
+
+
+async def handle_chat_queue_delete(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    item_id = str(request.match_info.get("item_id") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    if not item_id or not _QUEUE_ITEM_ID_RE.match(item_id):
+        return web.json_response({"ok": False, "error": "invalid item_id"}, status=400)
+    canon, _, cands = _get_cid_alias_candidates(cid)
+    target_cid = canon or cid
+    found = False
+    snap: list[dict[str, Any]] = []
+    with _CONV_QUEUES_LOCK:
+        q = _consolidate_queue_unlocked(target_cid, cands)
+        for i, it in enumerate(q):
+            if str(it.get("id") or "") == item_id:
+                q.pop(i)
+                found = True
+                break
+        if found:
+            if not q:
+                _CONV_QUEUES.pop(target_cid, None)
+            snap = [_clone_queue_item(x) for x in q]
+    if not found:
+        return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
+    _broadcast_queue_updated(target_cid, snap)
+    return web.json_response({"ok": True, "conversation_id": target_cid, "deleted": True, "queue": snap})
+
+
+async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    item_id = str(request.match_info.get("item_id") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    if not item_id or not _QUEUE_ITEM_ID_RE.match(item_id):
+        return web.json_response({"ok": False, "error": "invalid item_id"}, status=400)
+    canon, _, cands = _get_cid_alias_candidates(cid)
+    target_cid = canon or cid
+    found = False
+    snap: list[dict[str, Any]] = []
+    with _CONV_QUEUES_LOCK:
+        q = _consolidate_queue_unlocked(target_cid, cands)
+        for i, it in enumerate(q):
+            if str(it.get("id") or "") == item_id:
+                moved = q.pop(i)
+                moved["priority"] = "urgent"
+                q.insert(0, moved)
+                found = True
+                break
+        if found:
+            snap = [_clone_queue_item(x) for x in q]
+    if not found:
+        return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
+
+    proc = None
+    still_running = False
+    with _ACTIVE_RUNS_LOCK:
+        for k in cands:
+            cur_rec = _ACTIVE_RUNS.get(k)
+            if cur_rec and cur_rec.get("running"):
+                cur_rec["canceled"] = True
+                cur_rec["cancel_reason"] = "interrupt"
+                proc = cur_rec.get("proc")
+                still_running = True
+                break
+
+    if still_running:
+        _broadcast_queue_updated(target_cid, snap)
+        if proc is not None:
+            _terminate_proc_safely(proc)
+        return web.json_response({
+            "ok": True,
+            "conversation_id": target_cid,
+            "interrupting": True,
+            "queue": snap,
+        })
+
+    # Conversation is idle: pop index 0 and launch immediately
+    res = await asyncio.to_thread(_drain_next_queued_run, target_cid)
+    after_snap = get_conv_queue_snapshot(target_cid)
+    if res is not None and not res.get("ok"):
+        return web.json_response(
+            {
+                "ok": False,
+                "error": str(res.get("error") or "插队启动失败"),
+                "conversation_id": target_cid,
+                "interrupting": False,
+                "queue": after_snap,
+            },
+            status=400,
+        )
+    return web.json_response({
+        "ok": True,
+        "conversation_id": target_cid,
+        "interrupting": True,
+        "started": bool(res and res.get("ok")),
+        "run_id": str((res or {}).get("run_id") or ""),
+        "queue": after_snap,
+    })
+
+
+async def handle_chat_queue_resume(request: web.Request) -> web.Response:
+    cid = str(request.match_info.get("cid") or "").strip()
+    if not _is_valid_cid(cid):
+        return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    canon, _ = _resolve_queue_canonical_cid(cid)
+    target_cid = canon or cid
+    if _find_active_run(target_cid) is not None:
+        return web.json_response({
+            "ok": True,
+            "conversation_id": target_cid,
+            "started": False,
+            "queue": get_conv_queue_snapshot(target_cid),
+        })
+    if not get_conv_queue_snapshot(target_cid):
+        return web.json_response({
+            "ok": True,
+            "conversation_id": target_cid,
+            "started": False,
+            "queue": [],
+        })
+    res = await asyncio.to_thread(_drain_next_queued_run, target_cid)
+    after_snap = get_conv_queue_snapshot(target_cid)
+    if res is not None and not res.get("ok"):
+        return web.json_response(
+            {
+                "ok": False,
+                "error": str(res.get("error") or "继续执行队列失败"),
+                "conversation_id": target_cid,
+                "started": False,
+                "queue": after_snap,
+            },
+            status=400,
+        )
+    return web.json_response({
+        "ok": True,
+        "conversation_id": target_cid,
+        "started": bool(res and res.get("ok")),
+        "run_id": str((res or {}).get("run_id") or ""),
+        "queue": after_snap,
+    })
 
 
 async def handle_chat_cancel(request: web.Request) -> web.Response:
     cid = str(request.match_info.get("cid") or "").strip()
     if not _is_valid_cid(cid):
         return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
+    canon, _, cands = _get_cid_alias_candidates(cid)
+    target_cid = canon or cid
     proc = None
     with _ACTIVE_RUNS_LOCK:
-        rec = _ACTIVE_RUNS.get(cid)
-        if rec:
-            rec["canceled"] = True
-            proc = rec.get("proc")
+        for k in cands:
+            rec = _ACTIVE_RUNS.get(k)
+            if rec and rec.get("running"):
+                rec["canceled"] = True
+                rec["cancel_reason"] = "user"
+                proc = rec.get("proc")
+                break
+    q_snap = get_conv_queue_snapshot(target_cid)
     if proc is not None and proc.poll() is None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        return web.json_response({"ok": True, "conversation_id": cid, "canceled": True})
-    return web.json_response({"ok": True, "conversation_id": cid, "canceled": False, "note": "无正在运行的手机端任务"})
+        _terminate_proc_safely(proc)
+        return web.json_response({"ok": True, "conversation_id": target_cid, "canceled": True, "queue": q_snap})
+    return web.json_response({"ok": True, "conversation_id": target_cid, "canceled": False, "note": "无正在运行的手机端任务", "queue": q_snap})
 
 
 async def handle_upload(request: web.Request) -> web.Response:
@@ -3608,6 +4256,1045 @@ def _classify_usage_pool(model_id: str) -> tuple[str, str]:
     if "gpt" in m:
         return ("oss", "GPT-OSS / 开源")
     return ("other", "其他 Antigravity 模型")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity Context Window Engine (100% Standalone + Optional Live Enrich)
+# ---------------------------------------------------------------------------
+
+_MODEL_DISPLAY_OVERRIDES: dict[str, str] = {
+    "gemini-pro-orchestrator-neon": "Orchestrator · Neon",
+    "gemini-pro-orchestrator": "Orchestrator · Carbon",
+    "gemini-pro-orchestrator-argon": "Orchestrator · Argon",
+    "gpt-oss-120b-medium": "GPT-OSS 120B (Medium)",
+    "gpt-oss-120b": "GPT-OSS 120B",
+}
+_MODEL_EFFORT_LABELS: dict[str, str] = {
+    "xhigh": "XHigh",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+    "thinking": "Thinking",
+}
+
+
+def _lookup_model_context_limit(model_id: str) -> int:
+    m = str(model_id or "").strip().lower()
+    if not m:
+        return 512000
+    if m.startswith((
+        "gemini-4-neon",
+        "gemini-4-carbon",
+        "gemini-4-hydrogen",
+        "gemini-4-argon",
+        "gemini-pro-orchestrator",
+    )):
+        return 512000
+    if m.startswith((
+        "gemini-3.8-flash",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+    )):
+        return 256000
+    if m.startswith((
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-3.",
+        "claude-3-",
+    )):
+        return 200000
+    if m.startswith((
+        "gemini-3-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-",
+        "deepseek-",
+    )):
+        return 128000
+    if m.startswith("gpt-oss-120b"):
+        return 80000
+    if "orchestrator" in m or any(k in m for k in ("neon", "carbon", "hydrogen", "argon")):
+        return 512000
+    if "opus-5" in m or "sonnet-5" in m or "3.8-flash" in m:
+        return 256000
+    if "claude" in m:
+        return 200000
+    if "gpt-oss" in m:
+        return 80000
+    return 512000
+
+
+def _format_window_limit_label(limit: int) -> str:
+    n = max(0, int(limit or 0))
+    if n in (1_000_000, 1_048_576):
+        return "1M"
+    if n in (2_000_000, 2_097_152):
+        return "2M"
+    if n >= 1_000_000:
+        lbl = f"{n / 1_000_000:.1f}M"
+        return lbl[:-3] + "M" if lbl.endswith(".0M") else lbl
+    if n >= 1000:
+        return f"{round(n / 1000)}K"
+    return str(n)
+
+
+def _format_model_display_label(model_id: str) -> str:
+    raw = str(model_id or "").strip()
+    if not raw:
+        return "Unknown"
+    low = raw.lower()
+    if low in _MODEL_DISPLAY_OVERRIDES:
+        return _MODEL_DISPLAY_OVERRIDES[low]
+    m_cl = re.match(r"^claude-([a-z]+)-(\d+)[-.](\d+)(?:-(xhigh|high|medium|low|thinking))?$", low)
+    if m_cl:
+        fam = m_cl.group(1).capitalize()
+        ver = f"{m_cl.group(2)}.{m_cl.group(3)}"
+        eff = _MODEL_EFFORT_LABELS.get(m_cl.group(4) or "", "")
+        return f"Claude {fam} {ver}" + (f" ({eff})" if eff else "")
+    m_gm = re.match(r"^gemini-([0-9.]+)-([a-z0-9-]+?)(?:-(xhigh|high|medium|low|thinking))?$", low)
+    if m_gm:
+        ver = m_gm.group(1)
+        fam = " ".join(p.capitalize() for p in m_gm.group(2).split("-") if p)
+        eff = _MODEL_EFFORT_LABELS.get(m_gm.group(3) or "", "")
+        return f"Gemini {ver} {fam}" + (f" ({eff})" if eff else "")
+    parts = [p for p in re.split(r"[-_]+", raw) if p]
+    if parts and parts[-1].lower() in _MODEL_EFFORT_LABELS and len(parts) > 1:
+        eff = _MODEL_EFFORT_LABELS[parts[-1].lower()]
+        base = " ".join(p.upper() if p.lower() in ("gpt", "oss") else p.capitalize() for p in parts[:-1])
+        return f"{base} ({eff})"
+    return " ".join(p.upper() if p.lower() in ("gpt", "oss") else p.capitalize() for p in parts)
+
+
+def _calc_context_status_level(used_pct: float) -> str:
+    if used_pct < 50.0:
+        return "low"
+    if used_pct < 75.0:
+        return "mid"
+    if used_pct < 90.0:
+        return "high"
+    return "critical"
+
+
+def _parse_transcript_context_file(tf: pathlib.Path) -> dict[str, Any] | None:
+    """mtime+size cached standalone extraction of context-window metrics from transcript.jsonl."""
+    try:
+        st = tf.stat()
+    except OSError:
+        return None
+    if st.st_size <= 0:
+        return None
+    key = tf.as_posix()
+    with _CTX_CACHE_LOCK:
+        cached = _CTX_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return dict(cached[2]) if cached[2] is not None else None
+
+    turns = 0
+    steps = 0
+    has_explicit_user = False
+    sess_in = 0
+    sess_ca = 0
+    turn_in = 0
+    turn_ca = 0
+    last_in = 0
+    last_ca = 0
+    last_out = 0
+    last_think_out = 0
+    last_resp_out = 0
+    last_model = ""
+    prev_step_ts = 0.0
+    last_speed_tps: float | None = None
+    speed_out_sum = 0
+    speed_dt_sum = 0.0
+
+    try:
+        with tf.open("r", encoding="utf-8", errors="ignore") as fh:
+            for ln in fh:
+                s = ln.strip()
+                if not s:
+                    continue
+                if '"PLANNER_RESPONSE"' not in s and '"USER_INPUT"' not in s:
+                    if '"created_at"' in s:
+                        try:
+                            o_ts = json.loads(s)
+                            if isinstance(o_ts, dict):
+                                ts_any = _parse_iso_ts(o_ts.get("created_at"))
+                                if ts_any > 0.0:
+                                    prev_step_ts = ts_any
+                        except Exception:
+                            pass
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                st_t = str(obj.get("type") or "")
+                ts = _parse_iso_ts(obj.get("created_at"))
+                if st_t == "USER_INPUT":
+                    if obj.get("source") == "USER_EXPLICIT":
+                        has_explicit_user = True
+                        turns += 1
+                        turn_in = 0
+                        turn_ca = 0
+                    elif not has_explicit_user:
+                        turn_in = 0
+                        turn_ca = 0
+                elif st_t == "PLANNER_RESPONSE":
+                    mod = str(obj.get("model") or "").strip()
+                    if mod:
+                        last_model = mod
+                    in_t = max(0, int(obj.get("input_tokens") or 0))
+                    ca_t = max(0, int(obj.get("cache_read_tokens") or 0))
+                    out_t = max(0, int(obj.get("output_tokens") or 0))
+                    if in_t > 0 or ca_t > 0 or out_t > 0:
+                        steps += 1
+                        sess_in += in_t
+                        sess_ca += ca_t
+                        turn_in += in_t
+                        turn_ca += ca_t
+                        last_in = in_t
+                        last_ca = ca_t
+                        last_out = out_t
+                        if prev_step_ts > 0.0 and ts > prev_step_ts:
+                            dt = ts - prev_step_ts
+                            if 0.4 <= dt <= 120.0 and out_t >= 16:
+                                last_speed_tps = out_t / dt
+                                speed_out_sum += out_t
+                                speed_dt_sum += dt
+                        raw_think_tok = obj.get("thinking_tokens")
+                        if isinstance(raw_think_tok, int) and raw_think_tok >= 0:
+                            last_think_out = min(out_t, raw_think_tok)
+                            last_resp_out = max(0, out_t - last_think_out)
+                        elif out_t <= 0:
+                            last_think_out = 0
+                            last_resp_out = 0
+                        else:
+                            th_len = len(str(obj.get("thinking") or ""))
+                            ct_len = len(str(obj.get("content") or ""))
+                            tcs = obj.get("tool_calls")
+                            tc_len = len(json.dumps(tcs, ensure_ascii=False)) if tcs else 0
+                            resp_len = ct_len + tc_len
+                            if th_len > 0 and resp_len > 0:
+                                last_think_out = round(out_t * th_len / (th_len + resp_len))
+                                last_resp_out = max(0, out_t - last_think_out)
+                            elif th_len > 0:
+                                last_think_out = out_t
+                                last_resp_out = 0
+                            else:
+                                last_think_out = 0
+                                last_resp_out = out_t
+                if ts > 0.0:
+                    prev_step_ts = ts
+    except OSError:
+        return None
+
+    result: dict[str, Any] | None = None
+    if steps > 0:
+        used_tokens = last_in + last_ca + last_out
+        window_limit = _lookup_model_context_limit(last_model)
+        remaining_tokens = max(0, window_limit - used_tokens)
+        used_pct = round((used_tokens * 100.0 / window_limit), 1) if window_limit > 0 else 0.0
+        turn_prompt = turn_in + turn_ca
+        sess_prompt = sess_in + sess_ca
+        denom = used_tokens if used_tokens > 0 else 1
+        usage_breakdown = [
+            {"key": "cache_read", "label": "缓存读取", "tokens": last_ca, "pct": round(last_ca * 100.0 / denom, 1), "color": "#34d399"},
+            {"key": "uncached_input", "label": "新增输入", "tokens": last_in, "pct": round(last_in * 100.0 / denom, 1), "color": "#38bdf8"},
+            {"key": "thinking_output", "label": "思考推理", "tokens": last_think_out, "pct": round(last_think_out * 100.0 / denom, 1), "color": "#a78bfa"},
+            {"key": "response_output", "label": "正文回复", "tokens": last_resp_out, "pct": round(last_resp_out * 100.0 / denom, 1), "color": "#f59e0b"},
+        ]
+        result = {
+            "used_tokens": used_tokens,
+            "window_limit": window_limit,
+            "window_limit_label": _format_window_limit_label(window_limit),
+            "remaining_tokens": remaining_tokens,
+            "used_pct": used_pct,
+            "status_level": _calc_context_status_level(used_pct),
+            "model_id": last_model,
+            "model_label": _format_model_display_label(last_model),
+            "turn_cache_hit_pct": round((turn_ca * 100.0 / turn_prompt), 1) if turn_prompt > 0 else 0.0,
+            "turn_cache_tokens": turn_ca,
+            "session_cache_hit_pct": round((sess_ca * 100.0 / sess_prompt), 1) if sess_prompt > 0 else 0.0,
+            "session_cache_tokens": sess_ca,
+            "speed_tps": round(last_speed_tps, 1) if last_speed_tps is not None else None,
+            "avg_speed_tps": round(speed_out_sum / speed_dt_sum, 1) if speed_dt_sum > 0.0 else None,
+            "breakdown": None,
+            "usage_breakdown": usage_breakdown,
+            "turns": turns if turns > 0 else 1,
+            "steps": steps,
+            "source": "transcript",
+            "is_live": False,
+            "is_generating": False,
+        }
+
+    with _CTX_CACHE_LOCK:
+        if len(_CTX_FILE_CACHE) >= _CTX_CACHE_MAX:
+            for drop_k in list(_CTX_FILE_CACHE.keys())[: _CTX_CACHE_MAX // 4]:
+                _CTX_FILE_CACHE.pop(drop_k, None)
+        _CTX_FILE_CACHE[key] = (st.st_mtime_ns, st.st_size, dict(result) if result is not None else None)
+    return result
+
+
+def _sanitize_breakdown_list(raw_list: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(raw_list, list) or not raw_list:
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw_list[:12]:
+        if not isinstance(item, dict):
+            continue
+        k = str(item.get("key") or "").strip()[:32]
+        if not k:
+            continue
+        color_raw = str(item.get("color") or "#38bdf8").strip()
+        color = color_raw if _SAFE_HEX_COLOR_RE.match(color_raw) else "#38bdf8"
+        try:
+            tok = max(0, int(item.get("tokens") or 0))
+        except (TypeError, ValueError):
+            tok = 0
+        try:
+            pct = round(max(0.0, float(item.get("pct") or 0.0)), 1)
+        except (TypeError, ValueError):
+            pct = 0.0
+        entry: dict[str, Any] = {
+            "key": k,
+            "tokens": tok,
+            "pct": pct,
+            "color": color,
+        }
+        lbl = str(item.get("label") or "").strip()[:48]
+        if lbl:
+            entry["label"] = lbl
+        out.append(entry)
+    return out or None
+
+
+def _fetch_optional_live_context_window(cid: str) -> dict[str, Any] | None:
+    """Strictly fail-silent optional live context-window enrichment (env URL or loopback :18492), 3s cached."""
+    if not _is_valid_cid(cid):
+        return None
+    now = time.time()
+    with _LIVE_CTX_CACHE_LOCK:
+        cached = _LIVE_CTX_CACHE.get(cid)
+        if cached is not None and (now - cached[0]) < _LIVE_CTX_CACHE_TTL_SEC:
+            return dict(cached[1]) if cached[1] is not None else None
+
+    env_url = str(os.environ.get("AGY_CONTEXT_WINDOW_API_URL") or "").strip()
+    target_url = ""
+    use_direct = True
+    if env_url:
+        try:
+            if "{cid}" in env_url:
+                cand_url = env_url.replace("{cid}", urllib.parse.quote(cid))
+            else:
+                sep = "&" if "?" in env_url else "?"
+                cand_url = f"{env_url}{sep}sid={urllib.parse.quote(cid)}"
+            pu = urllib.parse.urlparse(cand_url)
+            host_lc = (pu.hostname or "").lower()
+            is_local = pu.scheme == "http" and host_lc in ("127.0.0.1", "localhost", "::1")
+            is_https = pu.scheme == "https" and bool(host_lc)
+            if is_local or is_https:
+                target_url = cand_url
+                use_direct = is_local
+        except Exception:
+            target_url = ""
+    else:
+        target_url = f"http://127.0.0.1:18492/context-window?sid={urllib.parse.quote(cid)}"
+        use_direct = True
+
+    sanitized: dict[str, Any] | None = None
+    if target_url:
+        try:
+            req = urllib.request.Request(target_url, headers={"Accept": "application/json"}, method="GET")
+            opener = _DIRECT_OPENER if use_direct else urllib.request.build_opener()
+            with opener.open(req, timeout=0.55) as resp:
+                if getattr(resp, "status", 200) == 200:
+                    raw = json.loads(resp.read(262144).decode("utf-8", errors="replace"))
+                    cw = raw.get("context_window") if isinstance(raw, dict) and isinstance(raw.get("context_window"), dict) else (raw if isinstance(raw, dict) else None)
+                    if isinstance(cw, dict):
+                        out: dict[str, Any] = {}
+                        for ik in ("used_tokens", "remaining_tokens", "window_limit", "turn_cache_tokens", "session_cache_tokens", "turns", "turn_count", "steps"):
+                            if cw.get(ik) is not None:
+                                try:
+                                    out[ik] = max(0, int(cw[ik]))
+                                except (TypeError, ValueError):
+                                    pass
+                        for fk in ("used_pct", "speed_tps", "avg_speed_tps", "turn_cache_hit_pct", "session_cache_hit_pct"):
+                            if cw.get(fk) is not None:
+                                try:
+                                    out[fk] = round(float(cw[fk]), 1)
+                                except (TypeError, ValueError):
+                                    pass
+                        for sk in ("window_limit_label", "model_id", "model_label", "source"):
+                            if cw.get(sk):
+                                out[sk] = str(cw[sk]).strip()[:64]
+                        if "is_live" in cw:
+                            out["is_live"] = bool(cw["is_live"])
+                        if "is_generating" in cw:
+                            out["is_generating"] = bool(cw["is_generating"])
+                        bd = _sanitize_breakdown_list(cw.get("breakdown"))
+                        if bd:
+                            out["breakdown"] = bd
+                        ubd = _sanitize_breakdown_list(cw.get("usage_breakdown"))
+                        if ubd:
+                            out["usage_breakdown"] = ubd
+                        if out:
+                            sanitized = out
+        except Exception:
+            sanitized = None
+
+    with _LIVE_CTX_CACHE_LOCK:
+        if len(_LIVE_CTX_CACHE) >= _LIVE_CTX_CACHE_MAX:
+            for drop_k in list(_LIVE_CTX_CACHE.keys())[: _LIVE_CTX_CACHE_MAX // 4]:
+                _LIVE_CTX_CACHE.pop(drop_k, None)
+        _LIVE_CTX_CACHE[cid] = (now, dict(sanitized) if sanitized is not None else None)
+    return sanitized
+
+
+def compute_conversation_context_window(cid: str) -> dict[str, Any]:
+    """Compute standalone Antigravity context-window metrics from transcript.jsonl, with optional live enrichment."""
+    default_model = str(load_or_create_config().get("default_model") or "gemini-4-neon-medium").strip()
+    default_limit = _lookup_model_context_limit(default_model)
+    is_local_active = _find_active_run(cid) is not None
+
+    base: dict[str, Any] = {
+        "used_tokens": 0,
+        "window_limit": default_limit,
+        "window_limit_label": _format_window_limit_label(default_limit),
+        "remaining_tokens": default_limit,
+        "used_pct": 0.0,
+        "status_level": "low",
+        "model_id": default_model,
+        "model_label": _format_model_display_label(default_model),
+        "turn_cache_hit_pct": 0.0,
+        "turn_cache_tokens": 0,
+        "session_cache_hit_pct": 0.0,
+        "session_cache_tokens": 0,
+        "speed_tps": None,
+        "avg_speed_tps": None,
+        "breakdown": None,
+        "usage_breakdown": [
+            {"key": "cache_read", "label": "缓存读取", "tokens": 0, "pct": 0.0, "color": "#34d399"},
+            {"key": "uncached_input", "label": "新增输入", "tokens": 0, "pct": 0.0, "color": "#38bdf8"},
+            {"key": "thinking_output", "label": "思考推理", "tokens": 0, "pct": 0.0, "color": "#a78bfa"},
+            {"key": "response_output", "label": "正文回复", "tokens": 0, "pct": 0.0, "color": "#f59e0b"},
+        ],
+        "turns": 0,
+        "steps": 0,
+        "source": "transcript",
+        "is_live": False,
+        "is_generating": is_local_active,
+    }
+
+    if not _is_valid_cid(cid):
+        return base
+
+    # Gather candidate transcripts (primary + desktop/cli alias) and pick the freshest one with token data
+    tf_cands: list[tuple[float, pathlib.Path, str]] = []
+    seen_p: set[str] = set()
+
+    def _add_tf(p: pathlib.Path | None, probe_cid: str) -> None:
+        if p is None:
+            return
+        ps = p.as_posix()
+        if ps in seen_p:
+            return
+        try:
+            st = p.stat()
+            if st.st_size > 0:
+                seen_p.add(ps)
+                tf_cands.append((st.st_mtime, p, probe_cid))
+        except OSError:
+            pass
+
+    tf_main, src_main = _locate_transcript(cid)
+    _add_tf(tf_main, cid)
+    if src_main == "desktop":
+        aliased = get_desktop_cli_alias(cid)
+        if aliased and aliased != cid:
+            _add_tf(CLI_BRAIN / aliased / ".system_generated" / "logs" / "transcript.jsonl", aliased)
+    elif src_main == "mobile":
+        parent_d = get_desktop_parent_for_cli(cid)
+        if parent_d and parent_d != cid:
+            _add_tf(DESKTOP_BRAIN / parent_d / ".system_generated" / "logs" / "transcript.jsonl", parent_d)
+
+    tf_cands.sort(key=lambda item: item[0], reverse=True)
+    live_probe_cid = cid
+    for _, tf_path, p_cid in tf_cands:
+        parsed = _parse_transcript_context_file(tf_path)
+        if parsed is not None:
+            base = dict(parsed)
+            base["is_generating"] = is_local_active
+            live_probe_cid = p_cid
+            break
+
+    # Optional fail-silent live enrichment (zero personal data hardcoded)
+    live = _fetch_optional_live_context_window(live_probe_cid)
+    if live is None and live_probe_cid != cid:
+        live = _fetch_optional_live_context_window(cid)
+
+    if isinstance(live, dict) and int(live.get("used_tokens") or 0) > 0:
+        used_tokens = int(live["used_tokens"])
+        window_limit = int(live.get("window_limit") or base.get("window_limit") or default_limit)
+        if window_limit <= 0:
+            window_limit = default_limit
+        base["used_tokens"] = used_tokens
+        base["window_limit"] = window_limit
+        base["window_limit_label"] = str(live.get("window_limit_label") or _format_window_limit_label(window_limit))[:16]
+        if live.get("remaining_tokens") is not None:
+            base["remaining_tokens"] = max(0, int(live["remaining_tokens"]))
+        else:
+            base["remaining_tokens"] = max(0, window_limit - used_tokens)
+        if live.get("used_pct") is not None:
+            base["used_pct"] = round(max(0.0, float(live["used_pct"])), 1)
+        else:
+            base["used_pct"] = round((used_tokens * 100.0 / window_limit), 1) if window_limit > 0 else 0.0
+        if live.get("model_id"):
+            base["model_id"] = str(live["model_id"])
+            base["model_label"] = str(live.get("model_label") or _format_model_display_label(base["model_id"]))
+        elif live.get("model_label"):
+            base["model_label"] = str(live["model_label"])
+        for opt_k in ("speed_tps", "avg_speed_tps", "turn_cache_hit_pct", "turn_cache_tokens", "session_cache_hit_pct", "session_cache_tokens"):
+            if live.get(opt_k) is not None:
+                base[opt_k] = live[opt_k]
+        if live.get("breakdown"):
+            base["breakdown"] = live["breakdown"]
+        if live.get("usage_breakdown"):
+            base["usage_breakdown"] = live["usage_breakdown"]
+        live_turns = live.get("turns") if live.get("turns") is not None else live.get("turn_count")
+        if live_turns is not None:
+            base["turns"] = max(int(base.get("turns") or 0), int(live_turns))
+        if live.get("steps") is not None:
+            base["steps"] = max(int(base.get("steps") or 0), int(live["steps"]))
+        base["is_live"] = bool(live.get("is_live", True))
+        base["is_generating"] = bool(live.get("is_generating", False)) or is_local_active
+        base["source"] = str(live.get("source") or "live")[:32]
+        # Always normalize status_level to canonical contract: low / mid / high / critical
+        base["status_level"] = _calc_context_status_level(float(base["used_pct"]))
+
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Live Swarm Status Engine (100% Read-Only, Privacy-Safe)
+# ---------------------------------------------------------------------------
+
+def _sanitize_swarm_snippet(raw: str, max_len: int = 90) -> str:
+    """Collapse whitespace, redact emails, and replace absolute host paths with basenames only."""
+    s = re.sub(r"\s+", " ", str(raw or "")).strip()
+    if not s:
+        return ""
+    s = _EMAIL_RE.sub("[redacted]", s)
+
+    def _to_basename(m: re.Match[str]) -> str:
+        tok = m.group(0).rstrip(".,;:!?`'\"])}")
+        parts = [p for p in re.split(r"[/\\]+", tok) if p]
+        return parts[-1] if parts else ""
+
+    s = _WIN_ABS_PATH_RE.sub(_to_basename, s)
+    s = _UNIX_HOME_PATH_RE.sub(_to_basename, s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        return s[: max_len - 1].rstrip() + "…"
+    return s
+
+
+def _locate_swarm_dir(cid: str) -> tuple[pathlib.Path | None, pathlib.Path]:
+    """Locate .system_generated/swarm across DESKTOP_BRAIN & CLI_BRAIN (and desktop_to_cli_alias)."""
+    if not _is_valid_cid(cid):
+        return None, DESKTOP_BRAIN
+    cands: list[str] = [cid]
+    cli_alias = get_desktop_cli_alias(cid)
+    if cli_alias and _is_valid_cid(cli_alias) and cli_alias not in cands:
+        cands.append(cli_alias)
+    parent_d = get_desktop_parent_for_cli(cid)
+    if parent_d and _is_valid_cid(parent_d) and parent_d not in cands:
+        cands.append(parent_d)
+
+    found: list[tuple[float, pathlib.Path, pathlib.Path]] = []
+    for c in cands:
+        for root in (DESKTOP_BRAIN, CLI_BRAIN):
+            sdir = root / c / ".system_generated" / "swarm"
+            if not sdir.is_dir():
+                continue
+            mt = 0.0
+            for fname in ("members.json", "board.jsonl", "plan.json", "swarm.json"):
+                fp = sdir / fname
+                try:
+                    st = fp.stat()
+                    if st.st_mtime > mt:
+                        mt = st.st_mtime
+                except OSError:
+                    continue
+            found.append((mt, sdir, root))
+    if not found:
+        return None, DESKTOP_BRAIN
+    found.sort(key=lambda item: item[0], reverse=True)
+    return found[0][1], found[0][2]
+
+
+def _read_member_current_action(member_cid: str, primary_root: pathlib.Path) -> str:
+    """Fast 16KB tail-read (mtime+size cached) of a member's transcript.jsonl for a privacy-safe action summary."""
+    mcid = str(member_cid or "").strip()
+    if not _is_valid_cid(mcid):
+        return ""
+    roots = (primary_root, CLI_BRAIN if primary_root == DESKTOP_BRAIN else DESKTOP_BRAIN)
+    tf: pathlib.Path | None = None
+    st = None
+    for root in roots:
+        cand = root / mcid / ".system_generated" / "logs" / "transcript.jsonl"
+        try:
+            cand_st = cand.stat()
+            if cand_st.st_size > 0:
+                tf = cand
+                st = cand_st
+                break
+        except OSError:
+            continue
+    if tf is None or st is None:
+        return ""
+
+    cache_key = tf.as_posix()
+    with _SWARM_ACTION_CACHE_LOCK:
+        cached = _SWARM_ACTION_CACHE.get(cache_key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+
+    action = ""
+    try:
+        tail_bytes = 16384
+        with tf.open("rb") as fh:
+            if st.st_size > tail_bytes:
+                fh.seek(st.st_size - tail_bytes)
+                raw = fh.read(tail_bytes)
+                nl_idx = raw.find(b"\n")
+                if nl_idx >= 0:
+                    raw = raw[nl_idx + 1 :]
+            else:
+                raw = fh.read()
+        lines = raw.decode("utf-8", errors="ignore").splitlines()
+        for ln in reversed(lines):
+            s = ln.strip()
+            if not s or '"PLANNER_RESPONSE"' not in s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "PLANNER_RESPONSE":
+                continue
+            tcs = obj.get("tool_calls") or []
+            if isinstance(tcs, list) and tcs:
+                def _unquote_arg(v: Any) -> str:
+                    s_v = str(v or "").strip()
+                    if len(s_v) >= 2 and s_v[0] == '"' and s_v[-1] == '"':
+                        try:
+                            dec = json.loads(s_v)
+                            if isinstance(dec, str):
+                                return dec.strip()
+                        except Exception:
+                            return s_v.strip('"').strip()
+                    return s_v
+
+                tc = tcs[-1] if isinstance(tcs[-1], dict) else {}
+                tname = str(tc.get("name") or "").strip()
+                targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                summary = _unquote_arg(targs.get("toolSummary"))
+                if summary:
+                    action = _sanitize_swarm_snippet(summary, 90)
+                elif tname in ("read_file", "edit_file", "write_file", "write_to_file", "replace_file_content"):
+                    raw_fp = _unquote_arg(targs.get("Path") or targs.get("TargetFile") or targs.get("path"))
+                    fname = pathlib.Path(raw_fp).name if raw_fp else ""
+                    action = _sanitize_swarm_snippet(f"{tname} {fname}".strip(), 90)
+                elif tname == "run_command":
+                    cmd_s = _unquote_arg(targs.get("CommandLine")).splitlines()[0] if targs.get("CommandLine") else ""
+                    action = _sanitize_swarm_snippet(f"run: {cmd_s}" if cmd_s else "run_command", 90)
+                elif tname == "swarm":
+                    act = _unquote_arg(targs.get("action"))
+                    nm = _unquote_arg(targs.get("name"))
+                    action = _sanitize_swarm_snippet(f"swarm {act} {nm}".strip(), 90)
+                elif tname == "post_message":
+                    msg_s = _unquote_arg(targs.get("text")).splitlines()[0] if targs.get("text") else ""
+                    action = _sanitize_swarm_snippet(f"post: {msg_s}" if msg_s else "post_message", 90)
+                elif tname:
+                    target = ""
+                    for tk in ("query", "Url", "Role", "Action"):
+                        if targs.get(tk):
+                            target = _unquote_arg(targs.get(tk)).splitlines()[0]
+                            break
+                    action = _sanitize_swarm_snippet(f"{tname} {target}".strip(), 90)
+            if not action:
+                c_txt = _clean_assistant_text(str(obj.get("content") or ""))
+                if c_txt:
+                    action = _sanitize_swarm_snippet(c_txt, 90)
+            if not action:
+                th_txt = str(obj.get("thinking") or "").strip()
+                if th_txt:
+                    action = _sanitize_swarm_snippet(th_txt, 90)
+            if action:
+                break
+    except OSError:
+        action = ""
+
+    with _SWARM_ACTION_CACHE_LOCK:
+        if len(_SWARM_ACTION_CACHE) >= _SWARM_ACTION_CACHE_MAX:
+            for drop_k in list(_SWARM_ACTION_CACHE.keys())[: _SWARM_ACTION_CACHE_MAX // 4]:
+                _SWARM_ACTION_CACHE.pop(drop_k, None)
+        _SWARM_ACTION_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, action)
+    return action
+
+
+def _classify_swarm_member_state(m_raw: dict[str, Any]) -> tuple[str, bool]:
+    killed = bool(m_raw.get("killed")) or str(m_raw.get("phase") or "").upper() == "KILLED"
+    if killed:
+        return "killed", True
+    phase = str(m_raw.get("phase") or "").upper()
+    wake_mode = str(m_raw.get("wake_mode") or "").lower()
+    if phase == "RUNNING" and wake_mode == "working":
+        return "working", False
+    if phase == "RUNNING":
+        return "waiting", False
+    return "stopped", False
+
+
+def _is_active_swarm_cli_run(cid: str) -> dict[str, Any] | None:
+    rec = _find_active_run(cid)
+    if rec and rec.get("running") and bool(rec.get("swarm_mode")):
+        return rec
+    return None
+
+
+def _read_json_file_safe(p: pathlib.Path) -> dict[str, Any]:
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_conversation_swarm_summary(cid: str) -> dict[str, Any]:
+    """Fast compact swarm summary for conversation detail (no board/transcript scan)."""
+    active_swarm_rec = _is_active_swarm_cli_run(cid)
+    sdir, _ = _locate_swarm_dir(cid)
+    if sdir is None:
+        if active_swarm_rec is not None:
+            return {
+                "has_swarm": True,
+                "is_live": True,
+                "active_count": 1,
+                "working_count": 1,
+                "title": _sanitize_swarm_snippet(str(active_swarm_rec.get("prompt") or "Swarm"), 64),
+            }
+        return {
+            "has_swarm": False,
+            "is_live": False,
+            "active_count": 0,
+            "working_count": 0,
+            "title": "",
+        }
+
+    m_doc = _read_json_file_safe(sdir / "members.json")
+    raw_members = m_doc.get("members") if isinstance(m_doc.get("members"), dict) else {}
+    title = str(m_doc.get("title") or "").strip()
+    if not title:
+        p_doc = _read_json_file_safe(sdir / "plan.json")
+        g_obj = p_doc.get("goal") if isinstance(p_doc.get("goal"), dict) else {}
+        title = str(g_obj.get("title") or "").strip()
+
+    active_count = 0
+    worker_working = 0
+    for nm, m_raw in raw_members.items():
+        if not isinstance(m_raw, dict):
+            continue
+        st_str, killed = _classify_swarm_member_state(m_raw)
+        if not killed:
+            active_count += 1
+            role = str(m_raw.get("role") or ("coordinator" if nm == "coordinator" else "worker")).strip().lower()
+            if st_str == "working" and role != "coordinator" and str(nm).strip().lower() != "monitor":
+                worker_working += 1
+
+    is_live = (worker_working > 0) or (active_swarm_rec is not None)
+    working_count = max(worker_working, 1 if active_swarm_rec is not None else 0)
+    return {
+        "has_swarm": True,
+        "is_live": is_live,
+        "active_count": active_count,
+        "working_count": working_count,
+        "title": _sanitize_swarm_snippet(title, 80),
+    }
+
+
+def load_conversation_swarm_status(cid: str, *, include_details: bool = True) -> dict[str, Any]:
+    """Read-only full Swarm status payload (members, plan/threads, board tail, live worker actions)."""
+    active_swarm_rec = _is_active_swarm_cli_run(cid)
+    sdir, brain_root = _locate_swarm_dir(cid)
+
+    if sdir is None:
+        if active_swarm_rec is not None:
+            title = _sanitize_swarm_snippet(str(active_swarm_rec.get("prompt") or "Swarm"), 64)
+            mod = str(active_swarm_rec.get("model") or "").strip()
+            return {
+                "has_swarm": True,
+                "is_live": True,
+                "title": title,
+                "goal": {"title": title, "line": ""},
+                "active_count": 1,
+                "working_count": 1,
+                "total_members": 1,
+                "killed_count": 0,
+                "board_count": 0,
+                "tasks_done": 0,
+                "tasks_total": 1,
+                "threads": [],
+                "members": [{
+                    "name": "coordinator",
+                    "role": "coordinator",
+                    "model": mod,
+                    "state": "working",
+                    "killed": False,
+                    "last_post_seq": 0,
+                    "last_post_preview": "",
+                    "last_post_time": "",
+                    "current_action": "正在启动蜂群协同...",
+                    "task": "",
+                    "color_idx": 0,
+                }],
+                "archived_members": [],
+                "board": [],
+            }
+        return {
+            "has_swarm": False,
+            "is_live": False,
+            "active_count": 0,
+            "working_count": 0,
+            "threads": [],
+            "members": [],
+            "archived_members": [],
+            "board": [],
+        }
+
+    m_doc = _read_json_file_safe(sdir / "members.json")
+    p_doc = _read_json_file_safe(sdir / "plan.json")
+    raw_members = m_doc.get("members") if isinstance(m_doc.get("members"), dict) else {}
+    plan_goal_raw = p_doc.get("goal") if isinstance(p_doc.get("goal"), dict) else {}
+    plan_tasks_raw = p_doc.get("tasks") if isinstance(p_doc.get("tasks"), dict) else {}
+    plan_threads_raw = p_doc.get("threads") if isinstance(p_doc.get("threads"), list) else []
+
+    plan_tasks: dict[str, str] = {
+        str(k).strip(): _sanitize_swarm_snippet(str(v or ""), 160)
+        for k, v in plan_tasks_raw.items()
+        if str(k).strip()
+    }
+    title = _sanitize_swarm_snippet(str(plan_goal_raw.get("title") or m_doc.get("title") or ""), 100)
+    goal = {
+        "title": title,
+        "line": _sanitize_swarm_snippet(str(plan_goal_raw.get("line") or ""), 240),
+    }
+
+    # Parse board.jsonl (track total count, latest post per agent, and last 60 entries)
+    board_count = 0
+    board_tail_dq: collections.deque[dict[str, Any]] = collections.deque(maxlen=60)
+    agent_last_post: dict[str, dict[str, Any]] = {}
+    board_file = sdir / "board.jsonl"
+    if include_details and board_file.is_file():
+        try:
+            with board_file.open("r", encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    try:
+                        row = json.loads(s)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    board_count += 1
+                    seq_val = int(row.get("seq") or board_count)
+                    agent_nm = str(row.get("agent") or "").strip()
+                    raw_txt = str(row.get("text") or "")
+                    clean_txt = _EMAIL_RE.sub("[redacted]", raw_txt)
+                    if len(clean_txt) > 1200:
+                        clean_txt = clean_txt[:1199] + "…"
+                    t_str = str(row.get("time") or "").strip()[:32]
+                    entry = {
+                        "seq": seq_val,
+                        "agent": agent_nm,
+                        "text": clean_txt,
+                        "time": t_str,
+                    }
+                    board_tail_dq.append(entry)
+                    if agent_nm:
+                        agent_last_post[agent_nm] = {
+                            "seq": seq_val,
+                            "preview": _sanitize_swarm_snippet(raw_txt, 90),
+                            "time": t_str,
+                            "has_done": "[done]" in raw_txt[:140].lower(),
+                        }
+        except OSError:
+            pass
+
+    # Deterministic bee palette indices: coordinator=0, active workers=1..5 sequentially, archived=hashed 1..5
+    active_non_coord_names = sorted(
+        nm for nm, m_raw in raw_members.items()
+        if isinstance(m_raw, dict)
+        and not _classify_swarm_member_state(m_raw)[1]
+        and str(m_raw.get("role") or ("coordinator" if nm == "coordinator" else "worker")).lower() != "coordinator"
+    )
+    color_map: dict[str, int] = {"coordinator": 0}
+    for idx, nm in enumerate(active_non_coord_names):
+        color_map[nm] = 1 + (idx % 5)
+
+    def _get_color_idx(nm: str, role: str) -> int:
+        if role == "coordinator" or nm == "coordinator":
+            return 0
+        if nm in color_map:
+            return color_map[nm]
+        c_idx = 1 + (sum((i + 1) * ord(ch) for i, ch in enumerate(nm)) % 5)
+        color_map[nm] = c_idx
+        return c_idx
+
+    all_member_map: dict[str, dict[str, Any]] = {}
+    active_members: list[dict[str, Any]] = []
+    archived_members: list[dict[str, Any]] = []
+    worker_working = 0
+
+    for nm, m_raw in raw_members.items():
+        if not isinstance(m_raw, dict):
+            continue
+        name = str(nm).strip()
+        if not name:
+            continue
+        role = str(m_raw.get("role") or ("coordinator" if name == "coordinator" else "worker")).strip().lower()
+        state, killed = _classify_swarm_member_state(m_raw)
+        model_id = str(m_raw.get("applied_model") or m_raw.get("model") or m_raw.get("desired_model") or "").strip()
+        lp = agent_last_post.get(name) or {}
+        cur_action = ""
+        if include_details and not killed:
+            cur_action = _read_member_current_action(str(m_raw.get("conversation_id") or ""), brain_root)
+        item = {
+            "name": name,
+            "role": role,
+            "model": model_id,
+            "state": state,
+            "killed": killed,
+            "last_post_seq": int(lp.get("seq") or 0),
+            "last_post_preview": str(lp.get("preview") or ""),
+            "last_post_time": str(lp.get("time") or ""),
+            "current_action": cur_action,
+            "task": plan_tasks.get(name, ""),
+            "color_idx": _get_color_idx(name, role),
+        }
+        all_member_map[name] = item
+        if killed:
+            archived_members.append(item)
+        else:
+            active_members.append(item)
+            if state == "working" and role != "coordinator" and name.lower() != "monitor":
+                worker_working += 1
+
+    # Order active members: coordinator first, then working workers, then waiting/stopped workers, monitor last
+    def _active_sort_key(it: dict[str, Any]) -> tuple[int, int, str]:
+        if it["role"] == "coordinator" or it["name"] == "coordinator":
+            return (0, 0, it["name"])
+        if it["name"].lower() == "monitor":
+            return (3, 0, it["name"])
+        st_rank = 0 if it["state"] == "working" else (1 if it["state"] == "waiting" else 2)
+        return (1, st_rank, it["name"])
+
+    active_members.sort(key=_active_sort_key)
+    archived_members.sort(key=lambda it: (-int(it["last_post_seq"]), it["name"]))
+
+    def _is_member_done(name: str) -> bool:
+        m_it = all_member_map.get(name)
+        if m_it is None:
+            return False
+        if m_it["killed"]:
+            return True
+        lp = agent_last_post.get(name) or {}
+        return m_it["state"] in ("waiting", "stopped") and bool(lp.get("has_done"))
+
+    # Build threads list from plan.json
+    threads_out: list[dict[str, Any]] = []
+    for t_raw in plan_threads_raw:
+        if not isinstance(t_raw, dict):
+            continue
+        tid = str(t_raw.get("id") or "").strip()[:48]
+        t_title = _sanitize_swarm_snippet(str(t_raw.get("title") or tid), 100)
+        t_goal = _sanitize_swarm_snippet(str(t_raw.get("goal") or ""), 220)
+        t_task_names = [str(x).strip() for x in (t_raw.get("tasks") or []) if str(x).strip()]
+        t_members: list[dict[str, Any]] = []
+        done_cnt = 0
+        any_working = False
+        now_action = ""
+        fallback_action = ""
+        for m_name in t_task_names:
+            m_it = all_member_map.get(m_name)
+            m_state = str(m_it["state"]) if m_it else "waiting"
+            m_cidx = int(m_it["color_idx"]) if m_it else _get_color_idx(m_name, "worker")
+            m_task = (m_it.get("task") if m_it else "") or plan_tasks.get(m_name, "")
+            t_members.append({
+                "name": m_name,
+                "state": m_state,
+                "task": m_task,
+                "color_idx": m_cidx,
+            })
+            if _is_member_done(m_name):
+                done_cnt += 1
+            if m_state == "working":
+                any_working = True
+                if not now_action and m_it and m_it.get("current_action"):
+                    now_action = str(m_it["current_action"])
+            if not fallback_action and m_it:
+                fallback_action = str(m_it.get("current_action") or m_it.get("last_post_preview") or "")
+        total_cnt = len(t_task_names)
+        if total_cnt > 0 and done_cnt >= total_cnt:
+            t_status = "done"
+        elif any_working:
+            t_status = "moving"
+        else:
+            t_status = "waiting"
+        threads_out.append({
+            "id": tid or f"thread-{len(threads_out) + 1}",
+            "title": t_title,
+            "goal": t_goal,
+            "status": t_status,
+            "done_count": done_cnt,
+            "total_count": total_cnt,
+            "now_action": now_action or fallback_action,
+            "members": t_members,
+        })
+
+    all_task_names = {
+        nm for nm, m_it in all_member_map.items()
+        if m_it["role"] != "coordinator" and nm.lower() != "monitor"
+    } | set(plan_tasks.keys())
+    tasks_total = len(all_task_names)
+    tasks_done = sum(1 for nm in all_task_names if _is_member_done(nm))
+
+    is_live = (worker_working > 0) or (active_swarm_rec is not None)
+    working_count = max(worker_working, 1 if active_swarm_rec is not None else 0)
+
+    return {
+        "has_swarm": True,
+        "is_live": is_live,
+        "title": title,
+        "goal": goal,
+        "active_count": len(active_members),
+        "working_count": working_count,
+        "total_members": len(all_member_map),
+        "killed_count": len(archived_members),
+        "board_count": board_count,
+        "tasks_done": tasks_done,
+        "tasks_total": tasks_total,
+        "threads": threads_out,
+        "members": active_members,
+        "archived_members": archived_members,
+        "board": list(board_tail_dq),
+    }
 
 
 def _parse_transcript_usage_file(tf: pathlib.Path) -> tuple[list[tuple[float, str, int, int, int]], int]:
@@ -5002,7 +6689,15 @@ def create_app() -> web.Application:
     app.router.add_get("/api/models", handle_models)
     app.router.add_get("/api/conversations", handle_conversations)
     app.router.add_get("/api/conversations/{cid}", handle_conversation_detail)
+    app.router.add_get("/api/conversations/{cid}/context", handle_conversation_context)
+    app.router.add_get("/api/conversations/{cid}/swarm", handle_conversation_swarm)
     app.router.add_post("/api/chat/send", handle_chat_send)
+    app.router.add_get("/api/chat/queue/{cid}", handle_chat_queue_get)
+    app.router.add_post("/api/chat/queue/{cid}/resume", handle_chat_queue_resume)
+    app.router.add_put("/api/chat/queue/{cid}/{item_id}", handle_chat_queue_update)
+    app.router.add_patch("/api/chat/queue/{cid}/{item_id}", handle_chat_queue_update)
+    app.router.add_delete("/api/chat/queue/{cid}/{item_id}", handle_chat_queue_delete)
+    app.router.add_post("/api/chat/queue/{cid}/{item_id}/interrupt", handle_chat_queue_interrupt)
     app.router.add_post("/api/chat/cancel/{cid}", handle_chat_cancel)
     app.router.add_post("/api/upload", handle_upload)
     app.router.add_get("/api/files", handle_files_list)

@@ -2,13 +2,13 @@
 <html lang="zh-CN" data-theme="light">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta id="meta-theme-color" name="theme-color" content="#FFFFFF" />
   <link rel="icon" href="./favicon.ico" />
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.7.6" />
+  <link rel="stylesheet" href="./app.css?v=1.7.0" />
 </head>
 <body>
   <!-- =========================================================
@@ -224,6 +224,11 @@
           </svg>
           <span data-i18n="topbar.pairBtn">供手机扫码</span>
         </button>
+        <button id="btn-swarm-status" class="swarm-topbar-pill hidden" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="swarm-drawer" data-i18n-aria="swarm.pillAria" aria-label="查看蜂群协同状态">
+          <span id="swarm-topbar-bee" class="swarm-topbar-bee" aria-hidden="true"></span>
+          <span class="swarm-topbar-dot" aria-hidden="true"></span>
+          <span id="swarm-topbar-count" class="swarm-topbar-count hidden"></span>
+        </button>
         <button id="btn-new-top" class="m3-icon-btn" type="button" data-i18n-aria="topbar.newChat" data-i18n-title="topbar.newChat" aria-label="新建对话" title="新建对话">
           <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
@@ -343,8 +348,17 @@
       </svg>
     </button>
 
+    <!-- Context Window Popover Backdrop -->
+    <div id="ctx-window-backdrop" class="ctx-window-backdrop hidden" aria-hidden="true"></div>
+
     <!-- Gemini-Android Floating Pill Composer -->
-    <footer class="composer-wrap">
+    <footer id="composer-wrap" class="composer-wrap">
+      <!-- Antigravity-Style Context Window Popover -->
+      <section id="ctx-window-panel" class="ctx-window-panel hidden" role="dialog" data-i18n-aria="ctx.aria" aria-label="上下文窗口详情"></section>
+
+      <!-- Prompt Queue Tray (Queued & Cut-in Items) -->
+      <section id="queue-tray" class="queue-tray hidden" data-i18n-aria="queue.trayAria" aria-label="排队消息列表"></section>
+
       <div id="attach-tray" class="attach-tray hidden"></div>
       <div class="composer-pill">
         <textarea id="prompt-input" class="prompt-input" rows="1" data-i18n-placeholder="chat.promptPlaceholder" placeholder="向 Antigravity 下达指令..."></textarea>
@@ -378,17 +392,34 @@
               </svg>
               <span data-i18n="chat.swarm">蜂群</span>
             </button>
+
+            <button id="btn-ctx-window" class="ctx-window-pill hidden" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="ctx-window-panel" data-level="low">
+              <svg class="ctx-mini-ring" viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+                <circle class="ctx-mini-track" cx="10" cy="10" r="7.5" fill="none" stroke-width="2.2"></circle>
+                <circle id="ctx-mini-progress" class="ctx-mini-progress" cx="10" cy="10" r="7.5" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-dasharray="47.12" stroke-dashoffset="47.12" transform="rotate(-90 10 10)"></circle>
+              </svg>
+              <span id="ctx-pill-pct" class="ctx-pill-pct">0%</span>
+            </button>
           </div>
 
-          <button id="btn-send" class="send-btn" type="button" data-i18n-aria="chat.sendAria" aria-label="发送">
-            <svg id="icon-send" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="12" y1="19" x2="12" y2="5"></line>
-              <polyline points="5 12 12 5 19 12"></polyline>
-            </svg>
-            <svg id="icon-stop" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-              <rect x="6" y="6" width="12" height="12" rx="3"></rect>
-            </svg>
-          </button>
+          <div class="composer-tools-right">
+            <button id="btn-cutin" class="composer-action-pill cutin hidden" type="button" data-i18n-title="queue.cutinTitle" title="中止当前输出并立即执行此条指令 (Ctrl+Enter)">
+              <span class="cutin-bolt" aria-hidden="true">⚡</span>
+              <span data-i18n="queue.cutin">插队</span>
+            </button>
+            <button id="btn-queue-send" class="composer-action-pill queue hidden" type="button" data-i18n-title="queue.enqueueTitle" title="加入队列，等当前输出完成后自动执行 (Enter)">
+              <span data-i18n="queue.enqueue">排队</span>
+            </button>
+            <button id="btn-send" class="send-btn" type="button" data-i18n-aria="chat.sendAria" aria-label="发送">
+              <svg id="icon-send" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"></line>
+                <polyline points="5 12 12 5 19 12"></polyline>
+              </svg>
+              <svg id="icon-stop" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="3"></rect>
+              </svg>
+            </button>
+          </div>
         </div>
       </div>
     </footer>
@@ -496,6 +527,49 @@
         </svg>
       </button>
     </nav>
+  </aside>
+
+  <!-- =========================================================
+       RIGHT-SIDE SWARM STATUS DRAWER (Overview / Board / Members)
+       ========================================================= -->
+  <div id="swarm-backdrop" class="scrim hidden"></div>
+  <aside id="swarm-drawer" class="swarm-drawer" role="dialog" data-i18n-aria="swarm.drawerAria" aria-label="蜂群状态面板">
+    <div class="swarm-drawer-header">
+      <div class="swarm-drawer-title-wrap">
+        <span id="swarm-drawer-bee" class="swarm-drawer-bee" aria-hidden="true"></span>
+        <div class="swarm-drawer-titles">
+          <div id="swarm-drawer-title" class="swarm-drawer-title" data-i18n="swarm.defaultTitle">蜂群协同</div>
+          <div id="swarm-drawer-status-pill" class="swarm-status-pill idle">
+            <span class="swarm-status-dot" aria-hidden="true"></span>
+            <span id="swarm-drawer-status-text" data-i18n="swarm.statusIdle">空闲</span>
+          </div>
+        </div>
+      </div>
+      <div class="swarm-drawer-head-actions">
+        <button id="btn-swarm-refresh" class="m3-icon-btn sm" type="button" data-i18n-aria="swarm.refreshAria" data-i18n-title="swarm.refreshAria" aria-label="刷新蜂群状态" title="刷新蜂群状态">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+        </button>
+        <button id="btn-close-swarm" class="m3-icon-btn sm" type="button" data-i18n-aria="swarm.closeAria" aria-label="关闭蜂群面板">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="swarm-tabs-wrap">
+      <div id="swarm-tabs" class="m3-segmented sm" role="tablist" data-i18n-aria="swarm.tabsAria" aria-label="蜂群视图切换">
+        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-swarm-tab="overview" id="swarm-tab-overview" data-i18n="swarm.tabOverview">概览</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-swarm-tab="board" id="swarm-tab-board" data-i18n="swarm.tabBoard">留言板</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-swarm-tab="members" id="swarm-tab-members" data-i18n="swarm.tabMembers">成员</button>
+      </div>
+    </div>
+
+    <div id="swarm-drawer-body" class="swarm-drawer-body"></div>
   </aside>
 
   <!-- =========================================================
@@ -952,7 +1026,7 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./i18n.js?v=1.7.6"></script>
-  <script src="./app.js?v=1.7.6"></script>
+  <script src="./i18n.js?v=1.7.0"></script>
+  <script src="./app.js?v=1.7.0"></script>
 </body>
 </html>

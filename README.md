@@ -92,8 +92,11 @@
 - **宽屏双栏布局**：宽度 `>= 960px` 自动展开左侧常驻会话列表 + 右侧宽屏阅读区，自带工作区文件浏览器与代码/图片预览。
 - **拖图 / `Ctrl+V` 无损原图直传**：直接把电脑里的图片或文件拖入窗口，或截图后 `Ctrl+V` 粘贴，原文件二进制无损直传工作区。
 
-### 2. Android 通用客户端（`v1.6.2`，仅 ~560 KB）
-- **Material 3 现代界面与双语切换**：Edge-to-Edge 沉浸式适配、浅色/深色主题自由切换、内置 **界面语言设置（跟随系统 / 简体中文 / English）** 即时生效，图片原图预览支持双指缩放。
+### 2. Android 通用客户端（`v1.7.0`，仅 ~560 KB）
+- **Material 3 现代界面与双语切换**：Edge-to-Edge 沉浸式适配、浅色/深色主题自由切换、内置 **界面语言设置（跟随系统 / 简体中文 / English）** 即时生效。主界面彻底锁定防误触双指缩放，仅在原图预览模态框内提供丝滑双指缩放、平移、双击放大与一键重置。
+- **消息排队、⚡ 插队、行内编辑与删除**：AI 流式输出期间输入框全程可用，支持随时 **排队**（等当前回复结束后自动续发）或 **⚡ 插队**（立即中止当前输出并优先执行新指令）；排队卡片支持原地行内编辑（不覆盖主输入框草稿）、随时插队、删除及中止后一键 **▶ 继续**。
+- **上下文窗口实时环形监控与明细弹窗**：工具栏内置紧凑型 **上下文窗口环形进度胶囊（`◯ XX%`）**，按占用等级四色预警；点击展开 Antigravity 原生风格详情卡，查看环形仪表盘、已用 / 剩余 / 窗口上限 Token、可折叠上下文构成条（系统 / 工具 / 规则 / 历史 / 缓存明细）、采样模型、生成速率与本次 / 累计缓存命中率。
+- **像素蜂群实时状态指示、右侧折叠抽屉与双向滑动手势**：顶栏内置动画 **像素蜜蜂蜂群指示胶囊**（运行中带呼吸绿点与活跃计数），流式输出时自带可点击蜂群进度条；支持在聊天画布上 **左滑唤出右侧蜂群状态抽屉**（概览 / 留言板 / 成员三标签，含可折叠 GOAL、活跃任务、进度环、线程线索与像素蜜蜂团队网格，每 2.5s 自动刷新）以及 **右滑唤出左侧会话抽屉**，全面兼容手机端与桌面触控操作。
 - **瞬时贴底与对话轮次导航**：打开长对话直接定位在最新一轮最底部（零从顶滑到底动画）；点击顶部会话标题栏即可展开「对话轮次导航」，按轮次检索并一键跳转任意历史提问。
 - **额度与用量统计看板**：内置「额度与用量」仪表盘，基于本机官方桌面端与 CLI 完整对话日志实时核算 **近 5 小时 / 今日 / 近 3 天 / 近 7 天（含每日趋势柱图）/ 当前会话** 的 Token 消耗、缓存命中率、等效费用与分模型池占比（亦支持实时剩余额度展示）。
 - **内置离线扫码**：原生相机 + ZXing 离线解析二维码（支持手电筒、相册选码），同时支持 6 位数字配对码与多台电脑主机一键切换。
@@ -246,7 +249,7 @@ pkill -f agy_mobile_server.py
 
 ### 2. 手机端安装与配对
 1. **下载并安装 Android APK**：
-   - 直接安装本仓库内的 [`dist/Antigravity-Mobile-Universal-v1.6.apk`](dist/Antigravity-Mobile-Universal-v1.6.apk)（Android 8.0+ / API 26+，~520 KB，`v1.6.1`）。
+   - 直接安装本仓库内的 [`dist/Antigravity-Mobile-Universal-v1.7.apk`](dist/Antigravity-Mobile-Universal-v1.7.apk)（Android 8.0+ / API 26+，~560 KB，`v1.7.0`）。
    - 后续正式版本亦可在 GitHub [Releases](../../releases) 页面下载；服务端运行中时，手机也可通过配对页提供的链接下载同款 APK。
 2. **与电脑配对（任选其一）**：
    - **扫码一键配对（推荐）**：
@@ -331,7 +334,7 @@ pkill -f agy_mobile_server.py
 
 ## 从源码自行构建 Android APK（免 Gradle）
 
-本项目提供零 Gradle 极速构建脚本 [`android/build_apk.py`](android/build_apk.py)（基于 `aapt2` + `javac --release 11` + `d8` + `zipalign` + `apksigner`），数秒即可生成对齐并完成 v1+v2+v3 签名的通用安装包 `dist/Antigravity-Mobile-Universal-v1.6.apk`。
+本项目提供零 Gradle 极速构建脚本 [`android/build_apk.py`](android/build_apk.py)（基于 `aapt2` + `javac --release 11` + `d8` + `zipalign` + `apksigner`），数秒即可生成对齐并完成 v1+v2+v3 签名的通用安装包 `dist/Antigravity-Mobile-Universal-v1.7.apk`。
 
 ### 构建前置依赖
 1. **JDK 11+**（确保 `javac` 与 `keytool` 在 `PATH` 中）
@@ -388,7 +391,7 @@ export AGY_KEYSTORE_PASS="请替换为你的自定义签名密码"
 python3 android/build_apk.py
 ```
 
-构建完成后，已签名 APK 将输出至 `dist/Antigravity-Mobile-Universal-v1.6.apk`。
+构建完成后，已签名 APK 将输出至 `dist/Antigravity-Mobile-Universal-v1.7.apk`。
 
 ---
 
@@ -403,7 +406,7 @@ python3 android/build_apk.py
 ├── install_antigravity_plugin.ps1       # Windows PowerShell 插件安装脚本
 ├── install_antigravity_plugin.sh        # macOS / Linux 插件安装脚本
 ├── android/                             # Android 原生壳源码与零 Gradle 构建脚本（build_apk.py）
-├── dist/Antigravity-Mobile-Universal-v1.6.apk  # 预构建通用签名 Android 安装包
+├── dist/Antigravity-Mobile-Universal-v1.7.apk  # 预构建通用签名 Android 安装包
 ├── assets/antigravity_mobile.ico        # Windows 桌面快捷方式四色 A 图标
 ├── create_desktop_shortcuts.ps1         # Windows 一键创建「Antigravity 同步工作台」桌面单图标
 ├── launch_desktop_workbench.bat         # Windows 无窗后台拉起服务并打开宽屏独立应用窗口

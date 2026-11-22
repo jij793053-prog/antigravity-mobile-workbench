@@ -141,6 +141,30 @@
     bottomAnchorActive: false,
     bottomAnchorTimer: null,
     programmaticScrollAt: 0,
+
+    // v1.7.0: Prompt queue & Context window state
+    currentQueue: [],
+    editingQueueItemId: "",
+    editingQueueDraft: "",
+    interruptPendingUntil: 0,
+    currentContext: null,
+    ctxPopoverOpen: false,
+    ctxBreakdownOpen: false,
+    ctxFetchSeq: 0,
+
+    // v1.7.0 Feature 4: Live Swarm indicator & collapsible right drawer
+    currentSwarmSummary: null,
+    currentSwarm: null,
+    swarmDrawerOpen: false,
+    swarmTab: "overview",
+    swarmBoardNewestFirst: true,
+    swarmSelectedMember: "",
+    swarmExpandedKeys: new Set(["goal", "running"]),
+    swarmFetchSeq: 0,
+    swarmPollTimer: null,
+    swarmLoading: false,
+    swarmLastError: "",
+    swarmLastRenderFp: "",
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -242,12 +266,24 @@
     for (const mid of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
       const el = $(mid);
       if (el && !el.classList.contains("hidden")) {
-        el.classList.add("hidden");
+        if (mid === "preview-modal") {
+          closePreviewModal();
+        } else {
+          el.classList.add("hidden");
+        }
         return true;
       }
     }
+    if (state.ctxPopoverOpen) {
+      closeContextPopover();
+      return true;
+    }
     if (state.turnNavOpen) {
       closeTurnNavigator();
+      return true;
+    }
+    if (state.swarmDrawerOpen) {
+      closeSwarmDrawer();
       return true;
     }
     if (
@@ -373,6 +409,19 @@
       updateHostDisplays();
       updateSendButton();
       updateSidecarHeaderActions();
+      renderQueueTray();
+      updateContextPill();
+      updateSwarmTopbarPill();
+      if (state.ctxPopoverOpen) {
+        renderContextPopover();
+      }
+      if (state.swarmDrawerOpen) {
+        state.swarmLastRenderFp = "";
+        renderSwarmDrawer({ force: true });
+      }
+      if (activePreviewZoom) {
+        activePreviewZoom.updateLabel();
+      }
       renderConvList();
       renderHostSheetList();
       renderSettingsHosts();
@@ -1220,11 +1269,28 @@
     loadHostDrafts();
     clearAuthMediaCache();
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
+    stopSwarmPolling();
+    destroyPreviewZoom();
     disarmBottomAnchor();
     state.openConvSeq += 1;
     state.lastRenderedConvFp = "";
     state.currentCid = "";
     state.currentConv = null;
+    state.currentQueue = [];
+    state.editingQueueItemId = "";
+    state.editingQueueDraft = "";
+    state.interruptPendingUntil = 0;
+    state.currentContext = null;
+    state.ctxBreakdownOpen = false;
+    state.ctxFetchSeq += 1;
+    state.currentSwarmSummary = null;
+    state.currentSwarm = null;
+    state.swarmSelectedMember = "";
+    state.swarmLastRenderFp = "";
+    state.swarmLastError = "";
+    state.swarmFetchSeq += 1;
     state.conversations = [];
     state.streaming = false;
     state.streamBuffer = "";
@@ -1243,6 +1309,9 @@
     restoreDraftFor(NEW_DRAFT_KEY);
     updateHostDisplays();
     updateSidecarHeaderActions();
+    renderQueueTray();
+    updateContextPill();
+    updateSwarmTopbarPill();
     renderConversation();
     renderConvList();
     // Kick off HTTP bootstrap + active host-conversation auto-follow immediately in parallel
@@ -1621,7 +1690,12 @@
     if (ev.type === "run_start" || ev.type === "run_init") {
       adoptPendingCid();
       if (cid && cid === state.currentCid) {
+        state.interruptPendingUntil = 0;
+        if (Array.isArray(ev.queue)) {
+          setCurrentQueue(ev.queue);
+        }
         ensurePeerStreamAttached(ev.prompt, ev.attachments, ev.model);
+        renderQueueTray();
       }
       refreshConversations();
     } else if (ev.type === "run_tool") {
@@ -1651,7 +1725,16 @@
       adoptPendingCid();
       haptic("success");
       if (cid === state.currentCid || (ev.aliased_cid && ev.aliased_cid === state.currentCid)) {
+        state.interruptPendingUntil = 0;
         state.streaming = false;
+        if (ev.context_window && typeof ev.context_window === "object") {
+          setCurrentContext(ev.context_window);
+        }
+        if (Array.isArray(ev.queue)) {
+          setCurrentQueue(ev.queue);
+        } else {
+          renderQueueTray();
+        }
         openConversation(state.currentCid, { silent: true });
       }
       refreshConversationsThrottled(400);
@@ -1661,8 +1744,19 @@
         (cid && cid === state.currentCid) ||
         (ev.run_id && state.currentCid === `pending-${ev.run_id}`);
       if (matchesCurrent) {
-        state.streaming = false;
-        renderConversation({ preserveScroll: true });
+        if (Array.isArray(ev.queue)) {
+          setCurrentQueue(ev.queue);
+        }
+        const isCutinHandoff = Boolean(ev.interrupted || ev.reason === "interrupt" || Date.now() < state.interruptPendingUntil);
+        if (isCutinHandoff) {
+          state.streamBuffer = "";
+          state.streamTools = [];
+          updateStreamingRow();
+        } else {
+          state.streaming = false;
+          renderConversation({ preserveScroll: true });
+          renderQueueTray();
+        }
       }
       refreshConversationsThrottled(400);
     } else if (ev.type === "run_error") {
@@ -1672,6 +1766,7 @@
         (ev.run_id && state.currentCid === `pending-${ev.run_id}`) ||
         (!state.currentCid && state.streaming);
       if (matchesCurrent) {
+        state.interruptPendingUntil = 0;
         state.streaming = false;
         state.streamBuffer = "";
         state.streamTools = [];
@@ -1684,9 +1779,18 @@
           });
         }
         renderConversation({ preserveScroll: true });
+        renderQueueTray();
         showToast(t("toast.execFail", { err: errText.slice(0, 80) }));
       }
       refreshConversationsThrottled(400);
+    } else if (ev.type === "queue_updated") {
+      const aliasedCid = ev.aliased_cid || "";
+      const matchesCurrent = Boolean(state.currentCid) && (
+        cid === state.currentCid || (aliasedCid && aliasedCid === state.currentCid)
+      );
+      if (matchesCurrent) {
+        setCurrentQueue(Array.isArray(ev.queue) ? ev.queue : []);
+      }
     } else if (ev.type === "tunnel_status" && ev.tunnel) {
       if (isLocalDesktopBrowser()) {
         const ts = String(ev.tunnel.status || "");
@@ -1701,8 +1805,13 @@
       const matchesCurrent = Boolean(state.currentCid) && (
         cid === state.currentCid || (aliasedCid && aliasedCid === state.currentCid)
       );
-      if (matchesCurrent && !state.streaming) {
-        openConversation(state.currentCid, { silent: true });
+      if (matchesCurrent) {
+        if (ev.context_window && typeof ev.context_window === "object") {
+          setCurrentContext(ev.context_window);
+        }
+        if (!state.streaming) {
+          openConversation(state.currentCid, { silent: true });
+        }
       }
       refreshConversationsThrottled();
     }
@@ -2009,6 +2118,8 @@
 
   function updateSendButton() {
     const btn = $("btn-send");
+    const btnCutin = $("btn-cutin");
+    const btnQueue = $("btn-queue-send");
     const inp = $("prompt-input");
     const hasContent = Boolean((inp && inp.value.trim()) || state.attachments.length);
     const host = getActiveHost();
@@ -2016,16 +2127,21 @@
     if (state.streaming) {
       btn.classList.add("stopping");
       btn.classList.remove("ready");
+      btn.classList.toggle("compact-stop", hasContent);
       btn.setAttribute("aria-label", t("chat.stopAria"));
       $("icon-send").classList.add("hidden");
       $("icon-stop").classList.remove("hidden");
+      btnCutin?.classList.toggle("hidden", !hasContent);
+      btnQueue?.classList.toggle("hidden", !hasContent);
       setConnState("running", t("conn.runningTask"));
     } else {
-      btn.classList.remove("stopping");
+      btn.classList.remove("stopping", "compact-stop");
       btn.classList.toggle("ready", hasContent);
       btn.setAttribute("aria-label", t("chat.sendAria"));
       $("icon-send").classList.remove("hidden");
       $("icon-stop").classList.add("hidden");
+      btnCutin?.classList.add("hidden");
+      btnQueue?.classList.add("hidden");
       if (state.wsConnected) {
         const hostName = host ? formatHostDisplayName(host.name) : t("host.generic");
         setConnState("online", t("conn.connected", { name: hostName }));
@@ -2559,7 +2675,8 @@
   function fmtTurnTime(isoStr) {
     if (!isoStr) return "";
     try {
-      const d = new Date(isoStr);
+      const normalized = String(isoStr).trim().replace(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})/, "$1T$2");
+      const d = new Date(normalized);
       if (isNaN(d.getTime())) return "";
       const now = new Date();
       const hh = String(d.getHours()).padStart(2, "0");
@@ -2766,6 +2883,8 @@
   function openTurnNavigator() {
     if (state.turns.length < 1) return;
     haptic("light");
+    closeContextPopover();
+    closeSwarmDrawer();
     closeAllSheets();
     closeDrawer();
     state.turnNavOpen = true;
@@ -2863,6 +2982,1307 @@
   const CHEVRON_SVG = `<svg class="m3-tool-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
   const CHECK_SVG = `<svg class="tool-done-ic" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
   const COPY_SVG = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+
+  // =========================================================================
+  // 7.8 PROMPT QUEUE TRAY, CUT-IN, INLINE EDIT & DELETE
+  // =========================================================================
+  function setCurrentQueue(nextQueue) {
+    const list = Array.isArray(nextQueue) ? nextQueue.filter(Boolean) : [];
+    state.currentQueue = list;
+    if (state.editingQueueItemId && !list.some((it) => String(it.id) === state.editingQueueItemId)) {
+      state.editingQueueItemId = "";
+      state.editingQueueDraft = "";
+    }
+    renderQueueTray();
+  }
+
+  function renderQueueTray() {
+    const tray = $("queue-tray");
+    if (!tray) return;
+    const queue = Array.isArray(state.currentQueue) ? state.currentQueue : [];
+    if (!queue.length) {
+      tray.classList.add("hidden");
+      tray.innerHTML = "";
+      return;
+    }
+
+    const activeEditEl = tray.querySelector(".queue-edit-input");
+    const wasFocusedEdit = Boolean(activeEditEl && document.activeElement === activeEditEl);
+    const prevSelStart = wasFocusedEdit ? activeEditEl.selectionStart : null;
+    const prevSelEnd = wasFocusedEdit ? activeEditEl.selectionEnd : null;
+
+    tray.classList.remove("hidden");
+    const showResume = !state.streaming && queue.length > 0;
+    const resumeBtnHtml = showResume
+      ? `<button id="btn-queue-resume" class="queue-resume-btn" type="button" data-qact="resume" aria-label="${escHtml(t("queue.resumeAria"))}">▶ ${escHtml(t("queue.resume"))}</button>`
+      : "";
+
+    const cardsHtml = queue
+      .map((item, idx) => {
+        const qid = String(item.id || "");
+        const num = idx + 1;
+        const isUrgent = item.priority === "urgent";
+        const atts = Array.isArray(item.attachments) ? item.attachments : [];
+
+        if (state.editingQueueItemId && state.editingQueueItemId === qid) {
+          return `
+            <div class="queue-card editing" data-qid="${escHtml(qid)}">
+              <div class="queue-edit-head">
+                <span class="queue-index-badge ${isUrgent ? "urgent" : ""}">#${num}</span>
+                <span class="queue-edit-label">${escHtml(t("queue.editingLabel"))}</span>
+              </div>
+              <textarea class="queue-edit-input" data-qid="${escHtml(qid)}" rows="2" placeholder="${escHtml(t("queue.editPlaceholder"))}">${escHtml(state.editingQueueDraft)}</textarea>
+              <div class="queue-edit-actions">
+                <button class="queue-act-btn" type="button" data-qact="cancel-edit" data-qid="${escHtml(qid)}">${escHtml(t("queue.cancel"))}</button>
+                <button class="queue-act-btn save" type="button" data-qact="save-edit" data-qid="${escHtml(qid)}">${escHtml(t("queue.save"))}</button>
+              </div>
+            </div>`;
+        }
+
+        const tags = [];
+        if (isUrgent) {
+          tags.push(`<span class="queue-tag">${escHtml(t("queue.urgentTag"))}</span>`);
+        }
+        if (atts.length > 0) {
+          tags.push(`<span class="queue-tag" title="${escHtml(t("queue.attCount", { count: atts.length }))}">📎 ${atts.length}</span>`);
+        }
+        if (item.model) {
+          tags.push(`<span class="queue-tag">${escHtml(shortModelLabel(item.model))}</span>`);
+        }
+        if (item.swarm_mode) {
+          tags.push(`<span class="queue-tag swarm">${escHtml(t("chat.swarm"))}</span>`);
+        }
+        const previewText = String(item.prompt || "").trim() || t("queue.attachOnly");
+
+        return `
+          <div class="queue-card" data-qid="${escHtml(qid)}">
+            <div class="queue-card-main">
+              <span class="queue-index-badge ${isUrgent ? "urgent" : ""}">#${num}</span>
+              <div class="queue-card-text">${escHtml(previewText)}</div>
+            </div>
+            <div class="queue-card-foot">
+              <div class="queue-card-tags">${tags.join("")}</div>
+              <div class="queue-card-actions">
+                <button class="queue-act-btn cutin" type="button" data-qact="cutin" data-qid="${escHtml(qid)}">⚡ ${escHtml(t("queue.cutin"))}</button>
+                <button class="queue-act-btn edit" type="button" data-qact="edit" data-qid="${escHtml(qid)}">${escHtml(t("queue.edit"))}</button>
+                <button class="queue-act-btn delete" type="button" data-qact="delete" data-qid="${escHtml(qid)}" aria-label="${escHtml(t("queue.deleteAria"))}" title="${escHtml(t("queue.deleteTitle"))}">✕</button>
+              </div>
+            </div>
+          </div>`;
+      })
+      .join("");
+
+    tray.innerHTML = `
+      <div class="queue-tray-head">
+        <div class="queue-tray-title">
+          <span class="queue-tray-dot" aria-hidden="true"></span>
+          <span>${escHtml(t("queue.headerCount", { count: queue.length }))}</span>
+        </div>
+        ${resumeBtnHtml}
+      </div>
+      <div class="queue-list">${cardsHtml}</div>`;
+
+    if (wasFocusedEdit && state.editingQueueItemId) {
+      const nextEditEl = tray.querySelector(".queue-edit-input");
+      if (nextEditEl) {
+        nextEditEl.focus();
+        if (prevSelStart !== null && prevSelEnd !== null) {
+          try { nextEditEl.setSelectionRange(prevSelStart, prevSelEnd); } catch (_) {}
+        }
+      }
+    }
+  }
+
+  function startQueueInlineEdit(qid) {
+    const item = state.currentQueue.find((it) => String(it.id) === String(qid));
+    if (!item) return;
+    haptic("light");
+    state.editingQueueItemId = String(item.id);
+    state.editingQueueDraft = String(item.prompt || "");
+    renderQueueTray();
+    const ta = $("queue-tray")?.querySelector(".queue-edit-input");
+    if (ta) {
+      ta.focus();
+      const len = ta.value.length;
+      try { ta.setSelectionRange(len, len); } catch (_) {}
+    }
+  }
+
+  function cancelQueueInlineEdit() {
+    if (!state.editingQueueItemId) return;
+    state.editingQueueItemId = "";
+    state.editingQueueDraft = "";
+    renderQueueTray();
+  }
+
+  async function saveQueueInlineEdit(qid) {
+    const cid = state.currentCid;
+    if (!cid || !qid) return;
+    const item = state.currentQueue.find((it) => String(it.id) === String(qid));
+    const ta = $("queue-tray")?.querySelector(`.queue-edit-input[data-qid="${CSS.escape ? CSS.escape(String(qid)) : String(qid)}"]`)
+      || $("queue-tray")?.querySelector(".queue-edit-input");
+    const nextPrompt = String(ta ? ta.value : state.editingQueueDraft).trim();
+    const hasAtts = Boolean(item && Array.isArray(item.attachments) && item.attachments.length > 0);
+    if (!nextPrompt && !hasAtts) {
+      showToast(t("toast.queueEmptyEdit"));
+      ta?.focus();
+      return;
+    }
+    try {
+      const res = await apiFetch(
+        `/api/chat/queue/${encodeURIComponent(cid)}/${encodeURIComponent(qid)}`,
+        {
+          method: "PUT",
+          body: JSON.stringify({ prompt: nextPrompt }),
+        }
+      );
+      state.editingQueueItemId = "";
+      state.editingQueueDraft = "";
+      if (Array.isArray(res.queue)) {
+        setCurrentQueue(res.queue);
+      } else {
+        setCurrentQueue(
+          state.currentQueue.map((it) => (String(it.id) === String(qid) ? Object.assign({}, it, { prompt: nextPrompt }) : it))
+        );
+      }
+      haptic("light");
+      showToast(t("toast.queueSaved"));
+    } catch (e) {
+      showToast(t("toast.queueSaveFail", { err: e.message }));
+    }
+  }
+
+  async function deleteQueueItem(qid) {
+    const cid = state.currentCid;
+    if (!cid || !qid) return;
+    haptic("light");
+    try {
+      const res = await apiFetch(
+        `/api/chat/queue/${encodeURIComponent(cid)}/${encodeURIComponent(qid)}`,
+        { method: "DELETE" }
+      );
+      if (state.editingQueueItemId === String(qid)) {
+        state.editingQueueItemId = "";
+        state.editingQueueDraft = "";
+      }
+      if (Array.isArray(res.queue)) {
+        setCurrentQueue(res.queue);
+      } else {
+        setCurrentQueue(state.currentQueue.filter((it) => String(it.id) !== String(qid)));
+      }
+      showToast(t("toast.queueDeleted"));
+    } catch (e) {
+      showToast(t("toast.queueDeleteFail", { err: e.message }));
+    }
+  }
+
+  async function interruptQueueItem(qid) {
+    const cid = state.currentCid;
+    if (!cid || !qid) return;
+    haptic("light");
+    state.interruptPendingUntil = Date.now() + 4500;
+    try {
+      const res = await apiFetch(
+        `/api/chat/queue/${encodeURIComponent(cid)}/${encodeURIComponent(qid)}/interrupt`,
+        { method: "POST" }
+      );
+      if (state.editingQueueItemId === String(qid)) {
+        state.editingQueueItemId = "";
+        state.editingQueueDraft = "";
+      }
+      if (Array.isArray(res.queue)) {
+        setCurrentQueue(res.queue);
+      } else {
+        setCurrentQueue(state.currentQueue.filter((it) => String(it.id) !== String(qid)));
+      }
+      state.streaming = true;
+      state.streamBuffer = "";
+      state.streamTools = [];
+      updateSendButton();
+      renderQueueTray();
+      showToast(t("toast.cutinSent"));
+    } catch (e) {
+      state.interruptPendingUntil = 0;
+      showToast(t("toast.cutinFail", { err: e.message }));
+    }
+  }
+
+  async function resumeQueue() {
+    const cid = state.currentCid;
+    if (!cid || !state.currentQueue.length) return;
+    haptic("light");
+    try {
+      const res = await apiFetch(`/api/chat/queue/${encodeURIComponent(cid)}/resume`, { method: "POST" });
+      if (Array.isArray(res.queue)) {
+        setCurrentQueue(res.queue);
+      }
+      showToast(t("toast.queueResumed"));
+    } catch (e) {
+      showToast(t("toast.queueResumeFail", { err: e.message }));
+    }
+  }
+
+  // =========================================================================
+  // 7.9 CONTEXT WINDOW RING PILL & ANTIGRAVITY-STYLE POPOVER
+  // =========================================================================
+  const CTX_MINI_CIRC = 2 * Math.PI * 7.5;
+  const CTX_DONUT_CIRC = 2 * Math.PI * 40;
+  const CTX_BD_COLORS = {
+    system: "#818cf8",
+    tools: "#38bdf8",
+    rules: "#a78bfa",
+    history: "#34d399",
+    cache_read: "#34d399",
+    uncached_input: "#38bdf8",
+    thinking_output: "#f59e0b",
+    response_output: "#a78bfa",
+  };
+  const CTX_BD_FALLBACK_PALETTE = ["#60a5fa", "#fb7185", "#2dd4bf", "#facc15", "#c084fc"];
+
+  function fmtCompactTokens(n) {
+    const v = Math.max(0, Number(n) || 0);
+    if (v >= 1e9) return `${(v / 1e9).toFixed(2).replace(/\.?0+$/, "")}B`;
+    if (v >= 1e6) return `${(v / 1e6).toFixed(v >= 1e7 ? 1 : 2).replace(/\.?0+$/, "")}M`;
+    if (v >= 1e3) {
+      if (v >= 1e5) return `${Math.round(v / 1e3)}K`;
+      return `${Number((v / 1e3).toFixed(1))}K`;
+    }
+    return String(Math.round(v));
+  }
+
+  function resolveCtxStatusLevel(cw) {
+    const raw = String((cw && cw.status_level) || "").toLowerCase();
+    if (raw === "low" || raw === "mid" || raw === "high" || raw === "critical") {
+      return raw;
+    }
+    const pct = Number(cw && cw.used_pct) || 0;
+    if (pct >= 90) return "critical";
+    if (pct >= 75) return "high";
+    if (pct >= 50) return "mid";
+    return "low";
+  }
+
+  function ctxBreakdownLabel(key, fallbackLabel) {
+    const norm = String(key || "").trim().toLowerCase();
+    const i18nKey = `ctx.bd.${norm}`;
+    const localized = t(i18nKey);
+    if (localized !== i18nKey) return localized;
+    if (fallbackLabel) return String(fallbackLabel);
+    return norm || t("ctx.bd.other");
+  }
+
+  function normalizeCtxBreakdown(cw) {
+    if (!cw || typeof cw !== "object") return [];
+    const pickSource = (src) => {
+      if (!src) return null;
+      if (Array.isArray(src)) return src.length ? src : null;
+      if (typeof src === "object" && Object.keys(src).length) return src;
+      return null;
+    };
+    const raw = pickSource(cw.breakdown) || pickSource(cw.usage_breakdown);
+    if (!raw) return [];
+
+    const items = [];
+    if (Array.isArray(raw)) {
+      raw.forEach((entry, idx) => {
+        if (!entry || typeof entry !== "object") return;
+        const key = String(entry.key || entry.id || entry.name || `item_${idx}`).toLowerCase();
+        const tokens = Math.max(0, Number(entry.tokens ?? entry.value ?? entry.count ?? 0) || 0);
+        const rawPct = entry.pct ?? entry.percent;
+        const pct = rawPct !== undefined && rawPct !== null ? Math.max(0, Number(rawPct) || 0) : null;
+        if (tokens <= 0 && (!pct || pct <= 0)) return;
+        items.push({
+          key,
+          label: ctxBreakdownLabel(key, entry.label),
+          tokens,
+          pct,
+          color: entry.color || CTX_BD_COLORS[key] || CTX_BD_FALLBACK_PALETTE[idx % CTX_BD_FALLBACK_PALETTE.length],
+        });
+      });
+    } else {
+      Object.entries(raw).forEach(([rawKey, val], idx) => {
+        const key = String(rawKey || "").toLowerCase();
+        let tokens = 0;
+        let pct = null;
+        let customLabel = "";
+        let customColor = "";
+        if (typeof val === "number") {
+          tokens = Math.max(0, val);
+        } else if (val && typeof val === "object") {
+          tokens = Math.max(0, Number(val.tokens ?? val.value ?? val.count ?? 0) || 0);
+          const rawPct = val.pct ?? val.percent;
+          if (rawPct !== undefined && rawPct !== null) pct = Math.max(0, Number(rawPct) || 0);
+          customLabel = val.label ? String(val.label) : "";
+          customColor = val.color ? String(val.color) : "";
+        }
+        if (tokens <= 0 && (!pct || pct <= 0)) return;
+        items.push({
+          key,
+          label: ctxBreakdownLabel(key, customLabel),
+          tokens,
+          pct,
+          color: customColor || CTX_BD_COLORS[key] || CTX_BD_FALLBACK_PALETTE[idx % CTX_BD_FALLBACK_PALETTE.length],
+        });
+      });
+    }
+
+    const totalTok = items.reduce((acc, it) => acc + it.tokens, 0) || Number(cw.used_tokens) || 1;
+    return items.map((it) => ({
+      ...it,
+      pct: it.pct !== null ? it.pct : (it.tokens / totalTok) * 100,
+    }));
+  }
+
+  function setCurrentContext(cw) {
+    state.currentContext = cw && typeof cw === "object" ? cw : null;
+    updateContextPill();
+    if (state.ctxPopoverOpen) {
+      if (state.currentCid && state.currentContext && Number(state.currentContext.used_tokens) > 0) {
+        renderContextPopover();
+      } else {
+        closeContextPopover();
+      }
+    }
+  }
+
+  function updateContextPill() {
+    const btn = $("btn-ctx-window");
+    const ring = $("ctx-mini-progress");
+    const pctEl = $("ctx-pill-pct");
+    if (!btn) return;
+
+    const cw = state.currentContext;
+    const hasValid = Boolean(state.currentCid && cw && Number(cw.used_tokens) > 0);
+    if (!hasValid) {
+      btn.classList.add("hidden");
+      btn.classList.remove("open");
+      btn.setAttribute("aria-expanded", "false");
+      if (state.ctxPopoverOpen) {
+        closeContextPopover();
+      }
+      return;
+    }
+
+    const limit = Math.max(1, Number(cw.window_limit) || 512000);
+    const rawPct = cw.used_pct !== undefined && cw.used_pct !== null
+      ? Number(cw.used_pct)
+      : (Number(cw.used_tokens) / limit) * 100;
+    const pct = Math.max(0, Math.min(100, Number.isFinite(rawPct) ? rawPct : 0));
+    const intPct = Math.round(pct);
+    const level = resolveCtxStatusLevel(cw);
+    const offset = CTX_MINI_CIRC * (1 - pct / 100);
+
+    btn.dataset.level = level;
+    btn.classList.remove("hidden");
+    btn.classList.toggle("open", state.ctxPopoverOpen);
+    btn.setAttribute("aria-expanded", state.ctxPopoverOpen ? "true" : "false");
+    const pillAria = t("ctx.pillAria", { pct: intPct });
+    btn.setAttribute("aria-label", pillAria);
+    btn.title = pillAria;
+
+    if (ring) {
+      ring.setAttribute("stroke-dasharray", CTX_MINI_CIRC.toFixed(2));
+      ring.setAttribute("stroke-dashoffset", offset.toFixed(2));
+    }
+    if (pctEl) {
+      pctEl.textContent = `${intPct}%`;
+    }
+  }
+
+  function renderContextPopover() {
+    const panel = $("ctx-window-panel");
+    const cw = state.currentContext;
+    if (!panel || !cw || Number(cw.used_tokens) <= 0) return;
+
+    const usedTokens = Math.max(0, Number(cw.used_tokens) || 0);
+    const windowLimit = Math.max(1, Number(cw.window_limit) || 512000);
+    const remainingTokens = cw.remaining_tokens !== undefined && cw.remaining_tokens !== null
+      ? Math.max(0, Number(cw.remaining_tokens) || 0)
+      : Math.max(0, windowLimit - usedTokens);
+    const rawPct = cw.used_pct !== undefined && cw.used_pct !== null
+      ? Number(cw.used_pct)
+      : (usedTokens / windowLimit) * 100;
+    const usedPct = Math.max(0, Math.min(100, Number.isFinite(rawPct) ? rawPct : 0));
+    const usedPctText = usedPct >= 99.95 ? "100%" : `${usedPct.toFixed(1)}%`;
+    const level = resolveCtxStatusLevel(cw);
+    const statusText = level === "critical"
+      ? t("ctx.statusCritical")
+      : level === "high"
+      ? t("ctx.statusHigh")
+      : level === "mid"
+      ? t("ctx.statusMid")
+      : t("ctx.statusLow");
+
+    const donutOffset = CTX_DONUT_CIRC * (1 - usedPct / 100);
+    const limitLabel = cw.window_limit_label ? String(cw.window_limit_label) : fmtCompactTokens(windowLimit);
+    const modelLabel = cw.model_label ? String(cw.model_label) : shortModelLabel(cw.model_id || state.selectedModel);
+
+    const speed = Number(cw.speed_tps) || 0;
+    const avgSpeed = Number(cw.avg_speed_tps) || 0;
+    let speedText = "";
+    if (speed > 0 && avgSpeed > 0) {
+      speedText = t("ctx.speedVal", { speed: speed.toFixed(1), avg: avgSpeed.toFixed(1) });
+    } else if (speed > 0) {
+      speedText = t("ctx.speedSingle", { speed: speed.toFixed(1) });
+    } else if (avgSpeed > 0) {
+      speedText = t("ctx.speedAvgOnly", { avg: avgSpeed.toFixed(1) });
+    } else {
+      speedText = t("ctx.stepsTurns", {
+        steps: Math.max(0, Number(cw.steps) || 0),
+        turns: Math.max(0, Number(cw.turns) || state.turns.length || 0),
+      });
+    }
+
+    const turnCachePct = (Number(cw.turn_cache_hit_pct) || 0).toFixed(1);
+    const turnCacheTok = fmtCompactTokens(cw.turn_cache_tokens || 0);
+    const sessCachePct = (Number(cw.session_cache_hit_pct) || 0).toFixed(1);
+    const sessCacheTok = fmtCompactTokens(cw.session_cache_tokens || 0);
+
+    const bdItems = normalizeCtxBreakdown(cw);
+    let bdInnerHtml = "";
+    if (bdItems.length) {
+      const pctSum = bdItems.reduce((acc, it) => acc + Math.max(0, it.pct), 0) || 100;
+      const barSegs = bdItems
+        .map((it) => {
+          const w = Math.max(1.5, (it.pct / pctSum) * 100);
+          return `<span class="ctx-bd-seg" style="width:${w.toFixed(2)}%;background:${escHtml(it.color)}" title="${escHtml(it.label)}: ${escHtml(fmtCompactTokens(it.tokens))}"></span>`;
+        })
+        .join("");
+      const rows = bdItems
+        .map(
+          (it) => `
+            <div class="ctx-bd-row">
+              <span class="ctx-bd-key">
+                <span class="ctx-bd-dot" style="background:${escHtml(it.color)}"></span>
+                <span>${escHtml(it.label)}</span>
+              </span>
+              <span class="ctx-bd-val">
+                <span>${escHtml(fmtCompactTokens(it.tokens))}</span>
+                <span class="ctx-bd-pct">${it.pct.toFixed(1)}%</span>
+              </span>
+            </div>`
+        )
+        .join("");
+      bdInnerHtml = `<div class="ctx-bd-bar">${barSegs}</div><div class="ctx-bd-list">${rows}</div>`;
+    } else {
+      bdInnerHtml = `<div class="ctx-bd-empty">${escHtml(t("ctx.bdEmpty"))}</div>`;
+    }
+
+    const bdOpen = Boolean(state.ctxBreakdownOpen);
+    panel.dataset.level = level;
+    panel.innerHTML = `
+      <div class="ctx-panel-head">
+        <div class="ctx-panel-head-left">
+          <span class="ctx-panel-title">${escHtml(t("ctx.title"))}</span>
+          <button id="btn-ctx-breakdown" class="ctx-breakdown-toggle ${bdOpen ? "open" : ""}" type="button" aria-expanded="${bdOpen ? "true" : "false"}" aria-controls="ctx-breakdown-wrap" aria-label="${escHtml(t("ctx.breakdownAria"))}">
+            <svg class="ctx-breakdown-chev" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+            <span>${escHtml(t("ctx.breakdown"))}</span>
+          </button>
+        </div>
+        <span class="ctx-status-pill lvl-${escHtml(level)}">${escHtml(statusText)}</span>
+      </div>
+
+      <div id="ctx-breakdown-wrap" class="ctx-breakdown-wrap ${bdOpen ? "" : "hidden"}">
+        ${bdInnerHtml}
+      </div>
+
+      <div class="ctx-hero-row">
+        <div class="ctx-donut-wrap">
+          <svg class="ctx-donut-svg" viewBox="0 0 100 100" aria-hidden="true">
+            <circle class="ctx-donut-track" cx="50" cy="50" r="40" fill="none" stroke-width="8.5"></circle>
+            <circle class="ctx-donut-arc" cx="50" cy="50" r="40" fill="none" stroke-width="8.5" stroke-linecap="round" stroke-dasharray="${CTX_DONUT_CIRC.toFixed(2)}" stroke-dashoffset="${donutOffset.toFixed(2)}" transform="rotate(-90 50 50)"></circle>
+          </svg>
+          <div class="ctx-donut-center">
+            <span class="ctx-donut-pct">${escHtml(usedPctText)}</span>
+            <span class="ctx-donut-sub">${escHtml(t("ctx.usedLabel"))}</span>
+          </div>
+        </div>
+        <div class="ctx-hero-metrics">
+          <div class="ctx-metric-row">
+            <span class="ctx-metric-k">${escHtml(t("ctx.usedTokens"))}</span>
+            <span class="ctx-metric-v">${escHtml(fmtCompactTokens(usedTokens))}</span>
+          </div>
+          <div class="ctx-metric-row">
+            <span class="ctx-metric-k">${escHtml(t("ctx.remaining"))}</span>
+            <span class="ctx-metric-v">${escHtml(fmtCompactTokens(remainingTokens))}</span>
+          </div>
+          <div class="ctx-metric-row">
+            <span class="ctx-metric-k">${escHtml(t("ctx.windowLimit"))}</span>
+            <span class="ctx-metric-v">${escHtml(limitLabel)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="ctx-divider"></div>
+
+      <div class="ctx-details">
+        <div class="ctx-detail-row">
+          <span class="ctx-detail-k">${escHtml(t("ctx.model"))}</span>
+          <span class="ctx-detail-v">${escHtml(modelLabel)}</span>
+        </div>
+        <div class="ctx-detail-row">
+          <span class="ctx-detail-k">${escHtml(t("ctx.speed"))}</span>
+          <span class="ctx-detail-v">${escHtml(speedText)}</span>
+        </div>
+        <div class="ctx-detail-row">
+          <span class="ctx-detail-k">${escHtml(t("ctx.turnCache"))}</span>
+          <span class="ctx-detail-v">${escHtml(t("ctx.cacheVal", { pct: turnCachePct, tokens: turnCacheTok }))}</span>
+        </div>
+        <div class="ctx-detail-row">
+          <span class="ctx-detail-k">${escHtml(t("ctx.sessionCache"))}</span>
+          <span class="ctx-detail-v">${escHtml(t("ctx.cacheVal", { pct: sessCachePct, tokens: sessCacheTok }))}</span>
+        </div>
+      </div>`;
+  }
+
+  async function fetchCurrentContextWindow(cid) {
+    if (!cid || String(cid).startsWith("pending-")) return;
+    const seq = ++state.ctxFetchSeq;
+    try {
+      const data = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/context`);
+      if (seq !== state.ctxFetchSeq || state.currentCid !== cid) return;
+      if (data && data.context_window && typeof data.context_window === "object") {
+        setCurrentContext(data.context_window);
+      }
+    } catch (_) {}
+  }
+
+  function openContextPopover() {
+    if (!state.currentCid || !state.currentContext || Number(state.currentContext.used_tokens) <= 0) return;
+    haptic("light");
+    closeTurnNavigator();
+    closeSwarmDrawer();
+    closeAllSheets();
+    closeDrawer();
+    state.ctxPopoverOpen = true;
+    renderContextPopover();
+    $("composer-wrap")?.classList.add("ctx-open");
+    $("ctx-window-backdrop")?.classList.remove("hidden");
+    $("ctx-window-panel")?.classList.remove("hidden");
+    updateContextPill();
+    fetchCurrentContextWindow(state.currentCid);
+  }
+
+  function closeContextPopover() {
+    if (!state.ctxPopoverOpen) return;
+    state.ctxPopoverOpen = false;
+    $("composer-wrap")?.classList.remove("ctx-open");
+    $("ctx-window-backdrop")?.classList.add("hidden");
+    $("ctx-window-panel")?.classList.add("hidden");
+    updateContextPill();
+  }
+
+  function toggleContextPopover() {
+    if (state.ctxPopoverOpen) {
+      closeContextPopover();
+    } else {
+      openContextPopover();
+    }
+  }
+
+  // =========================================================================
+  // 7.10 PIXEL-BEE SWARM INDICATOR & COLLAPSIBLE RIGHT SWARM DRAWER
+  // =========================================================================
+  const SWARM_BEE_PALETTES = [
+    { body: "#FBBF24", shade: "#D97706", stripe: "#1E1F22", crown: "#FDE047", wing: "#E0F2FE" }, // 0: Golden Queen
+    { body: "#FB7185", shade: "#E11D48", stripe: "#1E1F22", crown: "#FDE047", wing: "#FFE4E6" }, // 1: Coral
+    { body: "#F59E0B", shade: "#B45309", stripe: "#1E1F22", crown: "#FDE047", wing: "#FEF3C7" }, // 2: Amber
+    { body: "#38BDF8", shade: "#0284C7", stripe: "#1E1F22", crown: "#FDE047", wing: "#E0F2FE" }, // 3: Sky
+    { body: "#34D399", shade: "#059669", stripe: "#1E1F22", crown: "#FDE047", wing: "#D1FAE5" }, // 4: Mint
+    { body: "#A78BFA", shade: "#7C3AED", stripe: "#1E1F22", crown: "#FDE047", wing: "#EDE9FE" }, // 5: Violet
+  ];
+  const SWARM_CHEV_SVG = `<svg class="swarm-sec-chev" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
+
+  function swarmMemberColorIdx(name, explicitIdx) {
+    const cleanName = String(name || "").trim().toLowerCase();
+    if (cleanName === "coordinator") return 0;
+    if (explicitIdx !== undefined && explicitIdx !== null && Number.isFinite(Number(explicitIdx))) {
+      const n = Number(explicitIdx);
+      if (n === 0) return 0;
+      return ((Math.abs(n) - 1) % 5) + 1;
+    }
+    let h = 0;
+    for (let i = 0; i < cleanName.length; i++) {
+      h = (h * 31 + cleanName.charCodeAt(i)) >>> 0;
+    }
+    return (h % 5) + 1;
+  }
+
+  function pixelBeeSvg(colorIdx = 0, opts = {}) {
+    const { size = 16, crowned = false, live = false } = opts || {};
+    const palIdx = crowned ? 0 : (colorIdx === 0 ? 0 : (((Math.abs(Number(colorIdx) || 1) - 1) % 5) + 1));
+    const p = SWARM_BEE_PALETTES[palIdx] || SWARM_BEE_PALETTES[0];
+    const crownRects = crowned
+      ? `<rect x="4" y="1" width="1" height="2" fill="${p.crown}"/>` +
+        `<rect x="6" y="0" width="1" height="3" fill="${p.crown}"/>` +
+        `<rect x="8" y="1" width="1" height="2" fill="${p.crown}"/>` +
+        `<rect x="4" y="2" width="5" height="1" fill="${p.shade}"/>`
+      : `<rect x="3" y="3" width="1" height="2" fill="${p.stripe}"/>` +
+        `<rect x="5" y="4" width="1" height="1" fill="${p.stripe}"/>`;
+
+    return (
+      `<svg class="pixel-bee-svg${live ? " bee-live" : ""}" viewBox="0 0 16 16" width="${size}" height="${size}" shape-rendering="crispEdges" aria-hidden="true">` +
+        `<g class="bee-wing">` +
+          `<rect x="6" y="2" width="3" height="2" fill="${p.wing}"/>` +
+          `<rect x="10" y="3" width="3" height="2" fill="${p.wing}" opacity="0.88"/>` +
+        `</g>` +
+        crownRects +
+        `<rect x="3" y="5" width="9" height="1" fill="${p.stripe}"/>` +
+        `<rect x="2" y="6" width="1" height="5" fill="${p.stripe}"/>` +
+        `<rect x="12" y="6" width="1" height="5" fill="${p.stripe}"/>` +
+        `<rect x="3" y="11" width="9" height="1" fill="${p.stripe}"/>` +
+        `<rect x="3" y="6" width="3" height="5" fill="${p.body}"/>` +
+        `<rect x="6" y="6" width="2" height="5" fill="${p.stripe}"/>` +
+        `<rect x="8" y="6" width="2" height="5" fill="${p.body}"/>` +
+        `<rect x="10" y="6" width="2" height="5" fill="${p.stripe}"/>` +
+        `<rect x="3" y="10" width="3" height="1" fill="${p.shade}"/>` +
+        `<rect x="8" y="10" width="2" height="1" fill="${p.shade}"/>` +
+        `<rect x="4" y="7" width="1" height="2" fill="${p.stripe}"/>` +
+        `<rect x="3" y="9" width="1" height="1" fill="#FFF1F2" opacity="0.85"/>` +
+        `<rect x="13" y="8" width="2" height="1" fill="${p.stripe}"/>` +
+      `</svg>`
+    );
+  }
+
+  function swarmStateLabel(st) {
+    const s = String(st || "").toLowerCase();
+    if (s === "working") return t("swarm.stateWorking");
+    if (s === "waiting") return t("swarm.stateWaiting");
+    if (s === "in_review") return t("swarm.stateInReview");
+    if (s === "killed") return t("swarm.stateKilled");
+    return t("swarm.stateStopped");
+  }
+
+  function swarmThreadStatusLabel(st) {
+    const s = String(st || "").toLowerCase();
+    if (s === "moving") return t("swarm.threadMoving");
+    if (s === "done") return t("swarm.threadDone");
+    return t("swarm.threadWaiting");
+  }
+
+  function getSwarmEffectiveStats() {
+    const full = state.currentSwarm;
+    const sum = state.currentSwarmSummary;
+    const hasSwarm = Boolean((full && full.has_swarm) || (sum && sum.has_swarm));
+    const isLive = Boolean((full && full.is_live) || (sum && sum.is_live) || (state.streaming && state.swarmMode));
+    const workingCount = Number(
+      full && full.working_count !== undefined
+        ? full.working_count
+        : (sum && sum.working_count !== undefined ? sum.working_count : 0)
+    ) || 0;
+    const activeCount = Number(
+      full && full.active_count !== undefined
+        ? full.active_count
+        : (sum && sum.active_count !== undefined ? sum.active_count : 0)
+    ) || 0;
+    const title = String((full && full.title) || (sum && sum.title) || "").trim();
+    return { hasSwarm, isLive, workingCount, activeCount, title };
+  }
+
+  function updateSwarmTopbarPill() {
+    const btn = $("btn-swarm-status");
+    const beeEl = $("swarm-topbar-bee");
+    const cntEl = $("swarm-topbar-count");
+    if (!btn) return;
+
+    const { hasSwarm, isLive, workingCount, activeCount } = getSwarmEffectiveStats();
+    const visible = Boolean(state.currentCid ? (hasSwarm || state.swarmMode) : state.swarmMode);
+    if (!visible) {
+      btn.classList.add("hidden");
+      btn.classList.remove("is-live");
+      btn.setAttribute("aria-expanded", "false");
+      return;
+    }
+
+    btn.classList.remove("hidden");
+    btn.classList.toggle("is-live", isLive);
+    btn.setAttribute("aria-expanded", state.swarmDrawerOpen ? "true" : "false");
+
+    const displayCount = isLive ? (workingCount || activeCount) : workingCount;
+    if (beeEl) {
+      beeEl.innerHTML = pixelBeeSvg(0, { size: 16, crowned: true, live: isLive });
+    }
+    if (cntEl) {
+      if (displayCount > 0) {
+        cntEl.textContent = String(displayCount);
+        cntEl.classList.remove("hidden");
+      } else {
+        cntEl.textContent = "";
+        cntEl.classList.add("hidden");
+      }
+    }
+    btn.title = isLive
+      ? t("swarm.pillLiveTitle", { count: Math.max(1, displayCount) })
+      : t("swarm.pillIdleTitle");
+  }
+
+  function stopSwarmPolling() {
+    if (state.swarmPollTimer) {
+      clearTimeout(state.swarmPollTimer);
+      state.swarmPollTimer = null;
+    }
+  }
+
+  function syncSwarmPolling() {
+    stopSwarmPolling();
+    if (document.visibilityState === "hidden") return;
+    const cid = state.currentCid;
+    if (!cid || String(cid).startsWith("pending-") || !getActiveHost()) return;
+
+    const { isLive } = getSwarmEffectiveStats();
+    let delayMs = 0;
+    if (state.swarmDrawerOpen) {
+      delayMs = 2500;
+    } else if (isLive) {
+      delayMs = 5000;
+    }
+    if (!delayMs) return;
+
+    state.swarmPollTimer = setTimeout(async () => {
+      state.swarmPollTimer = null;
+      if (document.visibilityState === "hidden" || state.currentCid !== cid) return;
+      await fetchSwarmStatus({ showLoading: false });
+      syncSwarmPolling();
+    }, delayMs);
+  }
+
+  async function fetchSwarmStatus(opts = {}) {
+    const { showLoading = false } = opts || {};
+    const cid = state.currentCid;
+    if (!cid || String(cid).startsWith("pending-") || !getActiveHost()) {
+      state.currentSwarm = null;
+      state.swarmLoading = false;
+      state.swarmLastError = "";
+      updateSwarmTopbarPill();
+      if (state.swarmDrawerOpen) renderSwarmDrawer({ force: true });
+      return;
+    }
+
+    const seq = ++state.swarmFetchSeq;
+    if (showLoading) {
+      state.swarmLoading = true;
+      state.swarmLastError = "";
+      if (state.swarmDrawerOpen) renderSwarmDrawer({ force: true });
+    }
+
+    try {
+      const data = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/swarm`);
+      if (seq !== state.swarmFetchSeq || state.currentCid !== cid) return;
+      const sw = data && data.swarm && typeof data.swarm === "object" ? data.swarm : null;
+      state.currentSwarm = sw;
+      state.swarmLoading = false;
+      state.swarmLastError = "";
+      if (sw) {
+        state.currentSwarmSummary = {
+          has_swarm: Boolean(sw.has_swarm),
+          is_live: Boolean(sw.is_live),
+          active_count: Number(sw.active_count || 0),
+          working_count: Number(sw.working_count || 0),
+          title: String(sw.title || ""),
+        };
+      }
+      updateSwarmTopbarPill();
+      if (state.swarmDrawerOpen) {
+        renderSwarmDrawer();
+      }
+      if (state.streaming && $("streaming-row")) {
+        updateStreamingRow();
+      }
+    } catch (err) {
+      if (seq !== state.swarmFetchSeq || state.currentCid !== cid) return;
+      state.swarmLoading = false;
+      if (!state.currentSwarm) {
+        state.swarmLastError = err && err.message ? err.message : t("err.unknown");
+      }
+      if (state.swarmDrawerOpen) {
+        renderSwarmDrawer({ force: true });
+      }
+    }
+  }
+
+  function renderSwarmDrawer(opts = {}) {
+    const { force = false } = opts || {};
+    const drawer = $("swarm-drawer");
+    const body = $("swarm-drawer-body");
+    if (!drawer || !body) return;
+
+    const sw = state.currentSwarm;
+    const hasSwarm = Boolean(sw && sw.has_swarm);
+    const isLive = Boolean((sw && sw.is_live) || (state.streaming && state.swarmMode));
+    const members = Array.isArray(sw && sw.members) ? sw.members : [];
+    const archived = Array.isArray(sw && sw.archived_members) ? sw.archived_members : [];
+    const board = Array.isArray(sw && sw.board) ? sw.board : [];
+    const threads = Array.isArray(sw && sw.threads) ? sw.threads : [];
+
+    // Update header title, bee, status pill & tab labels
+    const titleEl = $("swarm-drawer-title");
+    const beeEl = $("swarm-drawer-bee");
+    const statusPill = $("swarm-drawer-status-pill");
+    const statusText = $("swarm-drawer-status-text");
+    if (titleEl) {
+      titleEl.textContent = (sw && sw.title) || t("swarm.defaultTitle");
+    }
+    if (beeEl) {
+      beeEl.innerHTML = pixelBeeSvg(0, { size: 20, crowned: true, live: isLive });
+    }
+    if (statusPill && statusText) {
+      const doneAll = hasSwarm && !isLive && Number(sw.tasks_total || 0) > 0 && Number(sw.tasks_done || 0) >= Number(sw.tasks_total || 0);
+      const pillCls = isLive ? "live" : (doneAll ? "done" : "idle");
+      statusPill.className = `swarm-status-pill ${pillCls}`;
+      statusText.textContent = isLive ? t("swarm.statusLive") : (doneAll ? t("swarm.statusDone") : t("swarm.statusIdle"));
+    }
+
+    const tabOv = $("swarm-tab-overview");
+    const tabBd = $("swarm-tab-board");
+    const tabMb = $("swarm-tab-members");
+    if (tabOv) tabOv.textContent = t("swarm.tabOverview");
+    if (tabBd) {
+      const bCnt = Number((sw && sw.board_count) || board.length || 0);
+      tabBd.textContent = bCnt > 0 ? t("swarm.tabBoardCount", { count: bCnt }) : t("swarm.tabBoard");
+    }
+    if (tabMb) {
+      const mCnt = Number((sw && sw.active_count) || members.length || 0);
+      tabMb.textContent = mCnt > 0 ? t("swarm.tabMembersCount", { count: mCnt }) : t("swarm.tabMembers");
+    }
+    document.querySelectorAll("#swarm-tabs [data-swarm-tab]").forEach((btn) => {
+      const act = btn.dataset.swarmTab === state.swarmTab;
+      btn.classList.toggle("active", act);
+      btn.setAttribute("aria-selected", act ? "true" : "false");
+    });
+
+    // Fingerprint guard so 2.5s polling never flickers or breaks user scroll
+    const fp = JSON.stringify({
+      lang: I18N.getLang(),
+      tab: state.swarmTab,
+      sel: state.swarmSelectedMember,
+      newest: state.swarmBoardNewestFirst,
+      loading: state.swarmLoading,
+      err: state.swarmLastError,
+      swarmMode: state.swarmMode,
+      sw,
+    });
+    if (!force && fp === state.swarmLastRenderFp) {
+      return;
+    }
+    state.swarmLastRenderFp = fp;
+
+    const prevScrollTop = body.scrollTop;
+    const isExp = (key, defOpen = false) =>
+      state.swarmExpandedKeys.has(key) || (defOpen && !state.swarmExpandedKeys.has(`!${key}`));
+
+    if (state.swarmLoading && !sw) {
+      body.innerHTML = `<div class="empty-placeholder">${escHtml(t("swarm.loading"))}</div>`;
+      return;
+    }
+    if (state.swarmLastError && !sw) {
+      body.innerHTML = `<div class="m3-card"><p class="info-text">${escHtml(t("swarm.loadFail", { err: state.swarmLastError }))}</p></div>`;
+      return;
+    }
+    if (!hasSwarm) {
+      const ctaHtml = state.swarmMode
+        ? `<span class="swarm-ready-pill">${escHtml(t("swarm.readyHint"))}</span>`
+        : `<button id="btn-swarm-enable-composer" class="m3-btn filled sm" type="button">${escHtml(t("swarm.enableBtn"))}</button>`;
+      body.innerHTML = `
+        <div class="swarm-empty-card">
+          <div class="swarm-empty-bee">${pixelBeeSvg(0, { size: 42, crowned: true, live: state.swarmMode })}</div>
+          <div class="swarm-empty-title">${escHtml(t("swarm.emptyTitle"))}</div>
+          <p class="swarm-empty-desc">${escHtml(t("swarm.emptyDesc"))}</p>
+          ${ctaHtml}
+        </div>`;
+      return;
+    }
+
+    // Build member color lookup map for Board/Threads consistency
+    const colorMap = new Map();
+    [...members, ...archived].forEach((m) => {
+      if (m && m.name) {
+        colorMap.set(m.name, swarmMemberColorIdx(m.name, m.color_idx));
+      }
+    });
+    const getColorFor = (name, explicitIdx) => {
+      if (colorMap.has(name)) return colorMap.get(name);
+      return swarmMemberColorIdx(name, explicitIdx);
+    };
+
+    if (state.swarmTab === "overview") {
+      const sections = [];
+
+      // 1. GOAL Card
+      const goalTitle = (sw.goal && sw.goal.title) || sw.title || t("swarm.defaultTitle");
+      const goalLine = (sw.goal && sw.goal.line) || "";
+      sections.push(`
+        <details class="swarm-section-card" data-skey="goal"${isExp("goal", true) ? " open" : ""}>
+          <summary>
+            <div class="swarm-sec-head-left">
+              <span class="swarm-sec-kicker">${escHtml(t("swarm.goalLabel"))}</span>
+              <span class="swarm-sec-title">${escHtml(goalTitle)}</span>
+            </div>
+            ${SWARM_CHEV_SVG}
+          </summary>
+          <div class="swarm-section-body">
+            <div class="swarm-goal-title">${escHtml(goalTitle)}</div>
+            ${goalLine ? `<div class="swarm-goal-line">${escHtml(goalLine)}</div>` : ""}
+          </div>
+        </details>`);
+
+      // 2. Running / Active Tasks Card
+      const activeWorkers = members.filter((m) => m && !m.killed);
+      const taskMembers = activeWorkers.filter((m) => m.role !== "coordinator");
+      const displayTaskMembers = taskMembers.length ? taskMembers : activeWorkers;
+      if (displayTaskMembers.length) {
+        const rowsHtml = displayTaskMembers
+          .map((m) => {
+            const st = String(m.state || "stopped").toLowerCase();
+            const cIdx = getColorFor(m.name, m.color_idx);
+            const isCrowned = m.role === "coordinator" || m.name === "coordinator";
+            const indicator = st === "working"
+              ? `<span class="swarm-task-spinner" aria-hidden="true"></span>`
+              : `<span class="swarm-task-dot ${escHtml(st)}" aria-hidden="true"></span>`;
+            const taskTitle = String(m.task || m.role || m.name);
+            const nowAct = String(m.current_action || "").trim();
+            return `
+              <div class="swarm-task-row">
+                <div class="swarm-task-top">
+                  ${indicator}
+                  <span class="swarm-task-name" title="${escHtml(taskTitle)}">${escHtml(taskTitle)}</span>
+                </div>
+                <div class="swarm-task-meta">
+                  <span class="swarm-bee-pill">
+                    ${pixelBeeSvg(cIdx, { size: 14, crowned: isCrowned, live: st === "working" })}
+                    <span>@${escHtml(m.name)}</span>
+                  </span>
+                  <span class="swarm-state-badge ${escHtml(st)}">${escHtml(swarmStateLabel(st))}</span>
+                </div>
+                ${nowAct ? `<div class="swarm-now-line">${escHtml(t("swarm.nowPrefix", { action: nowAct }))}</div>` : ""}
+              </div>`;
+          })
+          .join("");
+        sections.push(`
+          <details class="swarm-section-card" data-skey="running"${isExp("running", true) ? " open" : ""}>
+            <summary>
+              <div class="swarm-sec-head-left">
+                <span class="swarm-sec-title">${escHtml(t("swarm.runningTitle", { count: displayTaskMembers.length }))}</span>
+              </div>
+              ${SWARM_CHEV_SVG}
+            </summary>
+            <div class="swarm-section-body">${rowsHtml}</div>
+          </details>`);
+      }
+
+      // 3. Progress Summary Bar
+      const tasksDone = Math.max(0, Number(sw.tasks_done || 0));
+      const tasksTotal = Math.max(0, Number(sw.tasks_total || 0));
+      const progPct = tasksTotal > 0 ? Math.min(100, Math.round((tasksDone / tasksTotal) * 100)) : 0;
+      const progCirc = 2 * Math.PI * 8;
+      const progOff = progCirc * (1 - progPct / 100);
+      const movingThreads = threads.filter((th) => th && th.status === "moving").length;
+      sections.push(`
+        <details class="swarm-section-card" data-skey="progress"${isExp("progress", false) ? " open" : ""}>
+          <summary>
+            <div class="swarm-progress-summary">
+              <svg class="swarm-prog-ring" viewBox="0 0 20 20" width="20" height="20" aria-hidden="true">
+                <circle class="swarm-prog-track" cx="10" cy="10" r="8" fill="none" stroke-width="2.4"></circle>
+                <circle class="swarm-prog-arc" cx="10" cy="10" r="8" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-dasharray="${progCirc.toFixed(2)}" stroke-dashoffset="${progOff.toFixed(2)}" transform="rotate(-90 10 10)"></circle>
+              </svg>
+              <span class="swarm-prog-text">${escHtml(t("swarm.tasksProgress", { done: tasksDone, total: tasksTotal }))}</span>
+              ${movingThreads > 0 ? `<span class="swarm-prog-badge">${escHtml(t("swarm.activeThreads", { count: movingThreads }))}</span>` : ""}
+            </div>
+            ${SWARM_CHEV_SVG}
+          </summary>
+          <div class="swarm-section-body">
+            <div class="swarm-mini-stats">
+              <div class="swarm-mini-stat">
+                <span class="swarm-mini-stat-v">${Number(sw.active_count || members.length)}</span>
+                <span class="swarm-mini-stat-k">${escHtml(t("swarm.summaryActive"))}</span>
+              </div>
+              <div class="swarm-mini-stat">
+                <span class="swarm-mini-stat-v">${Number(sw.working_count || 0)}</span>
+                <span class="swarm-mini-stat-k">${escHtml(t("swarm.summaryWorking"))}</span>
+              </div>
+              <div class="swarm-mini-stat">
+                <span class="swarm-mini-stat-v">${Number(sw.killed_count || archived.length)}</span>
+                <span class="swarm-mini-stat-k">${escHtml(t("swarm.summaryArchived"))}</span>
+              </div>
+              <div class="swarm-mini-stat">
+                <span class="swarm-mini-stat-v">${Number(sw.board_count || board.length)}</span>
+                <span class="swarm-mini-stat-k">${escHtml(t("swarm.summaryBoard"))}</span>
+              </div>
+            </div>
+          </div>
+        </details>`);
+
+      // 4. Threads List (collapsible <details> cards)
+      if (threads.length) {
+        const thHtml = threads
+          .map((th, idx) => {
+            const tid = String(th.id || `t${idx}`);
+            const skey = `thread:${tid}`;
+            const st = String(th.status || "waiting").toLowerCase();
+            const dCnt = Math.max(0, Number(th.done_count || 0));
+            const tCnt = Math.max(1, Number(th.total_count || 1));
+            const barPct = Math.min(100, Math.round((dCnt / tCnt) * 100));
+            const thMembers = Array.isArray(th.members) ? th.members : [];
+            const thMemPills = thMembers
+              .map((tm) => {
+                const mc = getColorFor(tm.name, tm.color_idx);
+                const mst = String(tm.state || "stopped").toLowerCase();
+                return `
+                  <span class="swarm-bee-pill">
+                    ${pixelBeeSvg(mc, { size: 13, crowned: tm.name === "coordinator", live: mst === "working" })}
+                    <span>@${escHtml(tm.name)}</span>
+                  </span>`;
+              })
+              .join("");
+            return `
+              <details class="swarm-thread-card" data-skey="${escHtml(skey)}"${isExp(skey, st === "moving") ? " open" : ""}>
+                <summary>
+                  <span class="swarm-thread-dot ${escHtml(st)}" title="${escHtml(swarmThreadStatusLabel(st))}" aria-hidden="true"></span>
+                  <span class="swarm-thread-title">${escHtml(th.title || tid)}</span>
+                  <span class="swarm-thread-prog">
+                    <span class="swarm-thread-bar"><span class="swarm-thread-bar-fill ${st === "done" ? "done" : ""}" style="width:${barPct}%"></span></span>
+                    <span class="swarm-thread-ratio">${dCnt}/${tCnt}</span>
+                  </span>
+                  ${SWARM_CHEV_SVG}
+                </summary>
+                <div class="swarm-thread-body">
+                  ${th.goal ? `<div class="swarm-thread-goal">${escHtml(th.goal)}</div>` : ""}
+                  ${th.now_action ? `<div class="swarm-now-line">${escHtml(t("swarm.nowPrefix", { action: th.now_action }))}</div>` : ""}
+                  ${thMemPills ? `<div class="swarm-thread-members">${thMemPills}</div>` : ""}
+                </div>
+              </details>`;
+          })
+          .join("");
+        sections.push(`<div class="swarm-sub-heading">${escHtml(t("swarm.threadsHeading", { count: threads.length }))}</div><div class="swarm-threads-list">${thHtml}</div>`);
+      }
+
+      // 5. The Team Section (Coordinator Card + Interactive Bee Strip + Detail Card)
+      const coordinator = members.find((m) => m && (m.role === "coordinator" || m.name === "coordinator"));
+      const workers = members.filter((m) => m && m !== coordinator);
+      if (state.swarmSelectedMember && !workers.some((w) => w.name === state.swarmSelectedMember)) {
+        state.swarmSelectedMember = "";
+      }
+      const coordHtml = coordinator
+        ? (() => {
+            const cst = String(coordinator.state || "stopped").toLowerCase();
+            const actTxt = String(coordinator.current_action || coordinator.last_post_preview || "").trim() || t("swarm.noActivity");
+            return `
+              <div class="swarm-coordinator-card">
+                <div class="swarm-coord-avatar">${pixelBeeSvg(0, { size: 24, crowned: true, live: cst === "working" })}</div>
+                <div class="swarm-coord-info">
+                  <div class="swarm-coord-top">
+                    <span class="swarm-coord-name">@${escHtml(coordinator.name)}</span>
+                    <span class="swarm-coord-tag">${escHtml(t("swarm.coordinatorBadge"))}</span>
+                    <span class="swarm-state-badge ${escHtml(cst)}">${escHtml(swarmStateLabel(cst))}</span>
+                  </div>
+                  <div class="swarm-coord-act">${escHtml(actTxt)}</div>
+                </div>
+              </div>`;
+          })()
+        : "";
+
+      const allSelected = !state.swarmSelectedMember;
+      const stripTiles = [
+        `<button class="swarm-bee-tile ${allSelected ? "selected" : ""}" type="button" data-swarm-member="">
+          ${pixelBeeSvg(0, { size: 24, crowned: true, live: isLive })}
+          <span class="swarm-bee-tile-name">${escHtml(t("swarm.teamAll"))}</span>
+        </button>`,
+        ...workers.map((w) => {
+          const wst = String(w.state || "stopped").toLowerCase();
+          const cIdx = getColorFor(w.name, w.color_idx);
+          const sel = state.swarmSelectedMember === w.name;
+          const badge = wst === "working"
+            ? `<span class="swarm-bee-live-dot" aria-hidden="true"></span>`
+            : (wst === "waiting" ? `<span class="swarm-bee-zz" aria-hidden="true">zZ</span>` : "");
+          return `
+            <button class="swarm-bee-tile ${sel ? "selected" : ""}" type="button" data-swarm-member="${escHtml(w.name)}" title="@${escHtml(w.name)}">
+              ${badge}
+              ${pixelBeeSvg(cIdx, { size: 24, crowned: false, live: wst === "working" })}
+              <span class="swarm-bee-tile-name">${escHtml(w.name)}</span>
+            </button>`;
+        }),
+      ].join("");
+
+      let teamDetailHtml = "";
+      if (state.swarmSelectedMember) {
+        const picked = workers.find((w) => w.name === state.swarmSelectedMember);
+        if (picked) {
+          const pst = String(picked.state || "stopped").toLowerCase();
+          const pc = getColorFor(picked.name, picked.color_idx);
+          const modelTxt = picked.model ? shortModelLabel(picked.model) : "";
+          const nowTxt = String(picked.current_action || "").trim();
+          const postTxt = String(picked.last_post_preview || "").trim();
+          teamDetailHtml = `
+            <div class="swarm-member-detail">
+              <div class="swarm-member-detail-head">
+                ${pixelBeeSvg(pc, { size: 18, crowned: false, live: pst === "working" })}
+                <span class="swarm-member-detail-name">@${escHtml(picked.name)}</span>
+                <span class="swarm-state-badge ${escHtml(pst)}">${escHtml(swarmStateLabel(pst))}</span>
+                ${modelTxt ? `<span class="swarm-member-model-tag">${escHtml(modelTxt)}</span>` : ""}
+              </div>
+              <div class="swarm-member-detail-task">${escHtml(picked.task || t("swarm.noTaskDesc"))}</div>
+              ${nowTxt ? `<div class="swarm-now-line">${escHtml(t("swarm.nowPrefix", { action: nowTxt }))}</div>` : ""}
+              ${postTxt ? `<div class="swarm-coord-act">${picked.last_post_seq ? `#${picked.last_post_seq} · ` : ""}${escHtml(postTxt)}</div>` : ""}
+            </div>`;
+        }
+      } else if (workers.length) {
+        teamDetailHtml = `<div class="swarm-team-hint">${escHtml(t("swarm.teamTapHint"))}</div>`;
+      }
+
+      sections.push(`
+        <div class="swarm-team-box">
+          <div class="swarm-sub-heading">${escHtml(t("swarm.teamHeading"))}</div>
+          ${coordHtml}
+          ${workers.length ? `<div class="swarm-team-strip">${stripTiles}</div>` : ""}
+          ${teamDetailHtml}
+        </div>`);
+
+      body.innerHTML = sections.join("");
+    } else if (state.swarmTab === "board") {
+      if (!board.length) {
+        body.innerHTML = `<div class="empty-placeholder">${escHtml(t("swarm.boardEmpty"))}</div>`;
+      } else {
+        const ordered = state.swarmBoardNewestFirst
+          ? [...board].sort((a, b) => Number(b.seq || 0) - Number(a.seq || 0))
+          : [...board].sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+        const sortLbl = state.swarmBoardNewestFirst ? t("swarm.boardNewest") : t("swarm.boardOldest");
+        const msgsHtml = ordered
+          .map((msg) => {
+            const seq = Number(msg.seq || 0);
+            const agent = String(msg.agent || "agent");
+            const cIdx = getColorFor(agent);
+            const txt = String(msg.text || "");
+            const isLong = txt.length > 260;
+            const skey = `board:${seq}`;
+            const timeLbl = fmtTurnTime(msg.time);
+            const bodyHtml = isLong
+              ? `<details class="swarm-board-fold" data-skey="${escHtml(skey)}"${isExp(skey, false) ? " open" : ""}>
+                   <summary>
+                     <div class="swarm-board-preview">${escHtml(txt)}</div>
+                     <span class="swarm-board-expand-hint">${escHtml(t("swarm.boardExpand"))}</span>
+                   </summary>
+                   <div class="swarm-board-text">${escHtml(txt)}</div>
+                 </details>`
+              : `<div class="swarm-board-text">${escHtml(txt)}</div>`;
+            return `
+              <div class="swarm-board-msg">
+                <div class="swarm-board-msg-head">
+                  <span class="swarm-board-seq">#${seq}</span>
+                  <span class="swarm-bee-pill">
+                    ${pixelBeeSvg(cIdx, { size: 13, crowned: agent === "coordinator", live: false })}
+                    <span>@${escHtml(agent)}</span>
+                  </span>
+                  ${timeLbl ? `<span class="swarm-board-time">${escHtml(timeLbl)}</span>` : ""}
+                </div>
+                ${bodyHtml}
+              </div>`;
+          })
+          .join("");
+        body.innerHTML = `
+          <div class="swarm-board-toolbar">
+            <span class="swarm-board-count">${escHtml(t("swarm.boardCount", { count: board.length }))}</span>
+            <button id="btn-swarm-board-sort" class="swarm-board-sort-btn" type="button">${escHtml(sortLbl)}</button>
+          </div>
+          ${msgsHtml}`;
+      }
+    } else {
+      // Members Tab
+      const parts = [];
+      if (members.length) {
+        const activeHtml = members
+          .map((m) => {
+            const st = String(m.state || "stopped").toLowerCase();
+            const isCrowned = m.role === "coordinator" || m.name === "coordinator";
+            const cIdx = getColorFor(m.name, m.color_idx);
+            const mLbl = m.model ? shortModelLabel(m.model) : "";
+            const actTxt = String(m.current_action || "").trim();
+            const seqTxt = m.last_post_seq ? t("swarm.lastPostSeq", { seq: m.last_post_seq }) : "";
+            return `
+              <div class="swarm-member-card">
+                <div class="swarm-member-card-top">
+                  ${pixelBeeSvg(cIdx, { size: 22, crowned: isCrowned, live: st === "working" })}
+                  <div class="swarm-member-card-title">
+                    <div class="swarm-member-card-name">@${escHtml(m.name)}</div>
+                    <div class="swarm-member-card-sub">${escHtml([mLbl, seqTxt].filter(Boolean).join(" · ") || m.role || "")}</div>
+                  </div>
+                  <span class="swarm-state-badge ${escHtml(st)}">${escHtml(swarmStateLabel(st))}</span>
+                </div>
+                ${m.task ? `<div class="swarm-member-detail-task">${escHtml(m.task)}</div>` : ""}
+                ${actTxt ? `<div class="swarm-now-line">${escHtml(t("swarm.nowPrefix", { action: actTxt }))}</div>` : ""}
+              </div>`;
+          })
+          .join("");
+        parts.push(`<div class="swarm-sub-heading">${escHtml(t("swarm.membersActiveHeading", { count: members.length }))}</div>${activeHtml}`);
+      }
+      if (archived.length) {
+        const archHtml = archived
+          .map((m) => {
+            const cIdx = getColorFor(m.name, m.color_idx);
+            const mLbl = m.model ? shortModelLabel(m.model) : "";
+            const seqTxt = m.last_post_seq ? t("swarm.lastPostSeq", { seq: m.last_post_seq }) : "";
+            return `
+              <div class="swarm-member-card archived">
+                <div class="swarm-member-card-top">
+                  ${pixelBeeSvg(cIdx, { size: 18, crowned: m.role === "coordinator", live: false })}
+                  <div class="swarm-member-card-title">
+                    <div class="swarm-member-card-name">@${escHtml(m.name)}</div>
+                    <div class="swarm-member-card-sub">${escHtml([mLbl, seqTxt].filter(Boolean).join(" · "))}</div>
+                  </div>
+                  <span class="swarm-state-badge killed">${escHtml(swarmStateLabel("killed"))}</span>
+                </div>
+                ${m.last_post_preview ? `<div class="swarm-coord-act">${escHtml(m.last_post_preview)}</div>` : ""}
+              </div>`;
+          })
+          .join("");
+        parts.push(`
+          <details class="swarm-section-card" data-skey="archived"${isExp("archived", false) ? " open" : ""}>
+            <summary>
+              <div class="swarm-sec-head-left">
+                <span class="swarm-sec-title">${escHtml(t("swarm.membersArchivedHeading", { count: archived.length }))}</span>
+              </div>
+              ${SWARM_CHEV_SVG}
+            </summary>
+            <div class="swarm-section-body">${archHtml}</div>
+          </details>`);
+      }
+      body.innerHTML = parts.length ? parts.join("") : `<div class="empty-placeholder">${escHtml(t("swarm.membersEmpty"))}</div>`;
+    }
+
+    body.scrollTop = prevScrollTop;
+  }
+
+  function openSwarmDrawer() {
+    haptic("light");
+    closeTurnNavigator();
+    closeContextPopover();
+    closeAllSheets();
+    closeDrawer();
+    state.swarmDrawerOpen = true;
+    $("swarm-backdrop")?.classList.remove("hidden");
+    $("swarm-drawer")?.classList.add("open");
+    updateSwarmTopbarPill();
+    renderSwarmDrawer({ force: true });
+    fetchSwarmStatus({ showLoading: !state.currentSwarm });
+    syncSwarmPolling();
+  }
+
+  function closeSwarmDrawer() {
+    if (!state.swarmDrawerOpen) return;
+    state.swarmDrawerOpen = false;
+    $("swarm-backdrop")?.classList.add("hidden");
+    $("swarm-drawer")?.classList.remove("open");
+    updateSwarmTopbarPill();
+    syncSwarmPolling();
+  }
+
+  function toggleSwarmDrawer() {
+    if (state.swarmDrawerOpen) {
+      closeSwarmDrawer();
+    } else {
+      openSwarmDrawer();
+    }
+  }
 
   // =========================================================================
   // 8. CHAT & STREAMING RENDER
@@ -3159,12 +4579,28 @@
         ${items ? `<div class="tool-items">${items}</div>` : ""}
       </details>`;
 
+    const { isLive: swarmLive, workingCount: swarmWorking, activeCount: swarmActive } = getSwarmEffectiveStats();
+    const showSwarmStrip = Boolean(state.streaming && (state.swarmMode || swarmLive));
+    const swarmStripCount = swarmWorking || swarmActive;
+    const swarmStripHtml = showSwarmStrip
+      ? `<button class="swarm-live-strip" type="button" data-open-swarm="1">
+           ${pixelBeeSvg(0, { size: 17, crowned: true, live: true })}
+           <span class="swarm-live-strip-dot" aria-hidden="true"></span>
+           <span class="swarm-live-strip-text">${escHtml(
+             swarmStripCount > 0
+               ? t("swarm.streamActiveCount", { count: swarmStripCount })
+               : t("swarm.streamActiveGeneric")
+           )}</span>
+         </button>`
+      : "";
+
     sRow.innerHTML = `
       <div class="assistant-flow">
         <div class="assistant-head">
           <span class="assistant-avatar">${assistantMarkSvg()}</span>
           <span>${escHtml(t("chat.liveOutput", { model: shortModelLabel(state.selectedModel) }))}</span>
         </div>
+        ${swarmStripHtml}
         ${traceHtml}
         ${state.streamBuffer ? `<div class="md-body">${renderMarkdown(state.streamBuffer)}</div>` : ""}
       </div>`;
@@ -3359,9 +4795,27 @@
     const switching = cid !== state.currentCid;
     if (switching) {
       closeTurnNavigator();
+      closeContextPopover();
+      closeSwarmDrawer();
+      stopSwarmPolling();
       saveCurrentDraft(prevKey);
       state.currentCid = cid;
       state.lastRenderedConvFp = "";
+      state.currentQueue = [];
+      state.editingQueueItemId = "";
+      state.editingQueueDraft = "";
+      state.currentContext = null;
+      state.ctxBreakdownOpen = false;
+      state.ctxFetchSeq += 1;
+      state.currentSwarmSummary = null;
+      state.currentSwarm = null;
+      state.swarmSelectedMember = "";
+      state.swarmLastRenderFp = "";
+      state.swarmLastError = "";
+      state.swarmFetchSeq += 1;
+      renderQueueTray();
+      updateContextPill();
+      updateSwarmTopbarPill();
       restoreDraftFor(cid);
       renderConvList();
       updateSidecarHeaderActions();
@@ -3395,11 +4849,22 @@
         state.streamTools = [];
       }
 
+      setCurrentQueue(Array.isArray(nextConv && nextConv.queue) ? nextConv.queue : []);
+      setCurrentContext((nextConv && nextConv.context_window) || null);
+      if (nextConv && nextConv.swarm_summary && typeof nextConv.swarm_summary === "object") {
+        state.currentSwarmSummary = nextConv.swarm_summary;
+      } else if (switching) {
+        state.currentSwarmSummary = null;
+      }
+      updateSwarmTopbarPill();
+      syncSwarmPolling();
+
       if (!switching && nextFp && nextFp === state.lastRenderedConvFp) {
         if (nextRunning) {
           updateStreamingRow();
         }
         updateSidecarHeaderActions();
+        updateSendButton();
         return;
       }
 
@@ -3437,6 +4902,9 @@
     state.sidecarUserPicked = true;
     const prevKey = currentDraftKey();
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
+    stopSwarmPolling();
     closeDrawer();
     if (prevKey !== NEW_DRAFT_KEY) {
       saveCurrentDraft(prevKey);
@@ -3444,43 +4912,158 @@
       state.lastRenderedConvFp = "";
       state.currentCid = "";
       state.currentConv = null;
+      state.currentQueue = [];
+      state.editingQueueItemId = "";
+      state.editingQueueDraft = "";
+      state.interruptPendingUntil = 0;
+      state.currentContext = null;
+      state.ctxBreakdownOpen = false;
+      state.ctxFetchSeq += 1;
+      state.currentSwarmSummary = null;
+      state.currentSwarm = null;
+      state.swarmSelectedMember = "";
+      state.swarmLastRenderFp = "";
+      state.swarmLastError = "";
+      state.swarmFetchSeq += 1;
       state.streaming = false;
       state.streamBuffer = "";
       state.streamTools = [];
+      renderQueueTray();
+      updateContextPill();
+      updateSwarmTopbarPill();
       restoreDraftFor(NEW_DRAFT_KEY);
       renderConversation();
       renderConvList();
     } else {
+      state.currentQueue = [];
+      state.editingQueueItemId = "";
+      state.editingQueueDraft = "";
+      state.currentContext = null;
+      state.currentSwarmSummary = null;
+      state.currentSwarm = null;
+      state.swarmSelectedMember = "";
+      state.swarmLastRenderFp = "";
+      renderQueueTray();
+      updateContextPill();
+      updateSwarmTopbarPill();
       updateSidecarHeaderActions();
     }
     $("prompt-input").focus();
   }
 
   // =========================================================================
-  // 10. SEND / CANCEL & FILE UPLOADS
+  // 10. SEND / QUEUE / CUT-IN / CANCEL & FILE UPLOADS
   // =========================================================================
-  async function handleSendOrStop() {
-    haptic("light");
-    if (state.streaming && state.currentCid) {
-      try {
-        await apiFetch(`/api/chat/cancel/${encodeURIComponent(state.currentCid)}`, { method: "POST" });
-        state.streaming = false;
-        updateSendButton();
-        showToast(t("toast.stoppedTask"));
-      } catch (e) {
-        showToast(t("toast.stopFail", { err: e.message }));
-      }
-      return;
-    }
-
+  async function sendPromptWithMode(mode = "normal") {
+    const normalizedMode = mode === "queue" || mode === "interrupt" ? mode : "normal";
     const inp = $("prompt-input");
-    const rawText = inp.value;
+    const rawText = inp ? inp.value : "";
     const text = rawText.trim();
     if (!text && !state.attachments.length) return;
+
+    haptic("light");
+    closeContextPopover();
 
     const sendDraftKey = currentDraftKey();
     const prevAttachments = state.attachments.slice();
     const attPaths = prevAttachments.map((a) => a.path);
+
+    // Queue or Cut-in while streaming on an active conversation
+    if (normalizedMode === "queue" || normalizedMode === "interrupt") {
+      if (!state.currentCid) {
+        return sendPromptWithMode("normal");
+      }
+
+      delete state.drafts[sendDraftKey];
+      persistHostDrafts();
+      if (inp) {
+        inp.value = "";
+        inp.style.height = "auto";
+      }
+      state.attachments = [];
+      renderAttachTray();
+
+      const targetCid = state.currentCid;
+      if (normalizedMode === "interrupt") {
+        state.interruptPendingUntil = Date.now() + 4500;
+      }
+
+      try {
+        const res = await apiFetch("/api/chat/send", {
+          method: "POST",
+          body: JSON.stringify({
+            conversation_id: targetCid,
+            prompt: text,
+            model: state.selectedModel,
+            attachments: attPaths,
+            swarm_mode: state.swarmMode,
+            mode: normalizedMode,
+            priority: normalizedMode === "interrupt" ? "urgent" : "normal",
+          }),
+        });
+
+        if (state.currentCid === targetCid) {
+          if (Array.isArray(res.queue)) {
+            setCurrentQueue(res.queue);
+          } else if (normalizedMode === "queue" && res.item) {
+            setCurrentQueue([...state.currentQueue, res.item]);
+          }
+          if (normalizedMode === "queue") {
+            if (res.queued === false) {
+              // Active run ended right before queue request arrived; server started immediately
+              if (state.currentConv) {
+                const msgs = state.currentConv.messages || [];
+                const last = msgs[msgs.length - 1];
+                if (!(last && last.role === "user" && (last.text || "").trim() === text)) {
+                  msgs.push({
+                    role: "user",
+                    text,
+                    attachments: prevAttachments,
+                    time: new Date().toISOString(),
+                  });
+                }
+              }
+              state.streaming = true;
+              state.streamBuffer = "";
+              state.streamTools = [];
+              renderConversation();
+            } else {
+              showToast(t("toast.queuedPrompt"));
+            }
+          } else {
+            state.streaming = true;
+            state.streamBuffer = "";
+            state.streamTools = [];
+            updateSendButton();
+            renderQueueTray();
+            showToast(t("toast.cutinSent"));
+          }
+        }
+        refreshConversationsThrottled(400);
+      } catch (e) {
+        if (normalizedMode === "interrupt") {
+          state.interruptPendingUntil = 0;
+        }
+        if (currentDraftKey() === sendDraftKey) {
+          if (inp) {
+            inp.value = rawText;
+            resizePromptInput();
+          }
+          state.attachments = prevAttachments;
+          renderAttachTray();
+          saveCurrentDraft(sendDraftKey);
+        } else {
+          state.drafts[sendDraftKey] = { text: rawText, attachments: prevAttachments };
+          persistHostDrafts();
+        }
+        showToast(
+          normalizedMode === "interrupt"
+            ? t("toast.cutinFail", { err: e.message })
+            : t("toast.queueFail", { err: e.message })
+        );
+      }
+      return;
+    }
 
     const createdNewConv = !state.currentConv;
     if (createdNewConv) {
@@ -3503,8 +5086,10 @@
     targetConv.messages.push(optimisticMsg);
     delete state.drafts[sendDraftKey];
     persistHostDrafts();
-    inp.value = "";
-    inp.style.height = "auto";
+    if (inp) {
+      inp.value = "";
+      inp.style.height = "auto";
+    }
     state.attachments = [];
     renderAttachTray();
 
@@ -3523,9 +5108,26 @@
           model: state.selectedModel,
           attachments: attPaths,
           swarm_mode: state.swarmMode,
+          mode: "normal",
+          priority: "normal",
         }),
       });
       if (sendSeq === state.openConvSeq) {
+        if (res.queued === true) {
+          // Race condition: another device started streaming right before our normal send
+          const msgIdx = targetConv.messages.lastIndexOf(optimisticMsg);
+          if (msgIdx !== -1) {
+            targetConv.messages.splice(msgIdx, 1);
+          }
+          if (Array.isArray(res.queue)) {
+            setCurrentQueue(res.queue);
+          } else if (res.item) {
+            setCurrentQueue([...state.currentQueue, res.item]);
+          }
+          renderConversation({ preserveScroll: true });
+          showToast(t("toast.queuedPrompt"));
+          return;
+        }
         const nextCid = res.conversation_id;
         if (
           nextCid &&
@@ -3534,6 +5136,9 @@
           state.currentCid = nextCid;
           if (state.currentConv) state.currentConv.id = nextCid;
           updateSidecarHeaderActions();
+        }
+        if (Array.isArray(res.queue)) {
+          setCurrentQueue(res.queue);
         }
       }
       refreshConversations();
@@ -3551,8 +5156,10 @@
         }
       }
       if (currentDraftKey() === sendDraftKey) {
-        inp.value = rawText;
-        resizePromptInput();
+        if (inp) {
+          inp.value = rawText;
+          resizePromptInput();
+        }
         state.attachments = prevAttachments;
         renderAttachTray();
         saveCurrentDraft(sendDraftKey);
@@ -3567,6 +5174,24 @@
       }
       showToast(t("toast.sendFail", { err: e.message }));
     }
+  }
+
+  async function handleSendOrStop() {
+    haptic("light");
+    if (state.streaming && state.currentCid) {
+      try {
+        await apiFetch(`/api/chat/cancel/${encodeURIComponent(state.currentCid)}`, { method: "POST" });
+        state.interruptPendingUntil = 0;
+        state.streaming = false;
+        updateSendButton();
+        renderQueueTray();
+        showToast(t("toast.stoppedTask"));
+      } catch (e) {
+        showToast(t("toast.stopFail", { err: e.message }));
+      }
+      return;
+    }
+    return sendPromptWithMode("normal");
   }
 
   function appendUploadedAttachment(res, targetDraftKey) {
@@ -3698,6 +5323,8 @@
   function openModelSheet() {
     haptic("light");
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
     const body = $("model-groups");
     body.innerHTML =
       state.models
@@ -3752,6 +5379,8 @@
   function openHostSheet() {
     haptic("light");
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
     renderHostSheetList();
     $("model-sheet").classList.add("hidden");
     $("attach-sheet")?.classList.add("hidden");
@@ -3864,6 +5493,8 @@
   function openAttachSheet() {
     haptic("light");
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
     if (!window.AndroidBridge?.getRecentPhotosJson) {
       $("file-input")?.click();
       return;
@@ -3965,11 +5596,367 @@
   }
 
   let _previewLoadSeq = 0;
+  let activePreviewZoom = null;
+
+  function destroyPreviewZoom() {
+    if (activePreviewZoom) {
+      try {
+        activePreviewZoom.destroy();
+      } catch (_) {}
+      activePreviewZoom = null;
+    }
+    const bodyEl = $("preview-body");
+    if (bodyEl) {
+      bodyEl.classList.remove("preview-img-stage", "is-zoomed", "is-dragging", "is-animating");
+    }
+  }
+
+  function closePreviewModal() {
+    const modal = $("preview-modal");
+    if (modal) modal.classList.add("hidden");
+    destroyPreviewZoom();
+    state.previewFile = null;
+  }
+
+  function createPreviewImageZoomController(stageEl, imgEl, pillEl) {
+    const MIN_SCALE = 1;
+    const MAX_SCALE = 6;
+    const DOUBLE_TAP_SCALE = 2.5;
+    let scale = 1;
+    let tx = 0;
+    let ty = 0;
+    let animTimer = null;
+
+    let pinchActive = false;
+    let pinchDist0 = 0;
+    let pinchMidX0 = 0;
+    let pinchMidY0 = 0;
+    let pinchScale0 = 1;
+    let pinchTx0 = 0;
+    let pinchTy0 = 0;
+
+    let touchDragActive = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let dragTx0 = 0;
+    let dragTy0 = 0;
+    let lastTapAt = 0;
+    let lastTapX = 0;
+    let lastTapY = 0;
+
+    let mouseDragActive = false;
+
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    const clampOffsets = (nx, ny, s) => {
+      if (s <= 1.001) return { x: 0, y: 0 };
+      const sw = stageEl.clientWidth || 1;
+      const sh = stageEl.clientHeight || 1;
+      const bw = imgEl.offsetWidth || imgEl.clientWidth || sw;
+      const bh = imgEl.offsetHeight || imgEl.clientHeight || sh;
+      const maxTx = Math.max(0, (bw * s - sw) / 2);
+      const maxTy = Math.max(0, (bh * s - sh) / 2);
+      return {
+        x: clamp(nx, -maxTx, maxTx),
+        y: clamp(ny, -maxTy, maxTy),
+      };
+    };
+
+    const updatePill = () => {
+      if (!pillEl) return;
+      const isZoomed = scale > 1.005;
+      pillEl.classList.toggle("hidden", !isZoomed);
+      if (isZoomed) {
+        pillEl.textContent = t("preview.zoomReset", { pct: Math.round(scale * 100) });
+      }
+      pillEl.setAttribute("aria-label", t("preview.zoomResetAria"));
+    };
+
+    const applyTransform = (animate = false) => {
+      clearTimeout(animTimer);
+      if (animate) {
+        stageEl.classList.add("is-animating");
+        animTimer = setTimeout(() => {
+          stageEl.classList.remove("is-animating");
+        }, 215);
+      } else {
+        stageEl.classList.remove("is-animating");
+      }
+      const isZoomed = scale > 1.005;
+      stageEl.classList.toggle("is-zoomed", isZoomed);
+      imgEl.dataset.zoomScale = scale.toFixed(2);
+      imgEl.style.transform = `translate3d(${tx.toFixed(2)}px, ${ty.toFixed(2)}px, 0) scale(${scale.toFixed(4)})`;
+      updatePill();
+    };
+
+    const reset = (animate = true) => {
+      scale = 1;
+      tx = 0;
+      ty = 0;
+      applyTransform(animate);
+    };
+
+    const zoomAt = (nextScale, clientX, clientY, animate = false) => {
+      const clampedScale = clamp(nextScale, MIN_SCALE, MAX_SCALE);
+      if (clampedScale <= 1.005) {
+        reset(animate);
+        return;
+      }
+      const rect = stageEl.getBoundingClientRect();
+      const ox = clientX - (rect.left + rect.width / 2);
+      const oy = clientY - (rect.top + rect.height / 2);
+      const ratio = clampedScale / scale;
+      const rawTx = ox - (ox - tx) * ratio;
+      const rawTy = oy - (oy - ty) * ratio;
+      const clamped = clampOffsets(rawTx, rawTy, clampedScale);
+      scale = clampedScale;
+      tx = clamped.x;
+      ty = clamped.y;
+      applyTransform(animate);
+    };
+
+    const getPinchMetrics = (t0, t1) => {
+      const dx = t1.clientX - t0.clientX;
+      const dy = t1.clientY - t0.clientY;
+      return {
+        dist: Math.hypot(dx, dy),
+        midX: (t0.clientX + t1.clientX) / 2,
+        midY: (t0.clientY + t1.clientY) / 2,
+      };
+    };
+
+    const onTouchStart = (e) => {
+      if (e.target && e.target.closest && e.target.closest("#preview-zoom-pill")) return;
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        touchDragActive = false;
+        lastTapAt = 0;
+        const m = getPinchMetrics(e.touches[0], e.touches[1]);
+        pinchActive = true;
+        pinchDist0 = Math.max(1, m.dist);
+        pinchMidX0 = m.midX;
+        pinchMidY0 = m.midY;
+        pinchScale0 = scale;
+        pinchTx0 = tx;
+        pinchTy0 = ty;
+        stageEl.classList.remove("is-animating");
+        return;
+      }
+      if (e.touches.length === 1) {
+        const t0 = e.touches[0];
+        const now = Date.now();
+        if (now - lastTapAt < 300 && Math.hypot(t0.clientX - lastTapX, t0.clientY - lastTapY) < 36) {
+          e.preventDefault();
+          lastTapAt = 0;
+          touchDragActive = false;
+          if (scale > 1.05) {
+            reset(true);
+          } else {
+            zoomAt(DOUBLE_TAP_SCALE, t0.clientX, t0.clientY, true);
+          }
+          return;
+        }
+        lastTapAt = now;
+        lastTapX = t0.clientX;
+        lastTapY = t0.clientY;
+        if (scale > 1.005) {
+          e.preventDefault();
+          touchDragActive = true;
+          dragStartX = t0.clientX;
+          dragStartY = t0.clientY;
+          dragTx0 = tx;
+          dragTy0 = ty;
+          stageEl.classList.remove("is-animating");
+        }
+      }
+    };
+
+    const onTouchMove = (e) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const m = getPinchMetrics(e.touches[0], e.touches[1]);
+        if (!pinchActive) {
+          pinchActive = true;
+          pinchDist0 = Math.max(1, m.dist);
+          pinchMidX0 = m.midX;
+          pinchMidY0 = m.midY;
+          pinchScale0 = scale;
+          pinchTx0 = tx;
+          pinchTy0 = ty;
+          return;
+        }
+        const nextScale = clamp(pinchScale0 * (m.dist / pinchDist0), MIN_SCALE, MAX_SCALE);
+        const rect = stageEl.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const ox0 = pinchMidX0 - cx;
+        const oy0 = pinchMidY0 - cy;
+        const ox1 = m.midX - cx;
+        const oy1 = m.midY - cy;
+        const ratio = nextScale / pinchScale0;
+        const rawTx = ox1 - (ox0 - pinchTx0) * ratio;
+        const rawTy = oy1 - (oy0 - pinchTy0) * ratio;
+        const clamped = clampOffsets(rawTx, rawTy, nextScale);
+        scale = nextScale;
+        tx = clamped.x;
+        ty = clamped.y;
+        applyTransform(false);
+        return;
+      }
+      if (e.touches.length === 1 && touchDragActive && scale > 1.005) {
+        e.preventDefault();
+        const t0 = e.touches[0];
+        const clamped = clampOffsets(dragTx0 + (t0.clientX - dragStartX), dragTy0 + (t0.clientY - dragStartY), scale);
+        tx = clamped.x;
+        ty = clamped.y;
+        applyTransform(false);
+      }
+    };
+
+    const onTouchEnd = (e) => {
+      if (pinchActive && e.touches.length === 1) {
+        pinchActive = false;
+        if (scale > 1.005) {
+          const t0 = e.touches[0];
+          touchDragActive = true;
+          dragStartX = t0.clientX;
+          dragStartY = t0.clientY;
+          dragTx0 = tx;
+          dragTy0 = ty;
+        }
+        return;
+      }
+      if (e.touches.length === 0) {
+        pinchActive = false;
+        touchDragActive = false;
+        if (scale < 1.02) {
+          reset(true);
+        }
+      }
+    };
+
+    const onWheel = (e) => {
+      e.preventDefault();
+      const clampedDelta = clamp(e.deltaY, -160, 160);
+      const factor = Math.exp(-clampedDelta * 0.0032);
+      const nextScale = clamp(scale * factor, MIN_SCALE, MAX_SCALE);
+      zoomAt(nextScale, e.clientX, e.clientY, false);
+    };
+
+    const onMouseMove = (e) => {
+      if (!mouseDragActive || scale <= 1.005) return;
+      e.preventDefault();
+      const clamped = clampOffsets(dragTx0 + (e.clientX - dragStartX), dragTy0 + (e.clientY - dragStartY), scale);
+      tx = clamped.x;
+      ty = clamped.y;
+      applyTransform(false);
+    };
+
+    const onMouseUp = () => {
+      if (!mouseDragActive) return;
+      mouseDragActive = false;
+      stageEl.classList.remove("is-dragging");
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+
+    const onMouseDown = (e) => {
+      if (e.button !== 0) return;
+      if (e.target && e.target.closest && e.target.closest("#preview-zoom-pill")) return;
+      if (scale <= 1.005) return;
+      e.preventDefault();
+      mouseDragActive = true;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      dragTx0 = tx;
+      dragTy0 = ty;
+      stageEl.classList.add("is-dragging");
+      stageEl.classList.remove("is-animating");
+      window.addEventListener("mousemove", onMouseMove);
+      window.addEventListener("mouseup", onMouseUp);
+    };
+
+    const onDblClick = (e) => {
+      if (e.target && e.target.closest && e.target.closest("#preview-zoom-pill")) return;
+      e.preventDefault();
+      if (scale > 1.05) {
+        reset(true);
+      } else {
+        zoomAt(DOUBLE_TAP_SCALE, e.clientX, e.clientY, true);
+      }
+    };
+
+    const onPillClick = (e) => {
+      e.stopPropagation();
+      haptic("light");
+      reset(true);
+    };
+
+    const onResize = () => {
+      if (scale <= 1.005) return;
+      const clamped = clampOffsets(tx, ty, scale);
+      tx = clamped.x;
+      ty = clamped.y;
+      applyTransform(false);
+    };
+
+    stageEl.addEventListener("touchstart", onTouchStart, { passive: false });
+    stageEl.addEventListener("touchmove", onTouchMove, { passive: false });
+    stageEl.addEventListener("touchend", onTouchEnd, { passive: true });
+    stageEl.addEventListener("touchcancel", onTouchEnd, { passive: true });
+    stageEl.addEventListener("wheel", onWheel, { passive: false });
+    stageEl.addEventListener("mousedown", onMouseDown);
+    stageEl.addEventListener("dblclick", onDblClick);
+    pillEl?.addEventListener("click", onPillClick);
+    window.addEventListener("resize", onResize);
+
+    applyTransform(false);
+
+    return {
+      reset,
+      updateLabel: updatePill,
+      getScale: () => scale,
+      destroy() {
+        clearTimeout(animTimer);
+        mouseDragActive = false;
+        stageEl.removeEventListener("touchstart", onTouchStart);
+        stageEl.removeEventListener("touchmove", onTouchMove);
+        stageEl.removeEventListener("touchend", onTouchEnd);
+        stageEl.removeEventListener("touchcancel", onTouchEnd);
+        stageEl.removeEventListener("wheel", onWheel);
+        stageEl.removeEventListener("mousedown", onMouseDown);
+        stageEl.removeEventListener("dblclick", onDblClick);
+        pillEl?.removeEventListener("click", onPillClick);
+        window.removeEventListener("mousemove", onMouseMove);
+        window.removeEventListener("mouseup", onMouseUp);
+        window.removeEventListener("resize", onResize);
+        stageEl.classList.remove("preview-img-stage", "is-zoomed", "is-dragging", "is-animating");
+      },
+    };
+  }
+
+  function mountZoomablePreviewImage(bodyEl, imgEl) {
+    destroyPreviewZoom();
+    bodyEl.innerHTML = "";
+    bodyEl.classList.add("preview-img-stage");
+    imgEl.draggable = false;
+    const pill = document.createElement("button");
+    pill.id = "preview-zoom-pill";
+    pill.className = "preview-zoom-pill hidden";
+    pill.type = "button";
+    pill.setAttribute("aria-label", t("preview.zoomResetAria"));
+    bodyEl.appendChild(imgEl);
+    bodyEl.appendChild(pill);
+    activePreviewZoom = createPreviewImageZoomController(bodyEl, imgEl, pill);
+  }
 
   async function openFilePreview(path, name) {
     const host = getActiveHost();
     if (!host) return;
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
+    destroyPreviewZoom();
     const previewSeq = ++_previewLoadSeq;
     state.previewFile = { path, name };
     $("preview-name").textContent = name || path.split("/").pop();
@@ -3983,6 +5970,7 @@
       const apiPath = buildPreviewApiPath("", path);
       const renderPreviewError = (errMsg) => {
         if (previewSeq !== _previewLoadSeq) return;
+        destroyPreviewZoom();
         const detail = errMsg ? (I18N.isEn() ? ` (${errMsg})` : `（${errMsg}）`) : "";
         bodyEl.innerHTML = `
           <div class="m3-card preview-img-error">
@@ -4017,8 +6005,7 @@
             renderPreviewError(t("preview.decodeErr"));
           };
           img.src = entry.dataUrl || entry.blobUrl;
-          bodyEl.innerHTML = "";
-          bodyEl.appendChild(img);
+          mountZoomablePreviewImage(bodyEl, img);
         } catch (err) {
           if (previewSeq !== _previewLoadSeq || $("preview-modal")?.classList.contains("hidden")) return;
           renderPreviewError(err && err.name === "AbortError" ? t("preview.abortErr") : (err ? err.message : ""));
@@ -4044,8 +6031,7 @@
         }
       };
       img.src = directUrl;
-      bodyEl.innerHTML = "";
-      bodyEl.appendChild(img);
+      mountZoomablePreviewImage(bodyEl, img);
       return;
     }
 
@@ -4173,6 +6159,8 @@
 
   function openUsageModal() {
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
     closeDrawer();
     $("settings-modal")?.classList.add("hidden");
     $("usage-modal")?.classList.remove("hidden");
@@ -4538,6 +6526,8 @@
 
   function openSettingsModal() {
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
     closeDrawer();
     closeAllSheets();
     renderSettingsHosts();
@@ -4555,6 +6545,8 @@
   function openDrawer() {
     haptic("light");
     closeTurnNavigator();
+    closeContextPopover();
+    closeSwarmDrawer();
     updateHostDisplays();
     $("drawer-backdrop").classList.remove("hidden");
     $("drawer").classList.add("open");
@@ -4743,8 +6735,12 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
         syncOnForegroundResume();
-      } else if (SIDECAR) {
-        pauseSidecarTransportForHidden();
+        syncSwarmPolling();
+      } else {
+        stopSwarmPolling();
+        if (SIDECAR) {
+          pauseSidecarTransportForHidden();
+        }
       }
     });
 
@@ -4771,9 +6767,179 @@
       btn.setAttribute("aria-pressed", String(state.swarmMode));
       btn.querySelector(".swarm-ic-off")?.classList.toggle("hidden", state.swarmMode);
       btn.querySelector(".swarm-ic-on")?.classList.toggle("hidden", !state.swarmMode);
+      updateSwarmTopbarPill();
+      syncSwarmPolling();
+      if (state.swarmDrawerOpen) {
+        state.swarmLastRenderFp = "";
+        renderSwarmDrawer({ force: true });
+      }
+      if (state.streaming && $("streaming-row")) {
+        updateStreamingRow();
+      }
       haptic("light");
       showToast(state.swarmMode ? t("toast.swarmOn") : t("toast.swarmOff"));
     });
+
+    // --- Topbar Pixel-Bee Swarm Indicator & Right Collapsible Drawer Events ---
+    $("btn-swarm-status")?.addEventListener("click", toggleSwarmDrawer);
+    $("btn-close-swarm")?.addEventListener("click", closeSwarmDrawer);
+    $("swarm-backdrop")?.addEventListener("click", closeSwarmDrawer);
+    $("btn-swarm-refresh")?.addEventListener("click", () => {
+      haptic("light");
+      fetchSwarmStatus({ showLoading: false });
+    });
+    $("swarm-tabs")?.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-swarm-tab]");
+      if (!btn || !btn.dataset.swarmTab) return;
+      const nextTab = btn.dataset.swarmTab;
+      if (nextTab === state.swarmTab) return;
+      haptic("light");
+      state.swarmTab = nextTab;
+      state.swarmLastRenderFp = "";
+      renderSwarmDrawer({ force: true });
+    });
+    $("swarm-drawer-body")?.addEventListener("click", (e) => {
+      const beeTile = e.target.closest("[data-swarm-member]");
+      if (beeTile) {
+        haptic("light");
+        const nextName = beeTile.dataset.swarmMember || "";
+        state.swarmSelectedMember = state.swarmSelectedMember === nextName ? "" : nextName;
+        state.swarmLastRenderFp = "";
+        renderSwarmDrawer({ force: true });
+        return;
+      }
+      if (e.target.closest("#btn-swarm-board-sort")) {
+        haptic("light");
+        state.swarmBoardNewestFirst = !state.swarmBoardNewestFirst;
+        state.swarmLastRenderFp = "";
+        renderSwarmDrawer({ force: true });
+        return;
+      }
+      if (e.target.closest("#btn-swarm-enable-composer")) {
+        if (!state.swarmMode) {
+          $("btn-swarm")?.click();
+        }
+        closeSwarmDrawer();
+        $("prompt-input")?.focus();
+      }
+    });
+    $("swarm-drawer-body")?.addEventListener(
+      "toggle",
+      (e) => {
+        const det = e.target;
+        if (!det || det.tagName !== "DETAILS" || !det.dataset || !det.dataset.skey) return;
+        const key = det.dataset.skey;
+        if (det.open) {
+          state.swarmExpandedKeys.add(key);
+          state.swarmExpandedKeys.delete(`!${key}`);
+        } else {
+          state.swarmExpandedKeys.delete(key);
+          state.swarmExpandedKeys.add(`!${key}`);
+        }
+      },
+      true
+    );
+
+    // --- Bidirectional Horizontal Touch Swipe Gestures (Left Drawer <-> Right Swarm Drawer) ---
+    let swipeState = null;
+    const SWIPE_GUARD_SELECTOR =
+      ".code-block pre, .md-table-wrap, .photo-strip, .usage-daily-chart, .m3-segmented, .composer-tools-left, .attach-tray, .swarm-team-strip, input, textarea, select, [contenteditable]";
+    const isAnyBlockingOverlayOpen = () => {
+      if (!$("welcome-view")?.classList.contains("hidden")) return true;
+      if (!$("pair-confirm-dialog")?.classList.contains("hidden")) return true;
+      for (const id of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
+        if (!$(id)?.classList.contains("hidden")) return true;
+      }
+      if (
+        !$("model-sheet")?.classList.contains("hidden") ||
+        !$("host-sheet")?.classList.contains("hidden") ||
+        !$("attach-sheet")?.classList.contains("hidden")
+      ) {
+        return true;
+      }
+      if (state.turnNavOpen || state.ctxPopoverOpen) return true;
+      return false;
+    };
+    document.addEventListener(
+      "touchstart",
+      (e) => {
+        if (!e.touches || e.touches.length !== 1) {
+          swipeState = null;
+          return;
+        }
+        if (isAnyBlockingOverlayOpen()) {
+          swipeState = null;
+          return;
+        }
+        const target = e.target;
+        if (target && target.closest && target.closest(SWIPE_GUARD_SELECTOR)) {
+          swipeState = null;
+          return;
+        }
+        const t0 = e.touches[0];
+        swipeState = {
+          startX: t0.clientX,
+          startY: t0.clientY,
+          lastX: t0.clientX,
+          lastY: t0.clientY,
+          startedAt: Date.now(),
+        };
+      },
+      { passive: true }
+    );
+    document.addEventListener(
+      "touchmove",
+      (e) => {
+        if (!swipeState) return;
+        if (!e.touches || e.touches.length !== 1) {
+          swipeState = null;
+          return;
+        }
+        swipeState.lastX = e.touches[0].clientX;
+        swipeState.lastY = e.touches[0].clientY;
+      },
+      { passive: true }
+    );
+    document.addEventListener(
+      "touchend",
+      (e) => {
+        if (!swipeState) return;
+        const st = swipeState;
+        swipeState = null;
+        if (isAnyBlockingOverlayOpen()) return;
+        const endTouch = e.changedTouches && e.changedTouches[0];
+        const endX = endTouch ? endTouch.clientX : st.lastX;
+        const endY = endTouch ? endTouch.clientY : st.lastY;
+        const dx = endX - st.startX;
+        const dy = endY - st.startY;
+        if (Math.abs(dx) <= 48 || Math.abs(dx) <= Math.abs(dy) * 1.65) return;
+
+        const leftDrawerOpen = Boolean($("drawer")?.classList.contains("open"));
+        if (dx > 48) {
+          // Swipe Left -> Right
+          if (state.swarmDrawerOpen) {
+            closeSwarmDrawer();
+          } else if (!leftDrawerOpen) {
+            openDrawer();
+          }
+        } else if (dx < -48) {
+          // Swipe Right -> Left
+          if (leftDrawerOpen) {
+            closeDrawer();
+          } else if (!state.swarmDrawerOpen) {
+            openSwarmDrawer();
+          }
+        }
+      },
+      { passive: true }
+    );
+    document.addEventListener(
+      "touchcancel",
+      () => {
+        swipeState = null;
+      },
+      { passive: true }
+    );
 
     $("btn-attach").addEventListener("click", openAttachSheet);
     $("btn-attach-album")?.addEventListener("click", () => {
@@ -4835,15 +7001,108 @@
       updateSendButton();
     });
     inp.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (window.innerWidth > 768 || Boolean(SIDECAR))) {
+      if (e.key !== "Enter" || e.isComposing) return;
+      const isDesktopOrSidecar = window.innerWidth > 768 || Boolean(SIDECAR);
+      const hasContent = Boolean((inp.value || "").trim() || state.attachments.length);
+      if (state.streaming && hasContent) {
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          sendPromptWithMode("interrupt");
+          return;
+        }
+        if (!e.shiftKey && isDesktopOrSidecar) {
+          e.preventDefault();
+          sendPromptWithMode("queue");
+          return;
+        }
+      } else if (!state.streaming && !e.shiftKey && isDesktopOrSidecar) {
         e.preventDefault();
         handleSendOrStop();
       }
     });
     $("btn-send").addEventListener("click", handleSendOrStop);
+    $("btn-cutin")?.addEventListener("click", () => sendPromptWithMode("interrupt"));
+    $("btn-queue-send")?.addEventListener("click", () => sendPromptWithMode("queue"));
 
-    // --- Message Actions (Copy code, Copy reply, Preview file:///) ---
+    // --- Prompt Queue Tray Events (Cut-in / Inline Edit / Delete / Resume) ---
+    $("queue-tray")?.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-qact]");
+      if (!btn) return;
+      const act = btn.dataset.qact;
+      const qid = btn.dataset.qid || "";
+      if (act === "cutin") {
+        interruptQueueItem(qid);
+      } else if (act === "edit") {
+        startQueueInlineEdit(qid);
+      } else if (act === "delete") {
+        deleteQueueItem(qid);
+      } else if (act === "save-edit") {
+        saveQueueInlineEdit(qid);
+      } else if (act === "cancel-edit") {
+        cancelQueueInlineEdit();
+      } else if (act === "resume") {
+        resumeQueue();
+      }
+    });
+    $("queue-tray")?.addEventListener("input", (e) => {
+      const ta = e.target.closest(".queue-edit-input");
+      if (ta) {
+        state.editingQueueDraft = ta.value;
+      }
+    });
+    $("queue-tray")?.addEventListener("keydown", (e) => {
+      const ta = e.target.closest(".queue-edit-input");
+      if (!ta) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        cancelQueueInlineEdit();
+      } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
+        e.preventDefault();
+        saveQueueInlineEdit(ta.dataset.qid || state.editingQueueItemId);
+      }
+    });
+
+    // --- Context Window Ring Pill & Popover Events ---
+    $("btn-ctx-window")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleContextPopover();
+    });
+    $("ctx-window-backdrop")?.addEventListener("click", closeContextPopover);
+    $("ctx-window-panel")?.addEventListener("click", (e) => {
+      const bdBtn = e.target.closest("#btn-ctx-breakdown");
+      if (bdBtn) {
+        e.stopPropagation();
+        haptic("light");
+        state.ctxBreakdownOpen = !state.ctxBreakdownOpen;
+        bdBtn.classList.toggle("open", state.ctxBreakdownOpen);
+        bdBtn.setAttribute("aria-expanded", state.ctxBreakdownOpen ? "true" : "false");
+        $("ctx-breakdown-wrap")?.classList.toggle("hidden", !state.ctxBreakdownOpen);
+      }
+    });
+    document.addEventListener("click", (e) => {
+      if (!state.ctxPopoverOpen) return;
+      const tEl = e.target;
+      if (tEl && tEl.closest && (tEl.closest("#ctx-window-panel") || tEl.closest("#btn-ctx-window"))) {
+        return;
+      }
+      closeContextPopover();
+    });
+    document.addEventListener("gesturestart", (e) => {
+      const tEl = e.target;
+      if (!tEl || !tEl.closest || !tEl.closest("#preview-body.preview-img-stage")) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+    // --- Message Actions (Copy code, Copy reply, Preview file:///, Open Swarm) ---
     $("messages-list").addEventListener("click", (e) => {
+      const swarmStrip = e.target.closest(".swarm-live-strip[data-open-swarm]");
+      if (swarmStrip) {
+        openSwarmDrawer();
+        return;
+      }
+
       const cpCode = e.target.closest(".code-copy-btn");
       if (cpCode) {
         bridgeCopyText(decodeURIComponent(cpCode.dataset.copy || ""));
@@ -4972,6 +7231,8 @@
     }
     function openPairModal() {
       closeTurnNavigator();
+      closeContextPopover();
+      closeSwarmDrawer();
       closeDrawer();
       const modal = $("pair-modal");
       const iframe = $("pair-iframe");
@@ -5015,13 +7276,32 @@
         for (const mid of ["preview-modal", "pair-modal", "usage-modal", "files-modal", "qqbot-modal", "settings-modal"]) {
           const el = $(mid);
           if (el && !el.classList.contains("hidden")) {
-            el.classList.add("hidden");
+            if (mid === "preview-modal") {
+              closePreviewModal();
+            } else {
+              el.classList.add("hidden");
+            }
             e.preventDefault();
             return;
           }
         }
+        if (state.ctxPopoverOpen) {
+          closeContextPopover();
+          e.preventDefault();
+          return;
+        }
         if (state.turnNavOpen) {
           closeTurnNavigator();
+          e.preventDefault();
+          return;
+        }
+        if (state.swarmDrawerOpen) {
+          closeSwarmDrawer();
+          e.preventDefault();
+          return;
+        }
+        if (state.editingQueueItemId) {
+          cancelQueueInlineEdit();
           e.preventDefault();
           return;
         }
@@ -5147,6 +7427,10 @@
     // --- Full-Screen Views Controls ---
     document.querySelectorAll(".close-modal").forEach((b) => {
       b.addEventListener("click", () => {
+        if (b.dataset.target === "preview-modal") {
+          closePreviewModal();
+          return;
+        }
         const target = $(b.dataset.target);
         if (target) target.classList.add("hidden");
       });

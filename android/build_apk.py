@@ -27,7 +27,7 @@ MANIFEST_PATH = MAIN_DIR / "AndroidManifest.xml"
 WWW_SRC_DIR = PROJECT_DIR / "www"
 BUILD_DIR = ANDROID_DIR / "build"
 DIST_DIR = PROJECT_DIR / "dist"
-OUTPUT_APK = DIST_DIR / "Antigravity-Mobile-Universal-v1.6.apk"
+OUTPUT_APK = DIST_DIR / "Antigravity-Mobile-Universal-v1.7.apk"
 
 KEYSTORE_PATH = Path(os.environ.get("AGY_KEYSTORE_PATH", str(ANDROID_DIR / "antigravity_mobile.jks")))
 KEY_ALIAS = os.environ.get("AGY_KEY_ALIAS", "antigravity_mobile")
@@ -39,8 +39,8 @@ ZXING_JAR = Path(os.environ.get("ZXING_CORE_JAR", str(ANDROID_DIR / "libs" / "zx
 
 MIN_SDK = "26"
 TARGET_SDK = "34"
-VERSION_CODE = "10"
-VERSION_NAME = "1.6.2"
+VERSION_CODE = "11"
+VERSION_NAME = "1.7.0"
 
 
 def _version_tuple(name: str) -> tuple[int, ...]:
