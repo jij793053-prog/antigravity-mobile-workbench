@@ -97,6 +97,23 @@ function safeTokenEqual(provided, expected) {
   return crypto.timingSafeEqual(hProvided, hExpected);
 }
 
+const ELECTRON_HOST_SCHEMES = new Set([
+  'vscode-file:',
+  'vscode-webview:',
+  'app:',
+  'file:',
+  'antigravity:',
+]);
+
+function normalizeRawUrl(rawUrl) {
+  const s = String(rawUrl || '/');
+  const qIdx = s.indexOf('?');
+  if (qIdx === -1) return s;
+  const head = s.slice(0, qIdx + 1);
+  const tail = s.slice(qIdx + 1).replace(/\?/g, '&');
+  return head + tail;
+}
+
 function isLoopbackOrigin(originHeader) {
   if (!originHeader) return true;
   const trimmed = String(originHeader).trim();
@@ -111,6 +128,30 @@ function isLoopbackOrigin(originHeader) {
   } catch {
     return false;
   }
+}
+
+function isAllowedOrigin(originHeader, hasValidToken) {
+  if (isLoopbackOrigin(originHeader)) return true;
+  if (!hasValidToken) return false;
+  const trimmed = String(originHeader || '').trim();
+  if (trimmed.toLowerCase() === 'null') return true;
+  try {
+    const parsed = new URL(trimmed);
+    return ELECTRON_HOST_SCHEMES.has(parsed.protocol.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function logReject(statusCode, method, pathname, reason, req, urlObj) {
+  const origin = req.headers.origin || '-';
+  const sfs = req.headers['sec-fetch-site'] || '-';
+  const sfd = req.headers['sec-fetch-dest'] || '-';
+  const hasHdrTok = Boolean(req.headers['x-sidecar-token']);
+  const hasQryTok = Boolean(urlObj && (urlObj.searchParams.get('token') || urlObj.searchParams.get('sidecar_token')));
+  console.error(
+    `[antigravity-sync] reject ${statusCode} ${method} ${pathname} reason=${reason} origin=${origin} sfs=${sfs} sfd=${sfd} hdrTok=${hasHdrTok} qryTok=${hasQryTok}`
+  );
 }
 
 function hasUnsafePath(rawUrl, pathname) {
@@ -618,7 +659,7 @@ function checkRequestAuth(req, urlObj, pathname) {
     return safeTokenEqual(headerToken, SIDECAR_TOKEN);
   }
 
-  if (pathname === '/' || pathname === '/index.html') {
+  if (pathname === '/' || pathname === '/index.html' || pathname === '/sidebar') {
     return safeTokenEqual(headerToken, SIDECAR_TOKEN)
       || safeTokenEqual(queryToken, SIDECAR_TOKEN)
       || safeTokenEqual(querySidecarToken, SIDECAR_TOKEN);
@@ -632,49 +673,50 @@ function checkRequestAuth(req, urlObj, pathname) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') {
+      logReject(403, req.method, req.url || '/', 'options_blocked', req, null);
       sendText(res, 403, 'Forbidden');
       return;
     }
 
     let urlObj;
+    const rawUrl = normalizeRawUrl(req.url || '/');
     try {
-      urlObj = new URL(req.url || '/', `http://${BIND_HOST}`);
+      urlObj = new URL(rawUrl, `http://${BIND_HOST}`);
     } catch {
       sendText(res, 400, 'Bad Request');
       return;
     }
 
     const pathname = urlObj.pathname || '/';
-    if (hasUnsafePath(req.url, pathname)) {
+    if (hasUnsafePath(rawUrl, pathname)) {
+      logReject(400, req.method, pathname, 'unsafe_path', req, urlObj);
       sendText(res, 400, 'Bad Path');
       return;
     }
 
+    const isSafeStatic = (req.method === 'GET' || req.method === 'HEAD') && SAFE_STATIC_PATHS.has(pathname);
+    const authPassed = checkRequestAuth(req, urlObj, pathname);
+    const hasExplicitToken = Boolean(SIDECAR_TOKEN) && !isSafeStatic && authPassed;
+
     const origin = req.headers.origin;
-    if (!isLoopbackOrigin(origin)) {
+    if (!isAllowedOrigin(origin, hasExplicitToken)) {
+      logReject(403, req.method, pathname, 'forbidden_origin', req, urlObj);
       sendText(res, 403, 'Forbidden Origin');
       return;
     }
 
     const secFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
-    const secFetchDest = String(req.headers['sec-fetch-dest'] || '').trim().toLowerCase();
     if (secFetchSite === 'cross-site') {
-      // Allow Antigravity host Electron renderer to embed the root sidecar iframe ONLY when
-      // a valid SIDECAR_TOKEN secret is presented on GET / (or /index.html).
-      const isAuthorizedHostIframe =
-        (req.method === 'GET' || req.method === 'HEAD')
-        && (pathname === '/' || pathname === '/index.html')
-        && secFetchDest === 'iframe'
-        && Boolean(SIDECAR_TOKEN)
-        && safeTokenEqual(urlObj.searchParams.get('token') || '', SIDECAR_TOKEN);
-
-      if (!isAuthorizedHostIframe) {
+      const allowCrossSite = isSafeStatic || hasExplicitToken;
+      if (!allowCrossSite) {
+        logReject(403, req.method, pathname, 'cross_site_unauthenticated', req, urlObj);
         sendText(res, 403, 'Forbidden Cross-Site Request');
         return;
       }
     }
 
-    if (!checkRequestAuth(req, urlObj, pathname)) {
+    if (!authPassed) {
+      logReject(401, req.method, pathname, 'unauthorized', req, urlObj);
       if (pathname.startsWith('/api/') || pathname.startsWith('/__sidecar/')) {
         sendJson(res, 401, { ok: false, error: 'Unauthorized: invalid or missing sidecar token' });
       } else {
@@ -724,8 +766,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Root Workbench HTML with preload + sidecar-bridge injection and offline fallback
-    if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/' || pathname === '/index.html')) {
+    // Root Workbench HTML (aux pane / and sidebar /sidebar) with preload + sidecar-bridge injection and offline fallback
+    if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/' || pathname === '/index.html' || pathname === '/sidebar')) {
       proxyHtmlWithInjection(req, res, '/', {
         scriptsMarkup: '<script src="/preload.js"></script>\n  <script src="/sidecar-bridge.js"></script>',
         fallbackOffline: true,
@@ -782,37 +824,45 @@ server.on('upgrade', (req, socket, head) => {
   socket.on('error', () => {});
 
   let urlObj;
+  const rawUrl = normalizeRawUrl(req.url || '/');
   try {
-    urlObj = new URL(req.url || '/', `http://${BIND_HOST}`);
+    urlObj = new URL(rawUrl, `http://${BIND_HOST}`);
   } catch {
     writeRawUpgradeError(socket, 400, 'Bad Request');
     return;
   }
 
   const pathname = urlObj.pathname || '/';
-  if (pathname !== '/ws' || hasUnsafePath(req.url, pathname)) {
+  if (pathname !== '/ws' || hasUnsafePath(rawUrl, pathname)) {
+    logReject(404, 'UPGRADE', pathname, 'bad_ws_path', req, urlObj);
     writeRawUpgradeError(socket, 404, 'Not Found');
     return;
   }
 
+  const headerToken = String(req.headers['x-sidecar-token'] || '').trim();
+  const querySidecarToken = urlObj.searchParams.get('sidecar_token') || '';
+  const wsAuthPassed = !SIDECAR_TOKEN
+    || safeTokenEqual(headerToken, SIDECAR_TOKEN)
+    || safeTokenEqual(querySidecarToken, SIDECAR_TOKEN);
+  const hasExplicitWsToken = Boolean(SIDECAR_TOKEN) && wsAuthPassed;
+
+  if (!isAllowedOrigin(req.headers.origin, hasExplicitWsToken)) {
+    logReject(403, 'UPGRADE', pathname, 'ws_forbidden_origin', req, urlObj);
+    writeRawUpgradeError(socket, 403, 'Forbidden');
+    return;
+  }
+
   const secFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
-  if (secFetchSite === 'cross-site') {
+  if (secFetchSite === 'cross-site' && !hasExplicitWsToken) {
+    logReject(403, 'UPGRADE', pathname, 'ws_cross_site_unauth', req, urlObj);
     writeRawUpgradeError(socket, 403, 'Forbidden');
     return;
   }
 
-  if (!isLoopbackOrigin(req.headers.origin)) {
-    writeRawUpgradeError(socket, 403, 'Forbidden');
+  if (!wsAuthPassed) {
+    logReject(401, 'UPGRADE', pathname, 'ws_unauthorized', req, urlObj);
+    writeRawUpgradeError(socket, 401, 'Unauthorized');
     return;
-  }
-
-  if (SIDECAR_TOKEN) {
-    const headerToken = String(req.headers['x-sidecar-token'] || '').trim();
-    const querySidecarToken = urlObj.searchParams.get('sidecar_token') || '';
-    if (!safeTokenEqual(headerToken, SIDECAR_TOKEN) && !safeTokenEqual(querySidecarToken, SIDECAR_TOKEN)) {
-      writeRawUpgradeError(socket, 401, 'Unauthorized');
-      return;
-    }
   }
 
   const upstreamPath = buildUpstreamPath(urlObj, false);

@@ -18,7 +18,7 @@
       },
       {
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_SIDEBAR",
-        "path": "/?view=sidebar",
+        "path": "/sidebar",
         "title": "Mobile Sync"
       }
     ]

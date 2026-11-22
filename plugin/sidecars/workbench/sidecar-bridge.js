@@ -1,44 +1,46 @@
 (() => {
   'use strict';
 
-  const params = new URLSearchParams(window.location.search || '');
-  const token = params.get('token') || params.get('sidecar_token') || '';
+  const normalizedSearch = String(window.location.search || '').replace(/^\?/, '').replace(/\?/g, '&');
+  const params = new URLSearchParams(normalizedSearch);
+  const SESSION_TOK_KEY = '__agy_sidecar_tok_v1';
+  let token = params.get('token') || params.get('sidecar_token') || '';
+  if (token) {
+    try { window.sessionStorage.setItem(SESSION_TOK_KEY, token); } catch (_) {}
+  } else {
+    try { token = window.sessionStorage.getItem(SESSION_TOK_KEY) || ''; } catch (_) {}
+  }
   const initialConvId = params.get('conversationId')
     || params.get('conversation_id')
     || (window.sidecar && typeof window.sidecar.conversationId === 'string' ? window.sidecar.conversationId : '')
     || '';
-  const rawView = params.get('view')
+  const rawView = (window.location.pathname === '/sidebar' ? 'sidebar' : '')
+    || params.get('view')
     || (window.sidecar && typeof window.sidecar.view === 'string' ? window.sidecar.view : '')
     || '';
   const view = rawView === 'sidebar' ? 'sidebar' : 'auxpane';
 
-  // Strip ?token=... from address bar while preserving conversationId, view, and hash.
-  // Keep sidecar_token only on /pair so its internal reload timer keeps auth inside the iframe.
-  try {
-    const cleanUrl = new URL(window.location.href);
-    let dirty = false;
-    if (cleanUrl.searchParams.has('token')) {
-      cleanUrl.searchParams.delete('token');
-      dirty = true;
+  function currentBaseOrigin() {
+    if (window.location.origin && window.location.origin !== 'null') {
+      return window.location.origin;
     }
-    if (cleanUrl.pathname !== '/pair' && cleanUrl.searchParams.has('sidecar_token')) {
-      cleanUrl.searchParams.delete('sidecar_token');
-      dirty = true;
+    if (window.location.protocol && window.location.host) {
+      return `${window.location.protocol}//${window.location.host}`;
     }
-    if (dirty && window.history && typeof window.history.replaceState === 'function') {
-      window.history.replaceState(null, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
-    }
-  } catch (_) {}
+    return '';
+  }
 
   function isSameOriginHttp(urlObj) {
-    return (urlObj.protocol === 'http:' || urlObj.protocol === 'https:')
-      && urlObj.origin === window.location.origin;
+    if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') return false;
+    const base = currentBaseOrigin();
+    if (base && urlObj.origin === base) return true;
+    return Boolean(window.location.host && urlObj.host === window.location.host);
   }
 
   function isSameOriginWs(urlObj) {
     const expectedProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return (urlObj.protocol === expectedProto || urlObj.protocol === 'ws:' || urlObj.protocol === 'wss:')
-      && urlObj.host === window.location.host;
+      && Boolean(window.location.host && urlObj.host === window.location.host);
   }
 
   function withToken(urlStr) {

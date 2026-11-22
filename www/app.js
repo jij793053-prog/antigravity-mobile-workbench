@@ -3667,7 +3667,10 @@
       if (!resp.ok) return false;
       const data = await resp.json();
       if (!data || !data.ok || !data.token) return false;
-      const localUrl = normalizeServerUrl(location.origin);
+      const rawOrigin = (location.origin && location.origin !== "null")
+        ? location.origin
+        : `${location.protocol}//${location.host}`;
+      const localUrl = normalizeServerUrl(rawOrigin);
       const localName = data.hostname ? `${data.hostname}（本机）` : "本机工作台";
       if (data.default_model && !state.hosts.length) {
         state.selectedModel = String(data.default_model);

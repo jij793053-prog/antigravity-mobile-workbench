@@ -1,10 +1,11 @@
 (() => {
   'use strict';
 
-  const params = new URLSearchParams(window.location.search || '');
+  const normalizedSearch = String(window.location.search || '').replace(/^\?/, '').replace(/\?/g, '&');
+  const params = new URLSearchParams(normalizedSearch);
   const initialToken = params.get('token') || params.get('sidecar_token') || '';
   let currentConversationId = params.get('conversationId') || params.get('conversation_id') || '';
-  const initialView = params.get('view') === 'sidebar' ? 'sidebar' : 'auxpane';
+  const initialView = (window.location.pathname === '/sidebar' || params.get('view') === 'sidebar') ? 'sidebar' : 'auxpane';
   let currentTheme = '';
   let applyingHostVars = false;
 
