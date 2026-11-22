@@ -776,13 +776,19 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Local /pair iframe page with bridge injection and strict SAMEORIGIN framing preserved
+    // Local /pair iframe page with bridge injection.
+    // Inside Antigravity Electron, #pair-iframe is a nested iframe whose top-level ancestor is the
+    // Antigravity host app (not 127.0.0.1:<sidecarPort>). Chromium enforces X-Frame-Options: SAMEORIGIN
+    // and CSP frame-ancestors 'self' across the ENTIRE ancestor chain, which would black-screen #pair-iframe.
+    // Because SIDECAR_TOKEN has already been verified above (constant-time), stripping frame-blocking
+    // headers ONLY when SIDECAR_TOKEN is active keeps external unauthenticated sites blocked (401) while
+    // allowing Antigravity's authenticated side pane to render the QR pairing sheet cleanly.
     if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/pair') {
       const upstreamPath = buildUpstreamPath(urlObj, false);
       proxyHtmlWithInjection(req, res, upstreamPath, {
         scriptsMarkup: '<script src="/sidecar-bridge.js"></script>',
         fallbackOffline: false,
-        preserveFrameHeaders: true,
+        preserveFrameHeaders: !SIDECAR_TOKEN,
         transformHtml: (html) =>
           html.replace(
             "location.replace('/pair?ip=tunnel')",
