@@ -342,11 +342,57 @@ button {
 /* M3 Segmented Button */
 .m3-segmented {
   display: flex;
+  flex-shrink: 0;
   width: 100%;
   border-radius: 20px;
   border: 1px solid var(--md-outline-variant);
   background: var(--md-bg);
   overflow: hidden;
+}
+
+.usage-tabs-bar {
+  flex-shrink: 0;
+  padding: 10px 14px 8px;
+  background: var(--md-bg);
+  border-bottom: 1px solid var(--md-outline-variant);
+  z-index: 4;
+}
+.usage-tabs-bar .m3-segmented {
+  max-width: 720px;
+  margin: 0 auto;
+}
+.usage-plan-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.usage-quota-subbars {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 6px;
+}
+.usage-quota-mini-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--md-text-secondary);
+  margin-bottom: 4px;
+}
+.ci-badge.qqdm {
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+}
+:root[data-theme="light"] .ci-badge.qqdm {
+  background: rgba(5, 150, 105, 0.12);
+  color: #047857;
 }
 .m3-segmented .seg-btn {
   flex: 1;

@@ -40,7 +40,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.4"
+APP_VERSION = "1.6.5"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -986,18 +986,67 @@ def _build_cli_env() -> dict[str, str]:
     return env
 
 
+_LOCAL_BRIDGE_CACHE_LOCK = threading.Lock()
+_LOCAL_BRIDGE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _fetch_local_bridge_status(force: bool = False) -> dict[str, Any] | None:
+    """Optional loopback query to a local bridge status API (127.0.0.1:8788/api/status), cached for 5s."""
+    now = time.time()
+    if not force:
+        with _LOCAL_BRIDGE_CACHE_LOCK:
+            if (now - float(_LOCAL_BRIDGE_CACHE.get("ts") or 0.0)) < 5.0:
+                cached = _LOCAL_BRIDGE_CACHE.get("data")
+                return dict(cached) if isinstance(cached, dict) else None
+    result: dict[str, Any] | None = None
+    try:
+        with _DIRECT_OPENER.open("http://127.0.0.1:8788/api/status", timeout=0.6) as r:
+            if getattr(r, "status", 200) == 200:
+                data = json.loads(r.read(524288).decode("utf-8", errors="replace"))
+                if isinstance(data, dict) and any(
+                    k in data for k in ("bridge_online", "gateway_online", "active_model", "quotas", "ai_usage", "dm_cascade_ids")
+                ):
+                    result = data
+    except Exception:
+        result = None
+    with _LOCAL_BRIDGE_CACHE_LOCK:
+        _LOCAL_BRIDGE_CACHE["ts"] = now
+        _LOCAL_BRIDGE_CACHE["data"] = result
+    return dict(result) if isinstance(result, dict) else None
+
+
 def check_qqbot_available() -> bool:
     """Verify actual HTTP JSON status response from local optional QQ Bot API (127.0.0.1:8788)."""
-    try:
-        with _DIRECT_OPENER.open("http://127.0.0.1:8788/api/status", timeout=0.4) as r:
-            if getattr(r, "status", 200) != 200:
-                return False
-            data = json.loads(r.read(65536).decode("utf-8", errors="replace"))
-            if not isinstance(data, dict):
-                return False
-            return any(k in data for k in ("bridge_online", "gateway_online", "active_model", "group_chat_model", "quotas", "ai_usage"))
-    except Exception:
-        return False
+    return _fetch_local_bridge_status() is not None
+
+
+def get_qq_dm_cids() -> set[str]:
+    """Return private-chat (DM only, never group-chat) cascade IDs synced from optional local bridge + local config."""
+    cfg = load_or_create_config()
+    saved_list = [str(x).strip() for x in (cfg.get("qq_dm_conv_ids") or []) if _is_valid_cid(str(x).strip())]
+    out_set = set(saved_list)
+    st = _fetch_local_bridge_status()
+    if isinstance(st, dict):
+        live_dms = st.get("dm_cascade_ids")
+        if isinstance(live_dms, list):
+            changed = False
+            for raw in live_dms:
+                cid = str(raw or "").strip()
+                if cid and _is_valid_cid(cid) and cid not in out_set:
+                    out_set.add(cid)
+                    saved_list.insert(0, cid)
+                    changed = True
+            if changed:
+                def _merge_dm(cfg_fresh: dict[str, Any]) -> None:
+                    cur = [str(x).strip() for x in (cfg_fresh.get("qq_dm_conv_ids") or []) if _is_valid_cid(str(x).strip())]
+                    cur_set = set(cur)
+                    for cid in reversed(saved_list):
+                        if cid not in cur_set:
+                            cur.insert(0, cid)
+                            cur_set.add(cid)
+                    cfg_fresh["qq_dm_conv_ids"] = cur[:200]
+                _update_config(_merge_dm)
+    return out_set
 
 
 _VIRTUAL_NIC_KEYWORDS = (
@@ -2025,6 +2074,8 @@ def list_all_conversations(
     aliases = cfg.get("desktop_to_cli_alias") or {}
     aliased_cli_set = {str(v).strip() for v in aliases.values() if str(v).strip()}
     mobile_own = get_mobile_own_cids()
+    qq_dm_cids = get_qq_dm_cids()
+    all_mobile_cids = mobile_own | qq_dm_cids
 
     seen: set[str] = set()
     now_ts = time.time()
@@ -2087,10 +2138,10 @@ def list_all_conversations(
                 if c_item.get("status") == "running" or aliased_cli in active_ids or d_item["id"] in active_ids:
                     d_item["status"] = "running"
 
-    # 2. Include standalone chats created explicitly by Antigravity Mobile / Workbench
+    # 2. Include standalone chats created by Antigravity Mobile / Workbench AND optional QQ Bot private chats (DM only, never group chats)
     own_mobile_items: list[dict[str, Any]] = []
     if source_filter in ("all", "mobile"):
-        for m_cid in mobile_own:
+        for m_cid in all_mobile_cids:
             if not m_cid or m_cid in seen or m_cid in aliased_cli_set or not _is_valid_cid(m_cid):
                 continue
             m_tf = CLI_BRAIN / m_cid / ".system_generated" / "logs" / "transcript.jsonl"
@@ -2103,15 +2154,17 @@ def list_all_conversations(
                     continue
                 tr = bool(meta.pop("_tailRunning", False))
                 meta["status"] = "running" if (m_cid in active_ids or (tr and now_ts - st.st_mtime < 180.0)) else "idle"
+                if m_cid in qq_dm_cids and m_cid not in mobile_own:
+                    meta["subSource"] = "qq_dm"
                 own_mobile_items.append(meta)
                 seen.add(m_cid)
             except OSError:
                 continue
 
-    # 3. Optional External CLI / QQ Bot standalone sessions (ONLY when explicitly enabled)
+    # 3. Optional External CLI / QQ Bot group standalone sessions (ONLY when explicitly enabled)
     external_items: list[dict[str, Any]] = []
     if include_external_cli and source_filter in ("all", "external"):
-        exclude_ext = seen | mobile_own | aliased_cli_set | {str(k).strip() for k in aliases.keys() if str(k).strip()}
+        exclude_ext = seen | all_mobile_cids | aliased_cli_set | {str(k).strip() for k in aliases.keys() if str(k).strip()}
         external_items = _scan_source_conversations(CLI_BRAIN, "external", limit, active_ids, exclude_ext)
 
     if source_filter == "desktop":
@@ -3433,6 +3486,95 @@ async def handle_qqbot_switch(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
+_USD_TO_CNY = 7.25
+
+# Antigravity-only equivalent API pricing & estimated 5h-window quota weight (ported from AI Usage logic).
+# Strictly excludes third-party APIs such as DeepSeek / AI Studio.
+_AGY_MODEL_PRICING: dict[str, tuple[float, float, float]] = {
+    # model_id -> (input_usd_per_1m, output_usd_per_1m, quota_pct_per_10k_net_tokens)
+    "gemini-4-neon-xhigh": (1.50, 6.00, 0.16),
+    "gemini-4-neon-high": (1.00, 4.00, 0.12),
+    "gemini-4-neon-medium": (0.60, 2.40, 0.09),
+    "gemini-4-neon-low": (0.35, 1.40, 0.06),
+    "gemini-4-neon-thinking": (1.00, 4.00, 0.12),
+    "gemini-4-neon": (0.60, 2.40, 0.09),
+    "gemini-pro-orchestrator-neon": (1.50, 6.00, 0.16),
+    "gemini-pro-orchestrator-argon": (2.00, 8.00, 0.18),
+    "gemini-pro-orchestrator": (2.00, 8.00, 0.20),
+    "gemini-4-hydrogen-xhigh": (1.50, 6.00, 0.16),
+    "gemini-4-hydrogen-high": (1.00, 4.00, 0.12),
+    "gemini-4-hydrogen-medium": (0.60, 2.40, 0.09),
+    "gemini-4-hydrogen-low": (0.35, 1.40, 0.06),
+    "gemini-4-hydrogen-thinking": (1.00, 4.00, 0.12),
+    "gemini-4-hydrogen": (0.60, 2.40, 0.09),
+    "gemini-4-carbon-high": (2.50, 10.00, 0.24),
+    "gemini-4-carbon-medium": (2.00, 8.00, 0.20),
+    "gemini-4-carbon-low": (1.25, 5.00, 0.14),
+    "gemini-4-carbon-thinking": (2.50, 10.00, 0.24),
+    "gemini-4-carbon": (2.00, 8.00, 0.20),
+    "gemini-4-argon-high": (2.50, 10.00, 0.22),
+    "gemini-4-argon-medium": (2.00, 8.00, 0.18),
+    "gemini-4-argon-low": (1.25, 5.00, 0.13),
+    "gemini-4-argon-thinking": (2.50, 10.00, 0.22),
+    "gemini-4-argon": (2.00, 8.00, 0.20),
+    "gemini-3.8-flash-high": (0.30, 1.20, 0.06),
+    "gemini-3.8-flash-medium": (0.20, 0.80, 0.06),
+    "gemini-3.8-flash-low": (0.15, 0.60, 0.05),
+    "gemini-3.8-flash-thinking": (0.30, 1.20, 0.06),
+    "gemini-3.8-flash": (0.15, 0.60, 0.06),
+    "claude-opus-5-5-thinking": (15.00, 75.00, 0.45),
+    "claude-opus-5-5": (15.00, 75.00, 0.45),
+    "claude-sonnet-5-5-thinking": (3.00, 15.00, 0.25),
+    "claude-sonnet-5-5": (3.00, 15.00, 0.25),
+    "gpt-oss-120b-medium": (0.40, 1.60, 0.06),
+}
+
+
+def _is_antigravity_usage_model(model_id: str) -> bool:
+    """Include ONLY Antigravity platform models (exclude third-party DeepSeek / AI Studio APIs)."""
+    m = str(model_id or "").strip().lower()
+    if not m:
+        return False
+    if m.startswith(("deepseek", "aistudio", "openai/", "qwen", "doubao", "glm")):
+        return False
+    return True
+
+
+def _lookup_agy_pricing(model_id: str) -> tuple[float, float, float]:
+    m = str(model_id or "").strip().lower()
+    if m in _AGY_MODEL_PRICING:
+        return _AGY_MODEL_PRICING[m]
+    if "opus" in m:
+        return (15.00, 75.00, 0.45)
+    if "sonnet" in m or "claude" in m:
+        return (3.00, 15.00, 0.25)
+    if "carbon" in m:
+        return (2.00, 8.00, 0.20)
+    if "argon" in m:
+        return (2.00, 8.00, 0.18)
+    if "flash" in m:
+        return (0.15, 0.60, 0.06)
+    if "neon" in m or "hydrogen" in m or "orchestrator" in m:
+        if "xhigh" in m:
+            return (1.50, 6.00, 0.16)
+        if "high" in m:
+            return (1.00, 4.00, 0.12)
+        if "low" in m:
+            return (0.35, 1.40, 0.06)
+        return (0.60, 2.40, 0.09)
+    return (0.60, 2.40, 0.09)
+
+
+def _calc_step_cost_and_quota(model_id: str, in_t: int, ca_t: int, out_t: int) -> tuple[float, float]:
+    in_p, out_p, q_per_10k = _lookup_agy_pricing(model_id)
+    # Prompt cache reads billed at 10% of base input token rate
+    cost_usd = (in_t * in_p + ca_t * (in_p * 0.10) + out_t * out_p) / 1_000_000.0
+    # Quota weight uses net (uncached input + output) + 5% weight for cached context
+    eff_toks = in_t + out_t + (ca_t * 0.05)
+    quota_pct = (eff_toks / 10_000.0) * q_per_10k
+    return cost_usd, quota_pct
+
+
 def _classify_usage_pool(model_id: str) -> tuple[str, str]:
     m = str(model_id or "").strip().lower()
     if "orchestrator" in m:
@@ -3449,7 +3591,7 @@ def _classify_usage_pool(model_id: str) -> tuple[str, str]:
         return ("claude", "Claude 5.5")
     if "gpt" in m:
         return ("oss", "GPT-OSS / 开源")
-    return ("other", "其他模型")
+    return ("other", "其他 Antigravity 模型")
 
 
 def _parse_transcript_usage_file(tf: pathlib.Path) -> tuple[list[tuple[float, str, int, int, int]], int]:
@@ -3507,11 +3649,13 @@ def _aggregate_usage_bucket(
     turns: int = 0,
     *,
     window_sec: float | None = None,
-    include_daily: bool = False,
+    daily_days: int = 0,
 ) -> dict[str, Any]:
     total_in = 0
     total_cache = 0
     total_out = 0
+    total_cost_usd = 0.0
+    total_quota_pct = 0.0
     steps = 0
     oldest_ts = 0.0
     pools_acc: dict[str, dict[str, Any]] = {}
@@ -3519,45 +3663,63 @@ def _aggregate_usage_bucket(
     daily_acc: dict[str, dict[str, Any]] = {}
 
     for ts, mod, in_t, ca_t, out_t in records:
+        if not _is_antigravity_usage_model(mod):
+            continue
         steps += 1
         total_in += in_t
         total_cache += ca_t
         total_out += out_t
         tot = in_t + ca_t + out_t
+        step_usd, step_qpct = _calc_step_cost_and_quota(mod, in_t, ca_t, out_t)
+        total_cost_usd += step_usd
+        total_quota_pct += step_qpct
         if ts > 0.0 and (oldest_ts == 0.0 or ts < oldest_ts):
             oldest_ts = ts
 
         pid, plabel = _classify_usage_pool(mod)
         pa = pools_acc.get(pid)
         if pa is None:
-            pa = {"id": pid, "label": plabel, "steps": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            pa = {
+                "id": pid, "label": plabel, "steps": 0,
+                "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "quota_used_est_pct": 0.0,
+            }
             pools_acc[pid] = pa
         pa["steps"] += 1
         pa["input_tokens"] += in_t
         pa["cache_read_tokens"] += ca_t
         pa["output_tokens"] += out_t
         pa["total_tokens"] += tot
+        pa["cost_usd"] += step_usd
+        pa["quota_used_est_pct"] += step_qpct
 
         ma = models_acc.get(mod)
         if ma is None:
-            ma = {"model": mod, "steps": 0, "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            ma = {
+                "model": mod, "steps": 0,
+                "input_tokens": 0, "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "quota_used_est_pct": 0.0,
+            }
             models_acc[mod] = ma
         ma["steps"] += 1
         ma["input_tokens"] += in_t
         ma["cache_read_tokens"] += ca_t
         ma["output_tokens"] += out_t
         ma["total_tokens"] += tot
+        ma["cost_usd"] += step_usd
+        ma["quota_used_est_pct"] += step_qpct
 
-        if include_daily and ts > 0.0:
+        if daily_days > 0 and ts > 0.0:
             day_key = datetime.fromtimestamp(ts).strftime("%m-%d")
             da = daily_acc.get(day_key)
             if da is None:
-                da = {"date": day_key, "steps": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+                da = {"date": day_key, "steps": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cost_cny": 0.0}
                 daily_acc[day_key] = da
             da["steps"] += 1
             da["total_tokens"] += tot
             da["input_tokens"] += in_t
             da["output_tokens"] += out_t
+            da["cost_cny"] += step_usd * _USD_TO_CNY
 
     total_all = total_in + total_cache + total_out
     prompt_total = total_in + total_cache
@@ -3568,8 +3730,15 @@ def _aggregate_usage_bucket(
         p_in_ca = p_item["input_tokens"] + p_item["cache_read_tokens"]
         p_item["cache_hit_pct"] = round((p_item["cache_read_tokens"] * 100.0 / p_in_ca), 1) if p_in_ca > 0 else 0.0
         p_item["share_pct"] = round((p_item["total_tokens"] * 100.0 / total_all), 1) if total_all > 0 else 0.0
+        p_item["cost_usd"] = round(p_item["cost_usd"], 4)
+        p_item["cost_cny"] = round(p_item["cost_usd"] * _USD_TO_CNY, 2)
+        p_item["quota_used_est_pct"] = round(p_item["quota_used_est_pct"], 2)
 
     models_list = sorted(models_acc.values(), key=lambda x: x["total_tokens"], reverse=True)[:12]
+    for m_item in models_list:
+        m_item["cost_usd"] = round(m_item["cost_usd"], 4)
+        m_item["cost_cny"] = round(m_item["cost_usd"] * _USD_TO_CNY, 2)
+        m_item["quota_used_est_pct"] = round(m_item["quota_used_est_pct"], 2)
 
     out_dict: dict[str, Any] = {
         "steps": steps,
@@ -3579,6 +3748,9 @@ def _aggregate_usage_bucket(
         "output_tokens": total_out,
         "total_tokens": total_all,
         "cache_hit_pct": cache_hit_pct,
+        "cost_usd": round(total_cost_usd, 4),
+        "cost_cny": round(total_cost_usd * _USD_TO_CNY, 2),
+        "quota_used_est_pct": round(total_quota_pct, 2),
         "pools": pools_list,
         "models": models_list,
     }
@@ -3586,60 +3758,112 @@ def _aggregate_usage_bucket(
         relief_ts = oldest_ts + window_sec
         out_dict["oldest_ts"] = oldest_ts
         out_dict["relief_at"] = datetime.fromtimestamp(relief_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if include_daily:
+    if daily_days > 0:
         now_dt = datetime.now()
         daily_series: list[dict[str, Any]] = []
-        for off in range(6, -1, -1):
+        for off in range(daily_days - 1, -1, -1):
             d_key = datetime.fromtimestamp(now_dt.timestamp() - off * 86400.0).strftime("%m-%d")
-            daily_series.append(daily_acc.get(d_key, {"date": d_key, "steps": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0}))
+            item = daily_acc.get(d_key, {"date": d_key, "steps": 0, "total_tokens": 0, "input_tokens": 0, "output_tokens": 0, "cost_cny": 0.0})
+            item = dict(item)
+            item["cost_cny"] = round(float(item.get("cost_cny") or 0.0), 2)
+            daily_series.append(item)
         out_dict["daily"] = daily_series
     return out_dict
 
 
 def _fetch_optional_external_quota() -> dict[str, Any] | None:
-    """Strictly opt-in external quota JSON fetch (ONLY when user sets AGY_QUOTA_API_URL or mobile_config.json['quota_api_url'])."""
+    """Fetch Antigravity-ONLY live remaining quota from either user-configured AGY_QUOTA_API_URL
+    or optional local bridge (127.0.0.1:8788/api/status). Never exposes personal emails or third-party APIs."""
     cfg = load_or_create_config()
     raw_url = str(os.environ.get("AGY_QUOTA_API_URL") or cfg.get("quota_api_url") or "").strip()
-    if not raw_url:
+    if raw_url:
+        try:
+            pu = urllib.parse.urlparse(raw_url)
+            host_lc = (pu.hostname or "").lower()
+            is_local = pu.scheme == "http" and host_lc in ("127.0.0.1", "localhost", "::1")
+            is_https = pu.scheme == "https" and bool(host_lc)
+            if is_local or is_https:
+                req = urllib.request.Request(raw_url, headers={"Accept": "application/json"}, method="GET")
+                opener = _DIRECT_OPENER if is_local else urllib.request.build_opener()
+                with opener.open(req, timeout=3.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read(262144).decode("utf-8", errors="replace"))
+                        if isinstance(data, dict) and isinstance(data.get("pools"), list):
+                            clean_pools: list[dict[str, Any]] = []
+                            for p in data["pools"][:16]:
+                                if not isinstance(p, dict):
+                                    continue
+                                clean_pools.append({
+                                    "name": str(p.get("name") or p.get("label") or "")[:56],
+                                    "remaining_pct": float(p["remaining_pct"]) if p.get("remaining_pct") is not None else None,
+                                    "h5_pct": float(p["h5_pct"]) if p.get("h5_pct") is not None else None,
+                                    "weekly_pct": float(p["weekly_pct"]) if p.get("weekly_pct") is not None else None,
+                                    "reset_at": str(p.get("reset_at") or "")[:48],
+                                    "note": str(p.get("note") or "")[:80],
+                                })
+                            return {"source": str(data.get("source") or "custom")[:48], "plan": str(data.get("plan") or "")[:48], "pools": clean_pools}
+        except Exception:
+            pass
+
+    # Automatic fallback: optional local companion bridge on 127.0.0.1:8788 (Antigravity pools ONLY)
+    bridge = _fetch_local_bridge_status()
+    if not isinstance(bridge, dict):
         return None
-    try:
-        pu = urllib.parse.urlparse(raw_url)
-        host_lc = (pu.hostname or "").lower()
-        is_local = pu.scheme == "http" and host_lc in ("127.0.0.1", "localhost", "::1")
-        is_https = pu.scheme == "https" and bool(host_lc)
-        if not (is_local or is_https):
-            return None
-        req = urllib.request.Request(raw_url, headers={"Accept": "application/json"}, method="GET")
-        opener = _DIRECT_OPENER if is_local else urllib.request.build_opener()
-        with opener.open(req, timeout=3.0) as resp:
-            if resp.status != 200:
-                return None
-            data = json.loads(resp.read(262144).decode("utf-8", errors="replace"))
-            if isinstance(data, dict) and isinstance(data.get("pools"), list):
-                clean_pools: list[dict[str, Any]] = []
-                for p in data["pools"][:16]:
-                    if not isinstance(p, dict):
-                        continue
-                    clean_pools.append({
-                        "name": str(p.get("name") or p.get("label") or "")[:48],
-                        "remaining_pct": float(p["remaining_pct"]) if p.get("remaining_pct") is not None else None,
-                        "reset_at": str(p.get("reset_at") or "")[:48],
-                        "note": str(p.get("note") or "")[:80],
-                    })
-                return {"source": str(data.get("source") or "custom")[:48], "pools": clean_pools}
-    except Exception:
+    quotas = bridge.get("quotas")
+    if not isinstance(quotas, dict):
         return None
-    return None
+    raw_pools = quotas.get("pools")
+    if not isinstance(raw_pools, dict):
+        return None
+
+    acct = quotas.get("account") if isinstance(quotas.get("account"), dict) else {}
+    plan = str(acct.get("plan") or "").strip()[:48]
+    agy_pool_specs = [
+        ("gemini", "Gemini 4 共享池 (Neon / Hydrogen / Carbon / Argon / Flash)"),
+        ("opus", "Claude 5.5 池 (Opus 5.5 / Sonnet 5.5)"),
+    ]
+    out_pools: list[dict[str, Any]] = []
+    for key, default_label in agy_pool_specs:
+        p = raw_pools.get(key)
+        if not isinstance(p, dict):
+            continue
+        rem = p.get("remaining_pct")
+        h5 = p.get("h5_pct")
+        wk = p.get("weekly_pct")
+        if rem is None and h5 is None and wk is None:
+            continue
+        out_pools.append({
+            "id": key,
+            "name": str(p.get("name") or default_label)[:64],
+            "remaining_pct": round(float(rem), 1) if rem is not None else None,
+            "h5_pct": round(float(h5), 1) if h5 is not None else None,
+            "weekly_pct": round(float(wk), 1) if wk is not None else None,
+            "reset_at": str(p.get("reset_time") or p.get("reset_at") or "")[:48],
+            "note": str(p.get("remaining_text") or "")[:80],
+        })
+    if not out_pools:
+        return None
+    return {
+        "source": "Antigravity 实时额度",
+        "plan": plan,
+        "live": bool(quotas.get("ls_quota_live", True)),
+        "pools": out_pools,
+    }
 
 
 def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
     now = time.time()
+    local_now = datetime.now()
+    today_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     cut_7d = now - 7.0 * 86400.0
+    cut_3d = now - 3.0 * 86400.0
     cut_24h = now - 86400.0
     cut_5h = now - 5.0 * 3600.0
 
     rec_5h: list[tuple[float, str, int, int, int]] = []
+    rec_today: list[tuple[float, str, int, int, int]] = []
     rec_24h: list[tuple[float, str, int, int, int]] = []
+    rec_3d: list[tuple[float, str, int, int, int]] = []
     rec_7d: list[tuple[float, str, int, int, int]] = []
     scanned_convs = 0
     seen_paths: set[str] = set()
@@ -3671,10 +3895,14 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
                         ts = r[0]
                         if ts >= cut_7d:
                             rec_7d.append(r)
+                            if ts >= cut_3d:
+                                rec_3d.append(r)
                             if ts >= cut_24h:
                                 rec_24h.append(r)
-                                if ts >= cut_5h:
-                                    rec_5h.append(r)
+                            if ts >= today_midnight:
+                                rec_today.append(r)
+                            if ts >= cut_5h:
+                                rec_5h.append(r)
         except OSError:
             continue
 
@@ -3710,8 +3938,10 @@ def compute_usage_summary(current_cid: str = "") -> dict[str, Any]:
         "generated_at": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scanned_conversations": scanned_convs,
         "window_5h": _aggregate_usage_bucket(rec_5h, window_sec=5.0 * 3600.0),
+        "window_today": _aggregate_usage_bucket(rec_today, window_sec=86400.0),
         "window_24h": _aggregate_usage_bucket(rec_24h, window_sec=86400.0),
-        "window_7d": _aggregate_usage_bucket(rec_7d, window_sec=7.0 * 86400.0, include_daily=True),
+        "window_3d": _aggregate_usage_bucket(rec_3d, window_sec=3.0 * 86400.0, daily_days=3),
+        "window_7d": _aggregate_usage_bucket(rec_7d, window_sec=7.0 * 86400.0, daily_days=7),
         "current_conversation": conv_usage,
         "external_quota": _fetch_optional_external_quota(),
     }

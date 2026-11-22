@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.7.1" />
+  <link rel="stylesheet" href="./app.css?v=1.7.2" />
 </head>
 <body>
   <!-- =========================================================
@@ -851,13 +851,16 @@
         </svg>
       </button>
     </header>
-    <div class="view-body settings-body">
-      <div id="usage-window-tabs" class="m3-segmented" role="tablist" aria-label="统计周期">
-        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-usage-win="5h">近 5 小时</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="24h">今日 24h</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="7d">近 7 天</button>
-        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="conv">当前会话</button>
+    <div class="usage-tabs-bar">
+      <div id="usage-window-tabs" class="m3-segmented sm" role="tablist" aria-label="统计周期">
+        <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-usage-win="5h">近5h</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="today">今日</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="3d">近3天</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="7d">近7天</button>
+        <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="conv">本会话</button>
       </div>
+    </div>
+    <div class="view-body settings-body">
       <div id="usage-body" class="usage-body-wrap"></div>
     </div>
   </section>
@@ -902,6 +905,6 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=1.7.1"></script>
+  <script src="./app.js?v=1.7.2"></script>
 </body>
 </html>
