@@ -40,7 +40,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.6.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -1225,6 +1225,45 @@ def _probe_cloudflared_ready(metrics_port: int) -> tuple[bool, int]:
             return False, 0
     except Exception:
         return False, 0
+
+
+def _probe_tunnel_public_health(tunnel_url: str) -> tuple[bool, str]:
+    """End-to-end probe of <tunnel_url>/health to catch Cloudflare 530/1033 zombie routes
+    where local /ready still reports readyConnections >= 1.
+    Returns (True, "") if healthy or locally inconclusive; (False, reason) ONLY on definitive edge errors (530/502/503/504)."""
+    base = str(tunnel_url or "").strip().rstrip("/")
+    if not base.startswith(("https://", "http://")):
+        return True, ""
+    url = f"{base}/health"
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": f"AntigravityLink/{APP_VERSION}"})
+    openers = [urllib.request.build_opener(), _DIRECT_OPENER]
+    last_http_err = ""
+    for opener in openers:
+        try:
+            with opener.open(req, timeout=5.0) as resp:
+                raw = resp.read(512).decode("utf-8", errors="replace")
+                if resp.status == 200 and '"ok"' in raw:
+                    return True, ""
+                if resp.status in (530, 502, 503, 504):
+                    last_http_err = f"HTTP {resp.status}"
+                    continue
+                return True, ""
+        except urllib.error.HTTPError as he:
+            if he.code in (530, 502, 503, 504):
+                body = ""
+                try:
+                    body = he.read(120).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                last_http_err = f"HTTP {he.code}" + (f" ({body[:40]})" if body else "")
+                continue
+            return True, ""
+        except Exception:
+            # Local DNS/proxy hiccup: try next opener, don't false-kill tunnel unless definitive edge error
+            continue
+    if last_http_err:
+        return False, last_http_err
+    return True, ""
 
 
 def get_tunnel_snapshot() -> dict[str, Any]:
@@ -4595,15 +4634,18 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
 
 
 async def _tunnel_health_watchdog_loop(_app: web.Application) -> None:
-    """Detect zombie cloudflared processes (readyConnections == 0 after sleep/proxy reset) and auto-heal."""
+    """Detect zombie cloudflared processes (readyConnections == 0 OR Cloudflare edge 530/1033) and auto-heal."""
+    tick = 0
     while True:
         await asyncio.sleep(15.0)
+        tick += 1
         try:
             with _TUNNEL_LOCK:
                 enabled = bool(_TUNNEL_STATE.get("enabled"))
                 status = str(_TUNNEL_STATE.get("status") or "disabled")
                 proc = _TUNNEL_STATE.get("proc")
                 m_port = int(_TUNNEL_STATE.get("metrics_port") or 0)
+                cur_url = str(_TUNNEL_STATE.get("url") or "")
                 started_at = float(_TUNNEL_STATE.get("started_at") or 0.0)
                 last_heal_at = float(_TUNNEL_STATE.get("last_heal_at") or 0.0)
             if not enabled or status in ("disabled", "missing") or proc is None or proc.poll() is not None:
@@ -4614,6 +4656,15 @@ async def _tunnel_health_watchdog_loop(_app: web.Application) -> None:
                 continue
 
             ok, ready_cnt = await asyncio.to_thread(_probe_cloudflared_ready, m_port)
+            fail_reason = ""
+            if not ok:
+                fail_reason = "readyConnections=0"
+            elif cur_url and (now - started_at) >= 35.0 and (tick % 2 == 0 or status == "reconnecting"):
+                pub_ok, pub_reason = await asyncio.to_thread(_probe_tunnel_public_health, cur_url)
+                if not pub_ok:
+                    ok = False
+                    fail_reason = pub_reason or "公网边缘 530/1033"
+
             need_heal_proc = None
             broadcast_snap = None
             with _TUNNEL_LOCK:
@@ -4631,22 +4682,24 @@ async def _tunnel_health_watchdog_loop(_app: web.Application) -> None:
                 else:
                     streak = int(_TUNNEL_STATE.get("unhealthy_streak") or 0) + 1
                     _TUNNEL_STATE["unhealthy_streak"] = streak
-                    _TUNNEL_STATE["ready_connections"] = 0
+                    if fail_reason == "readyConnections=0":
+                        _TUNNEL_STATE["ready_connections"] = 0
+                    heal_threshold = 2 if fail_reason.startswith("HTTP 530") else 3
                     if streak == 1 and _TUNNEL_STATE.get("status") == "online":
                         _TUNNEL_STATE["status"] = "reconnecting"
-                        _TUNNEL_STATE["error"] = "检测到公网隧道出站断连（readyConnections=0），正在自愈重连…"
+                        _TUNNEL_STATE["error"] = f"检测到公网隧道异常（{fail_reason}），正在自愈重连…"
                         broadcast_snap = True
-                    elif streak >= 3 and (now - last_heal_at) >= 60.0:
+                    elif streak >= heal_threshold and (now - last_heal_at) >= 60.0:
                         _TUNNEL_STATE["unhealthy_streak"] = 0
                         _TUNNEL_STATE["last_heal_at"] = now
                         _TUNNEL_STATE["auto_heals"] = int(_TUNNEL_STATE.get("auto_heals") or 0) + 1
                         _TUNNEL_STATE["status"] = "reconnecting"
-                        _TUNNEL_STATE["error"] = "僵尸隧道已触发自动自愈，正在重新建连…"
+                        _TUNNEL_STATE["error"] = f"僵尸隧道（{fail_reason}）已触发自动自愈，正在重新建连…"
                         need_heal_proc = proc
                         broadcast_snap = True
 
             if need_heal_proc is not None:
-                print(f"[{APP_NAME}] Zombie cloudflared detected (readyConnections=0 for >=45s), auto-healing...", flush=True)
+                print(f"[{APP_NAME}] Zombie cloudflared detected ({fail_reason}), auto-healing...", flush=True)
                 try:
                     need_heal_proc.terminate()
                 except Exception:
