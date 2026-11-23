@@ -41,7 +41,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -223,6 +223,7 @@ _TUNNEL_STATE: dict[str, Any] = {
     "bin": "",
     "started_at": 0.0,
     "metrics_port": 0,
+    "external_pid": 0,
     "ready_connections": 0,
     "last_healthy_at": 0.0,
     "unhealthy_streak": 0,
@@ -231,6 +232,8 @@ _TUNNEL_STATE: dict[str, Any] = {
     "proc": None,
 }
 _CF_QUICK_URL_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+_TAILSCALE_FUNNEL_CACHE_LOCK = threading.Lock()
+_TAILSCALE_FUNNEL_CACHE: tuple[float, str] = (0.0, "")
 
 _USAGE_CACHE_LOCK = threading.Lock()
 _USAGE_FILE_CACHE: dict[str, tuple[int, int, list[tuple[float, str, int, int, int]], int]] = {}
@@ -1592,8 +1595,30 @@ def detect_lan_addresses() -> list[dict[str, str]]:
     return [entry for _, entry in ordered]
 
 
-def build_pair_uri(base_url: str, token: str, hostname: str) -> str:
-    q = urllib.parse.urlencode({"u": base_url, "t": token, "n": hostname})
+def build_pair_uri(
+    base_url: str,
+    token: str,
+    hostname: str,
+    alt_urls: list[str] | None = None,
+) -> str:
+    params: dict[str, str] = {"u": base_url, "t": token, "n": hostname}
+    if alt_urls:
+        seen = {str(base_url or "").strip().rstrip("/").lower()}
+        clean_alts: list[str] = []
+        for raw in alt_urls:
+            u = str(raw or "").strip().rstrip("/")
+            if not u or not u.startswith(("http://", "https://")):
+                continue
+            low = u.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            clean_alts.append(u)
+            if len(clean_alts) >= 2:
+                break
+        if clean_alts:
+            params["a"] = ",".join(clean_alts)
+    q = urllib.parse.urlencode(params)
     return f"agylink://pair?{q}"
 
 
@@ -1631,6 +1656,110 @@ def _pick_free_loopback_port() -> int:
         return 0
 
 
+def _discover_running_cloudflared() -> tuple[int, int]:
+    """Find an already-running cloudflared process targeting 127.0.0.1:{PORT} -> (pid, metrics_port)."""
+    try:
+        entries: list[tuple[int, str]] = []
+        if os.name == "nt":
+            ps = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'cloudflared*' } | Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress",
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=4, creationflags=_NO_WINDOW,
+            )
+            raw = (ps.stdout or "").strip()
+            if raw:
+                parsed = json.loads(raw)
+                items = parsed if isinstance(parsed, list) else [parsed]
+                for it in items:
+                    if isinstance(it, dict) and it.get("ProcessId"):
+                        entries.append((int(it["ProcessId"]), str(it.get("CommandLine") or "")))
+        else:
+            res = subprocess.run(
+                ["ps", "-eo", "pid,args"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3,
+            )
+            for ln in (res.stdout or "").splitlines():
+                m = re.match(r"^\s*(\d+)\s+(.*)$", ln)
+                if m and "cloudflared" in m.group(2):
+                    entries.append((int(m.group(1)), m.group(2)))
+        port_tag = f"127.0.0.1:{PORT}"
+        fallback: tuple[int, int] = (0, 0)
+        for pid, cmdline in entries:
+            m_met = re.search(r"--metrics\s+127\.0\.0\.1:(\d+)", cmdline)
+            mport = int(m_met.group(1)) if m_met else 0
+            if port_tag in cmdline or f"localhost:{PORT}" in cmdline:
+                return pid, mport
+            if fallback == (0, 0):
+                fallback = (pid, mport)
+        return fallback
+    except Exception:
+        return 0, 0
+
+
+def _kill_pid(pid: int) -> None:
+    if pid <= 0:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, timeout=4, creationflags=_NO_WINDOW,
+            )
+        else:
+            os.kill(pid, 15)
+    except Exception:
+        pass
+
+
+def _detect_tailscale_funnel_url() -> str:
+    """Detect whether Tailscale Funnel is already configured to expose this local port permanently."""
+    global _TAILSCALE_FUNNEL_CACHE
+    now = time.time()
+    with _TAILSCALE_FUNNEL_CACHE_LOCK:
+        ts_c, url_c = _TAILSCALE_FUNNEL_CACHE
+        if (now - ts_c) < 30.0:
+            return url_c
+    found = ""
+    ts_bin = shutil.which("tailscale") or shutil.which("tailscale.exe")
+    if ts_bin:
+        try:
+            kw = {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
+            res = subprocess.run(
+                [ts_bin, "funnel", "status", "--json"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.5, **kw
+            )
+            raw = (res.stdout or "").strip()
+            if res.returncode == 0 and raw.startswith("{"):
+                data = json.loads(raw)
+                allow_fn = data.get("AllowFunnel") if isinstance(data.get("AllowFunnel"), dict) else {}
+                web_map = data.get("Web") if isinstance(data.get("Web"), dict) else {}
+                target_pat = re.compile(rf"(?:127\.0\.0\.1|localhost):{PORT}\b")
+                for host_port, cfg in web_map.items():
+                    if not allow_fn.get(host_port, False):
+                        continue
+                    handlers = cfg.get("Handlers") if isinstance(cfg, dict) else None
+                    if not isinstance(handlers, dict):
+                        continue
+                    for h in handlers.values():
+                        if isinstance(h, dict) and target_pat.search(str(h.get("Proxy") or "")):
+                            hp = str(host_port).strip()
+                            if hp.endswith(":443"):
+                                hp = hp[:-4]
+                            if hp:
+                                found = f"https://{hp}"
+                                break
+                    if found:
+                        break
+        except Exception:
+            found = ""
+    with _TAILSCALE_FUNNEL_CACHE_LOCK:
+        _TAILSCALE_FUNNEL_CACHE = (now, found)
+    return found
+
+
 def _probe_cloudflared_ready(metrics_port: int) -> tuple[bool, int]:
     """Query cloudflared's documented local --metrics /ready endpoint (never via proxy)."""
     if metrics_port <= 0:
@@ -1654,10 +1783,10 @@ def _probe_cloudflared_ready(metrics_port: int) -> tuple[bool, int]:
         return False, 0
 
 
-def _probe_tunnel_public_health(tunnel_url: str) -> tuple[bool, str]:
+def _probe_tunnel_public_health(tunnel_url: str, metrics_port: int = 0) -> tuple[bool, str]:
     """End-to-end probe of <tunnel_url>/health to catch Cloudflare 530/1033 zombie routes
     where local /ready still reports readyConnections >= 1.
-    Returns (True, "") if healthy or locally inconclusive; (False, reason) ONLY on definitive edge errors (530/502/503/504)."""
+    Returns (True, "") if healthy or locally inconclusive; (False, reason) on definitive edge/TLS errors."""
     base = str(tunnel_url or "").strip().rstrip("/")
     if not base.startswith(("https://", "http://")):
         return True, ""
@@ -1665,6 +1794,7 @@ def _probe_tunnel_public_health(tunnel_url: str) -> tuple[bool, str]:
     req = urllib.request.Request(url, method="GET", headers={"User-Agent": f"AntigravityLink/{APP_VERSION}"})
     openers = [urllib.request.build_opener(), _DIRECT_OPENER]
     last_http_err = ""
+    fatal_conn_errs = 0
     for opener in openers:
         try:
             with opener.open(req, timeout=5.0) as resp:
@@ -1685,11 +1815,15 @@ def _probe_tunnel_public_health(tunnel_url: str) -> tuple[bool, str]:
                 last_http_err = f"HTTP {he.code}" + (f" ({body[:40]})" if body else "")
                 continue
             return True, ""
-        except Exception:
-            # Local DNS/proxy hiccup: try next opener, don't false-kill tunnel unless definitive edge error
+        except Exception as exc:
+            err_s = f"{type(exc).__name__}: {exc}".lower()
+            if any(k in err_s for k in ("unexpected_eof", "ssleoferror", "connectionreset", "remote end closed")):
+                fatal_conn_errs += 1
             continue
     if last_http_err:
         return False, last_http_err
+    if metrics_port <= 0 and fatal_conn_errs >= len(openers):
+        return False, "TLS/连接中断"
     return True, ""
 
 
@@ -1737,6 +1871,8 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
     global _TUNNEL_THREAD, _TUNNEL_STOP_EVT, _TUNNEL_GEN
     reuse_url = str(os.environ.get("AGY_REUSE_TUNNEL_URL") or "").strip().rstrip("/") if allow_reuse else ""
     if reuse_url:
+        ext_pid, ext_mport = _discover_running_cloudflared()
+        ready_ok, ready_cnt = _probe_cloudflared_ready(ext_mport) if ext_mport > 0 else (False, 0)
         with _TUNNEL_LOCK:
             _TUNNEL_STATE.update({
                 "enabled": True,
@@ -1745,10 +1881,15 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                 "url": reuse_url,
                 "error": "",
                 "bin": _find_cloudflared_bin(),
-                "started_at": time.time(),
+                "started_at": time.time() - 30.0,
+                "metrics_port": ext_mport,
+                "external_pid": ext_pid,
+                "ready_connections": ready_cnt,
+                "last_healthy_at": time.time() if ready_ok else 0.0,
+                "unhealthy_streak": 0,
                 "proc": None,
             })
-        print(f"[{APP_NAME}] Reusing Public Tunnel: {reuse_url}", flush=True)
+        print(f"[{APP_NAME}] Reusing Public Tunnel: {reuse_url} (pid={ext_pid}, metrics={ext_mport}, ready={ready_cnt})", flush=True)
         return get_tunnel_snapshot()
 
     os.environ.pop("AGY_REUSE_TUNNEL_URL", None)
@@ -1760,13 +1901,13 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
     if not enabled:
         _stop_cloudflared_tunnel()
         with _TUNNEL_LOCK:
-            _TUNNEL_STATE.update({"enabled": False, "mode": "disabled", "status": "disabled", "url": "", "error": "", "bin": cf_bin})
+            _TUNNEL_STATE.update({"enabled": False, "mode": "disabled", "status": "disabled", "url": "", "error": "", "bin": cf_bin, "external_pid": 0})
         return get_tunnel_snapshot()
 
     if not cf_bin:
         _stop_cloudflared_tunnel()
         with _TUNNEL_LOCK:
-            _TUNNEL_STATE.update({"enabled": True, "mode": "quick", "status": "missing", "url": "", "error": "未找到 cloudflared 可执行文件（请将其放入 bin/ 目录或系统 PATH）", "bin": ""})
+            _TUNNEL_STATE.update({"enabled": True, "mode": "quick", "status": "missing", "url": "", "error": "未找到 cloudflared 可执行文件（请将其放入 bin/ 目录或系统 PATH）", "bin": "", "external_pid": 0})
         return get_tunnel_snapshot()
 
     named_token = str(cfg.get("cloudflare_tunnel_token") or os.environ.get("AGY_CLOUDFLARE_TUNNEL_TOKEN") or "").strip()
@@ -1785,6 +1926,7 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
                 "error": "已配置 cloudflare_tunnel_token，但缺少 cloudflare_public_url（请在 mobile_config.json 补充固定域名）",
                 "bin": cf_bin,
                 "started_at": time.time(),
+                "external_pid": 0,
                 "proc": None,
             })
         return get_tunnel_snapshot()
@@ -1804,6 +1946,7 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
             "error": "",
             "bin": cf_bin,
             "started_at": time.time(),
+            "external_pid": 0,
             "proc": None,
         })
 
@@ -1918,17 +2061,35 @@ def start_cloudflared_tunnel(wait_sec: float = 0.0, allow_reuse: bool = True) ->
 
 
 def detect_connect_endpoints() -> list[dict[str, str]]:
-    """Return all reachable endpoints, prioritizing the active Cloudflare public tunnel."""
+    """Return all reachable endpoints, prioritizing permanent HTTPS & active public tunnels."""
     endpoints: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    funnel_url = _detect_tailscale_funnel_url()
+    if funnel_url:
+        endpoints.append({
+            "iface": "Tailscale Funnel 永久公网",
+            "ip": "funnel",
+            "url": funnel_url,
+            "kind": "permanent",
+        })
+        seen_urls.add(funnel_url.lower())
     tun = get_tunnel_snapshot()
     if tun.get("status") == "online" and tun.get("url"):
-        endpoints.append({
-            "iface": "Cloudflare 公网免VPN",
-            "ip": "tunnel",
-            "url": tun["url"],
-            "kind": "tunnel",
-        })
-    endpoints.extend(detect_lan_addresses())
+        tun_url = str(tun["url"]).strip().rstrip("/")
+        if tun_url and tun_url.lower() not in seen_urls:
+            is_named = tun.get("mode") == "named"
+            endpoints.append({
+                "iface": "Cloudflare 固定公网域名" if is_named else "Cloudflare 公网免VPN",
+                "ip": "tunnel",
+                "url": tun_url,
+                "kind": "permanent" if is_named else "tunnel",
+            })
+            seen_urls.add(tun_url.lower())
+    for ep in detect_lan_addresses():
+        u = str(ep.get("url") or "").strip().rstrip("/")
+        if u and u.lower() not in seen_urls:
+            endpoints.append(ep)
+            seen_urls.add(u.lower())
     return endpoints
 
 
@@ -3848,6 +4009,7 @@ async def handle_pair_info(_request: web.Request) -> web.Response:
     hostname = socket.gethostname()
     token = str(cfg.get("token") or "")
     main_url = lans[0]["url"] if lans else f"http://127.0.0.1:{PORT}"
+    alt_urls = [str(ep.get("url") or "") for ep in lans if ep.get("url") and str(ep.get("url")) != main_url]
     pin = get_pair_pin()
     return web.json_response(
         {
@@ -3856,7 +4018,7 @@ async def handle_pair_info(_request: web.Request) -> web.Response:
             "lan_urls": lans,
             "tunnel": tun,
             "pin": pin,
-            "pair_uri": build_pair_uri(main_url, token, hostname),
+            "pair_uri": build_pair_uri(main_url, token, hostname, alt_urls=alt_urls),
             "token_preview": _mask_token(token),
         },
         headers={"Cache-Control": "no-store"},
@@ -6244,7 +6406,8 @@ async def handle_pair_page(request: web.Request) -> web.Response:
         active_entry = lans[0] if lans else {"iface": "Localhost", "ip": "127.0.0.1", "url": f"http://127.0.0.1:{PORT}", "kind": "lan"}
 
     active_url = active_entry["url"]
-    pair_uri = build_pair_uri(active_url, token, hostname)
+    alt_urls = [str(ep.get("url") or "") for ep in lans if ep.get("url") and str(ep.get("url")) != active_url]
+    pair_uri = build_pair_uri(active_url, token, hostname, alt_urls=alt_urls)
     qr_svg = await asyncio.to_thread(render_qr_svg, pair_uri, "#131314", "#EAECEF")
 
     apk_p = DIST_DIR / APK_FILENAME
@@ -6259,6 +6422,7 @@ async def handle_pair_page(request: web.Request) -> web.Response:
         apk_btn_label = f"下载 {APK_FILENAME}（构建完成后可用）"
 
     kind_labels = {
+        "permanent": "永久固定公网域名（重启/断网重连不变，强烈推荐）",
         "tunnel": "Cloudflare 加密公网直连（推荐：免 Tailscale，手机可同时挂 v2rayNG / 校园网 / 5G）",
         "lan": "同 Wi-Fi 局域网（家里直连可选；校园网若隔离请用公网隧道）",
         "tailscale": "Tailscale 内网穿透（需手机端切 Tailscale）",
@@ -6307,7 +6471,7 @@ async def handle_pair_page(request: web.Request) -> web.Response:
         esc_ip = html_lib.escape(item["ip"])
         esc_url = html_lib.escape(item["url"])
         cls = "iface-chip active" if is_active else "iface-chip"
-        chip_lbl = f'{esc_iface} ★' if item.get("kind") == "tunnel" else f'{esc_iface} · {esc_ip}'
+        chip_lbl = f'{esc_iface} ★' if item.get("kind") in ("tunnel", "permanent") else f'{esc_iface} · {esc_ip}'
         chips_html_parts.append(
             f'<a class="{cls}" href="/pair?ip={urllib.parse.quote(item["ip"])}">'
             f'{chip_lbl}</a>'
@@ -7083,45 +7247,75 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
 
 
 async def _tunnel_health_watchdog_loop(_app: web.Application) -> None:
-    """Detect zombie cloudflared processes (readyConnections == 0 OR Cloudflare edge 530/1033) and auto-heal."""
+    """Detect zombie cloudflared processes (owned or reused, readyConnections==0, 530/1033, sleep/wake) and auto-heal."""
     tick = 0
+    last_wall_ts = time.time()
     while True:
         await asyncio.sleep(15.0)
         tick += 1
         try:
+            now = time.time()
+            wake_jump = (now - last_wall_ts) > 45.0
+            last_wall_ts = now
+            if wake_jump:
+                await asyncio.sleep(3.0)
+                now = time.time()
+
             with _TUNNEL_LOCK:
                 enabled = bool(_TUNNEL_STATE.get("enabled"))
                 status = str(_TUNNEL_STATE.get("status") or "disabled")
                 proc = _TUNNEL_STATE.get("proc")
+                ext_pid = int(_TUNNEL_STATE.get("external_pid") or 0)
                 m_port = int(_TUNNEL_STATE.get("metrics_port") or 0)
                 cur_url = str(_TUNNEL_STATE.get("url") or "")
                 started_at = float(_TUNNEL_STATE.get("started_at") or 0.0)
                 last_heal_at = float(_TUNNEL_STATE.get("last_heal_at") or 0.0)
-            if not enabled or status in ("disabled", "missing") or proc is None or proc.poll() is not None:
+            if not enabled or status in ("disabled", "missing"):
                 continue
-            now = time.time()
+            if proc is not None and proc.poll() is not None:
+                continue
+            if proc is None and not cur_url and ext_pid <= 0:
+                continue
+            if proc is None and m_port <= 0:
+                d_pid, d_mport = await asyncio.to_thread(_discover_running_cloudflared)
+                if d_pid > 0 or d_mport > 0:
+                    with _TUNNEL_LOCK:
+                        if _TUNNEL_STATE.get("proc") is None:
+                            if d_pid > 0:
+                                _TUNNEL_STATE["external_pid"] = d_pid
+                                ext_pid = d_pid
+                            if d_mport > 0:
+                                _TUNNEL_STATE["metrics_port"] = d_mport
+                                m_port = d_mport
+
             # Startup grace period so fresh cloudflared has time to establish edge HTTP/2 connections
-            if m_port <= 0 or (now - started_at) < 25.0:
+            if proc is not None and (now - started_at) < 25.0 and not wake_jump:
                 continue
 
-            ok, ready_cnt = await asyncio.to_thread(_probe_cloudflared_ready, m_port)
+            if m_port > 0:
+                ok, ready_cnt = await asyncio.to_thread(_probe_cloudflared_ready, m_port)
+            else:
+                ok, ready_cnt = (True, 0)
             fail_reason = ""
-            if not ok:
+            if m_port > 0 and not ok:
                 fail_reason = "readyConnections=0"
-            elif cur_url and (now - started_at) >= 35.0 and (tick % 2 == 0 or status == "reconnecting"):
-                pub_ok, pub_reason = await asyncio.to_thread(_probe_tunnel_public_health, cur_url)
+            elif cur_url and (wake_jump or (now - started_at) >= 35.0) and (wake_jump or tick % 2 == 0 or status == "reconnecting" or m_port <= 0):
+                pub_ok, pub_reason = await asyncio.to_thread(_probe_tunnel_public_health, cur_url, m_port)
                 if not pub_ok:
                     ok = False
                     fail_reason = pub_reason or "公网边缘 530/1033"
 
             need_heal_proc = None
-            broadcast_snap = None
+            need_heal_ext_pid = 0
+            need_restart_owned = False
+            broadcast_snap = False
             with _TUNNEL_LOCK:
                 if _TUNNEL_STATE.get("proc") is not proc:
                     continue
                 if ok:
                     prev_status = str(_TUNNEL_STATE.get("status") or "")
-                    _TUNNEL_STATE["ready_connections"] = ready_cnt
+                    if m_port > 0:
+                        _TUNNEL_STATE["ready_connections"] = ready_cnt
                     _TUNNEL_STATE["unhealthy_streak"] = 0
                     _TUNNEL_STATE["last_healthy_at"] = now
                     if prev_status == "reconnecting" and _TUNNEL_STATE.get("url"):
@@ -7133,26 +7327,36 @@ async def _tunnel_health_watchdog_loop(_app: web.Application) -> None:
                     _TUNNEL_STATE["unhealthy_streak"] = streak
                     if fail_reason == "readyConnections=0":
                         _TUNNEL_STATE["ready_connections"] = 0
-                    heal_threshold = 2 if fail_reason.startswith("HTTP 530") else 3
-                    if streak == 1 and _TUNNEL_STATE.get("status") == "online":
+                    heal_threshold = 1 if (wake_jump or fail_reason == "TLS/连接中断") else (2 if fail_reason.startswith("HTTP 530") else 3)
+                    if streak == 1 and _TUNNEL_STATE.get("status") == "online" and heal_threshold > 1:
                         _TUNNEL_STATE["status"] = "reconnecting"
                         _TUNNEL_STATE["error"] = f"检测到公网隧道异常（{fail_reason}），正在自愈重连…"
                         broadcast_snap = True
-                    elif streak >= heal_threshold and (now - last_heal_at) >= 60.0:
+                    elif streak >= heal_threshold and (wake_jump or (now - last_heal_at) >= 60.0):
                         _TUNNEL_STATE["unhealthy_streak"] = 0
                         _TUNNEL_STATE["last_heal_at"] = now
                         _TUNNEL_STATE["auto_heals"] = int(_TUNNEL_STATE.get("auto_heals") or 0) + 1
                         _TUNNEL_STATE["status"] = "reconnecting"
                         _TUNNEL_STATE["error"] = f"僵尸隧道（{fail_reason}）已触发自动自愈，正在重新建连…"
-                        need_heal_proc = proc
+                        if proc is not None:
+                            need_heal_proc = proc
+                        else:
+                            need_heal_ext_pid = ext_pid
+                            need_restart_owned = True
                         broadcast_snap = True
 
             if need_heal_proc is not None:
-                print(f"[{APP_NAME}] Zombie cloudflared detected ({fail_reason}), auto-healing...", flush=True)
+                print(f"[{APP_NAME}] Zombie cloudflared detected ({fail_reason}, wake={wake_jump}), auto-healing...", flush=True)
                 try:
                     need_heal_proc.terminate()
                 except Exception:
                     pass
+            elif need_restart_owned:
+                print(f"[{APP_NAME}] Zombie reused cloudflared (pid={need_heal_ext_pid}, reason={fail_reason}, wake={wake_jump}), taking ownership & restarting...", flush=True)
+                if need_heal_ext_pid > 0:
+                    await asyncio.to_thread(_kill_pid, need_heal_ext_pid)
+                await asyncio.to_thread(start_cloudflared_tunnel, 10.0, False)
+                broadcast_snap = True
             if broadcast_snap:
                 _broadcast_ws({"type": "tunnel_status", "tunnel": get_tunnel_snapshot(), "ts": now})
         except asyncio.CancelledError:

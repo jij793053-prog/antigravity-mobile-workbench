@@ -172,6 +172,12 @@
     usageCalSelectedDate: "",
     convErrors: {},
     pendingRevertTarget: null,
+
+    // v1.7.2: Multi-route auto-failover & WS heartbeat
+    wsFailStreak: 0,
+    failoverInFlight: false,
+    wsPingTimer: null,
+    wsLastPongAt: 0,
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -607,11 +613,15 @@
           const key = normUrl.toLowerCase();
           if (seenUrls.has(key)) continue;
           seenUrls.add(key);
+          const normAlts = Array.isArray(h.altUrls)
+            ? h.altUrls.map((u) => normalizeServerUrl(String(u || ""))).filter((u) => u && u !== "same-origin" && u.toLowerCase() !== key).slice(0, 8)
+            : [];
           state.hosts.push({
             id: String(h.id || makeHostId()),
             name: String(h.name || (normUrl === "same-origin" ? t("host.localWorkbench") : hostDisplayFallback(normUrl))).trim(),
             url: normUrl,
             token: String(h.token || "").trim(),
+            altUrls: normAlts,
           });
         }
         state.activeHostId = String(parsed.activeHostId || (state.hosts[0] ? state.hosts[0].id : ""));
@@ -677,17 +687,101 @@
     return String((host && host.url) || "");
   }
 
-  function upsertHost({ name, url, token }, activate = true) {
+  function isQuickTunnelUrl(url) {
+    return /^https:\/\/[^/]+\.trycloudflare\.com(?:\/|$)/i.test(String(url || "").trim());
+  }
+
+  function isTailscaleUrl(url) {
+    return /^https?:\/\/100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+(?::\d+)?(?:\/|$)/i.test(String(url || "").trim());
+  }
+
+  function isLanPrivateUrl(url) {
+    return /^https?:\/\/(?:192\.168\.|10\.|172\.(?:1[6-9]|2\d|3[01])\.)\d+\.\d+(?::\d+)?(?:\/|$)/i.test(String(url || "").trim());
+  }
+
+  function classifyRouteLabel(url) {
+    const s = String(url || "").trim();
+    if (!s) return t("host.routeAlt");
+    if (isQuickTunnelUrl(s)) return t("host.routeTunnel");
+    if (isTailscaleUrl(s)) return t("host.routeTailscale");
+    if (isLanPrivateUrl(s)) return t("host.routeLan");
+    if (/^https:\/\//i.test(s)) return t("host.routePermanent");
+    return t("host.routeAlt");
+  }
+
+  function routePriorityScore(url) {
+    const s = String(url || "").trim();
+    if (/^https:\/\//i.test(s) && !isQuickTunnelUrl(s)) return 0; // Permanent HTTPS (Named CF / TS Funnel)
+    if (isQuickTunnelUrl(s)) return 1;
+    if (isLanPrivateUrl(s)) return 2;
+    if (isTailscaleUrl(s)) return 3;
+    return 4;
+  }
+
+  function mergeHostAltUrls(host, endpointsList = [], activeTunnelUrl = "") {
+    if (!host || SIDECAR) return false;
+    const primaryLow = String(host.url || "").trim().toLowerCase();
+    const freshQuickLow = (activeTunnelUrl && isQuickTunnelUrl(activeTunnelUrl))
+      ? String(normalizeServerUrl(activeTunnelUrl) || "").toLowerCase()
+      : "";
+    const prev = Array.isArray(host.altUrls) ? host.altUrls.slice() : [];
+    const mergedMap = new Map();
+
+    const addCand = (raw, allowOldQuick = false) => {
+      const s = normalizeServerUrl(String(raw || "").trim());
+      if (!s || s === "same-origin" || !/^https?:\/\//i.test(s)) return;
+      const low = s.toLowerCase();
+      if (low === primaryLow) return;
+      if (!allowOldQuick && freshQuickLow && isQuickTunnelUrl(s) && low !== freshQuickLow) return;
+      if (!mergedMap.has(low)) mergedMap.set(low, s);
+    };
+
+    for (const oldU of prev) {
+      addCand(oldU, !freshQuickLow);
+    }
+    if (Array.isArray(endpointsList)) {
+      for (const item of endpointsList) {
+        if (!item) continue;
+        const rawU = typeof item === "string" ? item : item.url;
+        addCand(rawU, true);
+      }
+    }
+    if (activeTunnelUrl) {
+      addCand(activeTunnelUrl, true);
+    }
+
+    const next = Array.from(mergedMap.values())
+      .sort((a, b) => routePriorityScore(a) - routePriorityScore(b))
+      .slice(0, 8);
+    const changed = JSON.stringify(prev) !== JSON.stringify(next);
+    host.altUrls = next;
+    return changed;
+  }
+
+  function upsertHost({ name, url, token, altUrls }, activate = true) {
     const normUrl = (SIDECAR && url === "same-origin") ? "same-origin" : normalizeServerUrl(url);
     const cleanTok = String(token || "").trim();
     const cleanName = String(name || "").trim() || (normUrl === "same-origin" ? t("host.localWorkbench") : hostDisplayFallback(normUrl));
+    const inAlts = Array.isArray(altUrls) ? altUrls : [];
 
     let existing = state.hosts.find((h) => h.url.toLowerCase() === normUrl.toLowerCase());
+    if (!existing && !SIDECAR && !isLocalDesktopBrowser() && cleanTok && cleanTok.length >= 12) {
+      existing = state.hosts.find((h) => h.token === cleanTok && h.url !== "same-origin");
+    }
+
     if (existing) {
+      const prevUrl = existing.url;
+      existing.url = normUrl;
       existing.token = cleanTok;
       if (cleanName) existing.name = cleanName;
+      const extraAlts = inAlts.slice();
+      if (prevUrl && prevUrl !== "same-origin" && prevUrl.toLowerCase() !== normUrl.toLowerCase() && !isQuickTunnelUrl(prevUrl)) {
+        extraAlts.push(prevUrl);
+      }
+      mergeHostAltUrls(existing, extraAlts, isQuickTunnelUrl(normUrl) ? normUrl : "");
     } else {
-      existing = { id: makeHostId(), name: cleanName, url: normUrl, token: cleanTok };
+      existing = { id: makeHostId(), name: cleanName, url: normUrl, token: cleanTok, altUrls: [] };
+      mergeHostAltUrls(existing, inAlts, isQuickTunnelUrl(normUrl) ? normUrl : "");
       state.hosts.unshift(existing);
     }
 
@@ -819,7 +913,9 @@
         state.selectedModel = String(data.default_model);
         updateModelPill();
       }
-      const host = upsertHost({ name: data.hostname || hostDisplayFallback(url), url, token: data.token }, true);
+      const altList = Array.isArray(data.lan_urls) ? data.lan_urls.map((x) => x && x.url).filter(Boolean) : [];
+      if (data.tunnel_url) altList.push(data.tunnel_url);
+      const host = upsertHost({ name: data.hostname || hostDisplayFallback(url), url, token: data.token, altUrls: altList }, true);
       showBanner(bannerEl, "ok", t("toast.pairOk", { name: formatHostDisplayName(host.name) }));
       haptic("success");
       showToast(t("toast.pairedAndConnected", { name: formatHostDisplayName(host.name) }));
@@ -857,7 +953,11 @@
       if (!target.hostname) return null;
       const normUrl = normalizeServerUrl(u);
       if (!normUrl) return null;
-      return { url: normUrl, token: t, name: n };
+      const aRaw = (q.get("a") || q.get("alts") || "").trim();
+      const altUrls = aRaw
+        ? aRaw.split(",").map((s) => normalizeServerUrl(s.trim())).filter((s) => s && /^https?:\/\//i.test(s) && s.toLowerCase() !== normUrl.toLowerCase())
+        : [];
+      return { url: normUrl, token: t, name: n, altUrls };
     } catch (_) {
       return null;
     }
@@ -969,7 +1069,9 @@
         state.selectedModel = String(data.default_model);
         updateModelPill();
       }
-      const host = upsertHost({ name, url, token }, true);
+      const altList = Array.isArray(data.lan_urls) ? data.lan_urls.map((x) => x && x.url).filter(Boolean) : [];
+      if (data.tunnel_url) altList.push(data.tunnel_url);
+      const host = upsertHost({ name, url, token, altUrls: altList }, true);
       const dispName = formatHostDisplayName(host.name);
       haptic("success");
       showBanner(bannerEl, "ok", t("toast.connectOk", { name: dispName }));
@@ -1099,6 +1201,8 @@
     state.connectEpoch += 1;
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
+    clearInterval(state.wsPingTimer);
+    state.wsPingTimer = null;
     clearTimeout(state.sidecarPollTimer);
     state.sidecarPollTimer = null;
     clearTimeout(_refreshConvsTimer);
@@ -1307,6 +1411,8 @@
     state.workspaceRoot = "";
     state.currentDir = "";
     state.connPhase = "connecting";
+    state.wsFailStreak = 0;
+    state.failoverInFlight = false;
     state.hostActivatedAt = Date.now();
     state.sidecarAutoFollowed = false;
     state.sidecarAutoFollowInFlight = false;
@@ -1547,6 +1653,105 @@
     }
   }
 
+  function firstTruthyPromise(promises) {
+    return new Promise((resolve) => {
+      let pending = promises.length;
+      if (!pending) {
+        resolve(null);
+        return;
+      }
+      let settled = false;
+      for (const p of promises) {
+        Promise.resolve(p).then(
+          (val) => {
+            if (!settled && val) {
+              settled = true;
+              resolve(val);
+            } else {
+              pending -= 1;
+              if (!settled && pending <= 0) resolve(null);
+            }
+          },
+          () => {
+            pending -= 1;
+            if (!settled && pending <= 0) resolve(null);
+          }
+        );
+      }
+    });
+  }
+
+  async function tryFailoverHostEndpoint(host, epoch) {
+    if (!host || SIDECAR || isLocalDesktopBrowser() || state.failoverInFlight) {
+      return false;
+    }
+    const rawAlts = Array.isArray(host.altUrls) ? host.altUrls : [];
+    const primaryLow = String(host.url || "").trim().toLowerCase();
+    const cands = rawAlts
+      .map((u) => normalizeServerUrl(String(u || "").trim()))
+      .filter((u) => u && u !== "same-origin" && /^https?:\/\//i.test(u) && u.toLowerCase() !== primaryLow);
+    if (!cands.length) {
+      return false;
+    }
+    state.failoverInFlight = true;
+    try {
+      const winner = await firstTruthyPromise(
+        cands.map(async (candUrl) => {
+          try {
+            const resp = await fetchWithTimeout(
+              `${candUrl}/api/server-info`,
+              {
+                method: "GET",
+                cache: "no-store",
+                headers: host.token ? { Authorization: `Bearer ${host.token}` } : {},
+              },
+              3500
+            );
+            if (!resp.ok) return null;
+            const data = await resp.json().catch(() => null);
+            if (!data || data.ok === false) return null;
+            return { url: candUrl, data };
+          } catch (_) {
+            return null;
+          }
+        })
+      );
+      if (!winner || epoch !== state.connectEpoch || getActiveHost()?.id !== host.id) {
+        return false;
+      }
+      const oldPrimary = host.url;
+      host.url = winner.url;
+      const seedBack = oldPrimary && !isQuickTunnelUrl(oldPrimary) ? [oldPrimary] : [];
+      const learned = Array.isArray(winner.data.lan_urls) ? winner.data.lan_urls : [];
+      mergeHostAltUrls(host, [...learned, ...seedBack], winner.data.tunnel_url || "");
+      persistConfig();
+      updateHostDisplays();
+      renderHostSheetList();
+      renderSettingsHosts();
+      showToast(t("toast.routeSwitched", { route: classifyRouteLabel(winner.url) }));
+      state.wsFailStreak = 0;
+      state.failoverInFlight = false;
+      connectWs();
+      return true;
+    } finally {
+      state.failoverInFlight = false;
+    }
+  }
+
+  function scheduleWsReconnectOrFailover(host, epoch) {
+    if (epoch !== state.connectEpoch || !getActiveHost()) return;
+    if (!isLocalDesktopBrowser() && state.wsFailStreak >= 1) {
+      tryFailoverHostEndpoint(host, epoch).then((switched) => {
+        if (switched || epoch !== state.connectEpoch || !getActiveHost()) return;
+        const delay = Math.min(8000, 2500 + (state.wsFailStreak - 1) * 1500);
+        state.reconnectTimer = setTimeout(connectWs, delay);
+      });
+    } else {
+      const delay = Math.min(8000, 2500 + Math.max(0, state.wsFailStreak - 1) * 1500);
+      state.reconnectTimer = setTimeout(connectWs, delay);
+    }
+  }
+
   function connectWs(opts = {}) {
     disconnectWs(opts);
     const host = getActiveHost();
@@ -1575,8 +1780,25 @@
 
       ws.onopen = () => {
         if (epoch !== state.connectEpoch) return;
+        state.wsFailStreak = 0;
+        state.wsLastPongAt = Date.now();
         state.wsConnected = true;
         state.connPhase = "online";
+        clearInterval(state.wsPingTimer);
+        state.wsPingTimer = setInterval(() => {
+          if (epoch !== state.connectEpoch || state.ws !== ws) {
+            clearInterval(state.wsPingTimer);
+            state.wsPingTimer = null;
+            return;
+          }
+          if (ws.readyState === WebSocket.OPEN) {
+            if (Date.now() - state.wsLastPongAt > 45000) {
+              try { ws.close(); } catch (_) {}
+              return;
+            }
+            try { ws.send('{"type":"ping"}'); } catch (_) {}
+          }
+        }, 20000);
         updateHostDisplays();
         updateSendButton();
         fetchServerInfo();
@@ -1589,6 +1811,7 @@
 
       ws.onmessage = (ev) => {
         if (epoch !== state.connectEpoch) return;
+        state.wsLastPongAt = Date.now();
         try {
           const msg = JSON.parse(ev.data);
           onWsEvent(msg);
@@ -1597,13 +1820,14 @@
 
       ws.onclose = () => {
         if (epoch !== state.connectEpoch) return;
+        clearInterval(state.wsPingTimer);
+        state.wsPingTimer = null;
         state.wsConnected = false;
+        state.wsFailStreak += 1;
         state.connPhase = "reconnecting";
         updateHostDisplays();
         updateSendButton();
-        if (getActiveHost()) {
-          state.reconnectTimer = setTimeout(connectWs, 3200);
-        }
+        scheduleWsReconnectOrFailover(host, epoch);
       };
 
       ws.onerror = () => {
@@ -1612,8 +1836,9 @@
       };
     } catch (_) {
       if (epoch === state.connectEpoch && getActiveHost()) {
+        state.wsFailStreak += 1;
         state.connPhase = "reconnecting";
-        state.reconnectTimer = setTimeout(connectWs, 4000);
+        scheduleWsReconnectOrFailover(host, epoch);
       }
     }
   }
@@ -1631,9 +1856,16 @@
       }
 
       const host = getActiveHost();
-      if (host && data.hostname && host.name === hostDisplayFallback(host.url)) {
-        host.name = String(data.hostname);
-        persistConfig();
+      if (host) {
+        let changed = false;
+        if (data.hostname && host.name === hostDisplayFallback(host.url)) {
+          host.name = String(data.hostname);
+          changed = true;
+        }
+        if (mergeHostAltUrls(host, data.lan_urls, data.tunnel_url || "")) {
+          changed = true;
+        }
+        if (changed) persistConfig();
       }
       updateHostDisplays();
       updateSendButton();
@@ -7266,6 +7498,13 @@
         if (SIDECAR) {
           pauseSidecarTransportForHidden();
         }
+      }
+    });
+
+    window.addEventListener("online", () => {
+      if (!SIDECAR && getActiveHost() && !state.wsConnected) {
+        state.wsFailStreak = 1;
+        connectWs();
       }
     });
 

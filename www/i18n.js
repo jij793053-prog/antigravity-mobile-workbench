@@ -615,6 +615,12 @@
       "errCard.switchModelBtn": "换模型",
       "errCard.dismissAria": "关闭错误提示",
       "errCard.retrying": "正在重新发送...",
+      "toast.routeSwitched": "原线路中断，已自动切至可用线路 ({route})",
+      "host.routePermanent": "固定公网域名",
+      "host.routeTunnel": "Cloudflare 隧道",
+      "host.routeLan": "局域网 Wi-Fi",
+      "host.routeTailscale": "Tailscale 内网",
+      "host.routeAlt": "备用线路",
     },
 
     en: {
@@ -1228,6 +1234,12 @@
       "errCard.switchModelBtn": "Switch Model",
       "errCard.dismissAria": "Dismiss error",
       "errCard.retrying": "Retrying...",
+      "toast.routeSwitched": "Route unavailable — switched to {route}",
+      "host.routePermanent": "Permanent Domain",
+      "host.routeTunnel": "Cloudflare Tunnel",
+      "host.routeLan": "LAN Wi-Fi",
+      "host.routeTailscale": "Tailscale",
+      "host.routeAlt": "Backup Route",
     },
   };
 
