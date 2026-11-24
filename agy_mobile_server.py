@@ -41,7 +41,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -197,6 +197,13 @@ _MAX_CONCURRENT_RUNS = 4
 _WS_CLIENTS: set[web.WebSocketResponse] = set()
 _MAX_WS_CLIENTS = 32
 _LOOP: asyncio.AbstractEventLoop | None = None
+
+_VALID_PERMISSION_MODES = ("auto", "ask", "bypass")
+_MOBILE_ASK_PROFILE_NAME = "mobile_ask_profile"
+_INTERACTION_ID_RE = re.compile(r"^int_[0-9a-f]{6,32}$")
+_VALID_PERM_DECISIONS = ("allow_once", "allow_always", "reject_once", "reject_always", "cancel")
+_PENDING_INTERACTIONS_LOCK = threading.Lock()
+_PENDING_INTERACTIONS: dict[str, dict[str, Any]] = {}
 
 _PAIR_PIN_LOCK = threading.Lock()
 _RUNTIME_PAIR_PIN: str = ""
@@ -703,9 +710,33 @@ def _load_config_unlocked() -> dict[str, Any]:
     if not isinstance(cfg.get("conv_reverts"), dict):
         cfg["conv_reverts"] = {}
         changed = True
+    if str(cfg.get("permission_mode") or "").strip().lower() not in _VALID_PERMISSION_MODES:
+        cfg["permission_mode"] = "auto"
+        changed = True
     if changed:
         _save_config_unlocked(cfg)
     return cfg
+
+
+def get_permission_mode() -> str:
+    cfg = load_or_create_config()
+    mode = str(cfg.get("permission_mode") or "").strip().lower()
+    return mode if mode in _VALID_PERMISSION_MODES else "auto"
+
+
+def _ensure_mobile_ask_profile() -> str:
+    """Create isolated strict CLI profile directory (settings.json only; shares brain/conversations)."""
+    prof_dir = CLI_BRAIN.parent / _MOBILE_ASK_PROFILE_NAME
+    prof_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = prof_dir / "settings.json"
+    desired = json.dumps({"toolPermission": "strict", "agentMode": ""}, indent=2) + "\n"
+    try:
+        cur = settings_path.read_text(encoding="utf-8", errors="replace") if settings_path.is_file() else ""
+        if cur != desired:
+            settings_path.write_text(desired, encoding="utf-8")
+    except Exception:
+        pass
+    return _MOBILE_ASK_PROFILE_NAME
 
 
 def _save_config_unlocked(cfg: dict[str, Any]) -> None:
@@ -2452,15 +2483,210 @@ def _get_cli_first_step_time(cli_cid: str) -> str:
     return ""
 
 
+_RECOMMENDED_TAG_RE = re.compile(
+    r"^\s*(?:\(\s*Recommended\s*\)|\[\s*Recommended\s*\]|（\s*推荐\s*）|【\s*推荐\s*】)\s*",
+    re.IGNORECASE,
+)
+_USER_CHOICE_PREFIX_RE = re.compile(
+    r"^(?:我选择|已选择|选择|选|Selected|Choice)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_recommended_tag(text: str) -> str:
+    return _RECOMMENDED_TAG_RE.sub("", str(text or "").strip()).strip()
+
+
+def _parse_ask_question_args(args: Any) -> list[dict[str, Any]]:
+    if not isinstance(args, dict):
+        return []
+    raw_qs = args.get("questions")
+    if isinstance(raw_qs, str):
+        try:
+            raw_qs = json.loads(raw_qs)
+        except Exception:
+            return []
+    if not isinstance(raw_qs, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_qs:
+        if not isinstance(item, dict):
+            continue
+        q_txt = str(item.get("question") or "").strip()
+        raw_opts = item.get("options")
+        if isinstance(raw_opts, str):
+            try:
+                raw_opts = json.loads(raw_opts)
+            except Exception:
+                raw_opts = []
+        opts: list[str] = []
+        if isinstance(raw_opts, list):
+            for o in raw_opts:
+                s_o = str(o if not isinstance(o, dict) else (o.get("label") or o.get("text") or o.get("value") or "")).strip()
+                if s_o:
+                    opts.append(s_o)
+        if not q_txt and not opts:
+            continue
+        out.append({
+            "question": q_txt,
+            "is_multi_select": bool(item.get("is_multi_select", False)),
+            "options": opts,
+        })
+    return out
+
+
+def _strip_generic_timestamps(raw_content: str) -> tuple[str, str]:
+    lines = str(raw_content or "").replace("\r\n", "\n").split("\n")
+    idx = 0
+    completed_at = ""
+    while idx < len(lines):
+        ln = lines[idx].strip()
+        if ln.startswith("Created At:"):
+            idx += 1
+        elif ln.startswith("Completed At:"):
+            completed_at = ln.split(":", 1)[1].strip()
+            idx += 1
+        else:
+            break
+    body = "\n".join(lines[idx:]).strip()
+    return body, completed_at
+
+
+def _match_answer_to_options(ans_text: str, options: list[str], is_multi: bool) -> tuple[list[int], str]:
+    cleaned = _USER_CHOICE_PREFIX_RE.sub("", str(ans_text or "").strip()).strip()
+    if not cleaned:
+        return [], ""
+    low_clean = cleaned.lower()
+    stripped_clean = _strip_recommended_tag(cleaned).lower()
+    if not options:
+        return [], cleaned
+
+    # Direct full-string match first
+    for idx, opt in enumerate(options):
+        o_str = str(opt or "").strip()
+        o_stripped = _strip_recommended_tag(o_str)
+        if low_clean == o_str.lower() or stripped_clean == o_stripped.lower():
+            return [idx], ""
+
+    if is_multi:
+        selected: list[int] = []
+        remaining = cleaned
+        # Greedy match longer options first so substrings don't shadow full options
+        indexed_opts = sorted(enumerate(options), key=lambda kv: len(str(kv[1] or "")), reverse=True)
+        for idx, opt in indexed_opts:
+            o_str = str(opt or "").strip()
+            o_stripped = _strip_recommended_tag(o_str)
+            matched = False
+            for cand in (o_str, o_stripped):
+                if cand and cand.lower() in remaining.lower():
+                    pos = remaining.lower().find(cand.lower())
+                    remaining = (remaining[:pos] + " " + remaining[pos + len(cand):]).strip()
+                    matched = True
+                    break
+            if matched:
+                selected.append(idx)
+        selected.sort()
+        leftover = re.sub(r"^[,;、\s\n]+|[,;、\s\n]+$", "", remaining).strip()
+        if selected:
+            return selected, leftover
+        # Fallback token split
+        parts = [p.strip() for p in re.split(r"[\n,;；、]+", cleaned) if p.strip()]
+        custom_parts: list[str] = []
+        for p in parts:
+            p_low = _strip_recommended_tag(p).lower()
+            hit = next(
+                (i for i, o in enumerate(options) if _strip_recommended_tag(str(o or "")).lower() == p_low or str(o or "").strip().lower() == p.lower()),
+                None,
+            )
+            if hit is not None:
+                if hit not in selected:
+                    selected.append(hit)
+            else:
+                custom_parts.append(p)
+        selected.sort()
+        return selected, "; ".join(custom_parts)
+
+    # Numbered single choice fallback (e.g. "1" or "选1" or prefix match)
+    m_num = re.match(r"^(?:第\s*)?(\d+)(?:\s*(?:个|项|号))?$", cleaned)
+    if m_num:
+        n_idx = int(m_num.group(1)) - 1
+        if 0 <= n_idx < len(options):
+            return [n_idx], ""
+    if len(stripped_clean) >= 4:
+        for idx, opt in enumerate(options):
+            o_stripped = _strip_recommended_tag(str(opt or "")).lower()
+            if o_stripped and o_stripped.startswith(stripped_clean):
+                return [idx], ""
+    return [], cleaned
+
+
+def _parse_ask_question_answers(body: str, questions: list[dict[str, Any]]) -> tuple[list[str], list[list[int]], list[str]]:
+    text = str(body or "").replace("\r\n", "\n").strip()
+    n_qs = len(questions)
+    answers = [""] * n_qs
+    sel_indices: list[list[int]] = [[] for _ in range(n_qs)]
+    custom_answers = [""] * n_qs
+    if not text or n_qs == 0:
+        return answers, sel_indices, custom_answers
+
+    markers = list(re.finditer(r"(?:^|\n)A(\d+)\s*[:：]\s*", text))
+    if markers:
+        for pos, m in enumerate(markers):
+            q_num = int(m.group(1))
+            q_idx = q_num - 1
+            if not (0 <= q_idx < n_qs):
+                continue
+            start = m.end()
+            end = markers[pos + 1].start() if (pos + 1 < len(markers)) else len(text)
+            ans_raw = text[start:end].strip()
+            answers[q_idx] = ans_raw
+            q_obj = questions[q_idx]
+            idxs, cust = _match_answer_to_options(ans_raw, q_obj.get("options") or [], bool(q_obj.get("is_multi_select", False)))
+            sel_indices[q_idx] = idxs
+            custom_answers[q_idx] = cust
+    else:
+        q0 = questions[0]
+        cleaned = _USER_CHOICE_PREFIX_RE.sub("", text).strip()
+        answers[0] = cleaned
+        idxs, cust = _match_answer_to_options(cleaned, q0.get("options") or [], bool(q0.get("is_multi_select", False)))
+        sel_indices[0] = idxs
+        custom_answers[0] = cust
+    return answers, sel_indices, custom_answers
+
+
+def _extract_plan_feedback_meta(tc: dict[str, Any]) -> dict[str, Any] | None:
+    targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+    am = targs.get("ArtifactMetadata")
+    if isinstance(am, str):
+        try:
+            am = json.loads(am)
+        except Exception:
+            am = None
+    if not isinstance(am, dict):
+        return None
+    if not (bool(am.get("RequestFeedback")) and bool(am.get("UserFacing"))):
+        return None
+    fp = str(targs.get("Path") or targs.get("TargetFile") or "").strip().strip('"')
+    return {
+        "summary": str(am.get("Summary") or "").strip(),
+        "path": fp,
+    }
+
+
 def _summarize_tool(tc: dict[str, Any]) -> dict[str, str]:
     name = str(tc.get("name") or "")
     args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
     target = ""
-    for k in ("Path", "TargetFile", "CommandLine", "toolSummary", "query", "Url", "path", "Role"):
-        val = args.get(k)
-        if val:
-            target = str(val).strip().splitlines()[0][:80]
-            break
+    if name == "ask_question":
+        qs = _parse_ask_question_args(args)
+        if qs and qs[0].get("question"):
+            target = str(qs[0]["question"]).strip().splitlines()[0][:80]
+    if not target:
+        for k in ("Path", "TargetFile", "CommandLine", "toolSummary", "query", "Url", "path", "Role"):
+            val = args.get(k)
+            if val:
+                target = str(val).strip().splitlines()[0][:80]
+                break
     return {"name": name, "target": target}
 
 
@@ -2526,12 +2752,19 @@ def _extract_conv_meta(cid: str, tf: pathlib.Path, source: str, mtime: float, mt
         title = title or first_u[:42] or f"对话 {cid[:8]}"
 
     tail_looks_running = False
+    tail_looks_waiting = False
     if tail_step is not None:
         tt = str(tail_step.get("type") or "")
-        if tt != "PLANNER_RESPONSE" or str(tail_step.get("status") or "").upper() != "DONE" or bool(tail_step.get("tool_calls")):
+        st_u = str(tail_step.get("status") or "").upper()
+        tcs_tail = tail_step.get("tool_calls") or []
+        if tt == "PLANNER_RESPONSE" and st_u == "DONE" and tcs_tail and all(
+            isinstance(tc, dict) and str(tc.get("name") or "") == "ask_question" for tc in tcs_tail
+        ):
+            tail_looks_waiting = True
+        elif tt != "PLANNER_RESPONSE" or st_u != "DONE" or bool(tcs_tail):
             tail_looks_running = True
 
-    meta = {
+    meta: dict[str, Any] = {
         "id": cid,
         "shortId": cid[:8],
         "title": title,
@@ -2541,6 +2774,7 @@ def _extract_conv_meta(cid: str, tf: pathlib.Path, source: str, mtime: float, mt
         "updatedAt": mtime,
         "stepCount": len(steps),
         "_tailRunning": tail_looks_running,
+        "_tailWaiting": tail_looks_waiting,
     }
     if not is_active:
         with _CONV_META_CACHE_LOCK:
@@ -2587,8 +2821,11 @@ def _scan_source_conversations(
         if meta is None:
             continue
         tail_running = bool(meta.pop("_tailRunning", False))
+        tail_waiting = bool(meta.pop("_tailWaiting", False))
         is_running = is_act or (tail_running and (now_ts - mtime < 180.0))
         meta["status"] = "running" if is_running else "idle"
+        if tail_waiting and not is_running:
+            meta["waitingInteraction"] = True
         bucket.append(meta)
     return bucket
 
@@ -2639,7 +2876,10 @@ def list_all_conversations(
                 if d_meta is None:
                     continue
                 tr = bool(d_meta.pop("_tailRunning", False))
+                tw = bool(d_meta.pop("_tailWaiting", False))
                 d_meta["status"] = "running" if (d_cid in active_ids or (tr and now_ts - st.st_mtime < 180.0)) else "idle"
+                if tw and d_meta["status"] != "running":
+                    d_meta["waitingInteraction"] = True
                 desktop_items.append(d_meta)
                 seen.add(d_cid)
             except OSError:
@@ -2662,7 +2902,10 @@ def list_all_conversations(
                     )
                     if c_meta is not None:
                         tr = bool(c_meta.pop("_tailRunning", False))
+                        tw = bool(c_meta.pop("_tailWaiting", False))
                         c_meta["status"] = "running" if (aliased_cli in active_ids or (tr and now_ts - c_st.st_mtime < 180.0)) else "idle"
+                        if tw and c_meta["status"] != "running":
+                            c_meta["waitingInteraction"] = True
                         c_item = c_meta
             except OSError:
                 c_item = None
@@ -2674,6 +2917,10 @@ def list_all_conversations(
                         d_item["preview"] = c_item["preview"]
                     if c_item.get("model"):
                         d_item["model"] = c_item["model"]
+                    if c_item.get("waitingInteraction"):
+                        d_item["waitingInteraction"] = True
+                    elif d_item.get("waitingInteraction"):
+                        d_item.pop("waitingInteraction", None)
                 if c_item.get("status") == "running" or aliased_cli in active_ids or d_item["id"] in active_ids:
                     d_item["status"] = "running"
 
@@ -2692,7 +2939,10 @@ def list_all_conversations(
                 if meta is None:
                     continue
                 tr = bool(meta.pop("_tailRunning", False))
+                tw = bool(meta.pop("_tailWaiting", False))
                 meta["status"] = "running" if (m_cid in active_ids or (tr and now_ts - st.st_mtime < 180.0)) else "idle"
+                if tw and meta["status"] != "running":
+                    meta["waitingInteraction"] = True
                 if m_cid in qq_dm_cids and m_cid not in mobile_own:
                     meta["subSource"] = "qq_dm"
                 own_mobile_items.append(meta)
@@ -2742,6 +2992,14 @@ def list_all_conversations(
                     "stepCount": 1,
                 })
 
+    waiting_cids = _get_waiting_interaction_cids()
+    if waiting_cids:
+        for r in result:
+            rcid = str(r.get("id") or "")
+            ralias = str(aliases.get(rcid) or "")
+            if rcid in waiting_cids or (ralias and ralias in waiting_cids):
+                r["waitingInteraction"] = True
+
     return result[:limit]
 
 
@@ -2758,11 +3016,26 @@ def load_conversation_detail(
 
     if tf is not None and steps:
         needed: set[int] = set()
-        for s in steps:
+        watch_generic_until = -1
+        for s_idx, s in enumerate(steps):
             tfs = s.get("truncated_fields") or []
             si = s.get("step_index")
+            st_t = str(s.get("type") or "")
+            has_interesting_tc = False
+            if st_t == "PLANNER_RESPONSE":
+                tcs_c = s.get("tool_calls") or []
+                for tc in tcs_c:
+                    if isinstance(tc, dict) and tc.get("name") in ("ask_question", "write_file", "edit_file", "write_to_file"):
+                        has_interesting_tc = True
+                        if tc.get("name") == "ask_question":
+                            watch_generic_until = s_idx + 8
+                        break
             if isinstance(si, int) and tfs:
-                if s.get("type") in ("PLANNER_RESPONSE", "USER_INPUT") and "content" in tfs:
+                if st_t in ("PLANNER_RESPONSE", "USER_INPUT") and "content" in tfs:
+                    needed.add(si)
+                elif st_t == "PLANNER_RESPONSE" and "tool_calls" in tfs and has_interesting_tc:
+                    needed.add(si)
+                elif st_t == "GENERIC" and "content" in tfs and s_idx <= watch_generic_until:
                     needed.add(si)
         if needed:
             full_map = _load_full_steps(tf, needed)
@@ -2796,7 +3069,8 @@ def load_conversation_detail(
     last_step_time = ""
     pending_tool_time = ""
 
-    for s in steps:
+    n_steps = len(steps)
+    for s_idx, s in enumerate(steps):
         step_time = str(s.get("created_at") or "").strip()
         if step_time:
             last_step_time = step_time
@@ -2843,34 +3117,147 @@ def load_conversation_detail(
             if th:
                 pending_thinking.append(th)
             tcs = s.get("tool_calls") or []
-            for tc in tcs:
-                if isinstance(tc, dict) and tc.get("name"):
-                    pending_tools.append(_summarize_tool(tc))
-                    if msg_time:
-                        pending_tool_time = msg_time
-                    tname = str(tc["name"])
-                    targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
-                    if tname in ("write_file", "edit_file", "write_to_file", "replace_file_content"):
-                        fp = str(targs.get("Path") or targs.get("TargetFile") or "").strip()
-                        if fp:
-                            deliverable_cands.append(fp)
+
+            # Inspect immediate tool results & next user turn so ask_question / permission / plan cards stay structured
+            generic_steps: list[dict[str, Any]] = []
+            next_user_step: dict[str, Any] | None = None
+            has_later_turn = False
+            collecting_generic = True
+            for j in range(s_idx + 1, n_steps):
+                sj = steps[j]
+                sj_t = str(sj.get("type") or "")
+                if sj_t in ("EPHEMERAL_MESSAGE", "CHECKPOINT"):
+                    continue
+                if collecting_generic and sj_t == "GENERIC":
+                    generic_steps.append(sj)
+                    continue
+                collecting_generic = False
+                if sj_t in ("PLANNER_RESPONSE", "USER_INPUT"):
+                    has_later_turn = True
+                    if sj_t == "USER_INPUT" and sj.get("source") == "USER_EXPLICIT" and next_user_step is None:
+                        next_user_step = sj
+                    break
+
+            step_interactions: list[dict[str, Any]] = []
+            for tc_pos, tc in enumerate(tcs):
+                if not isinstance(tc, dict) or not tc.get("name"):
+                    continue
+                t_sum = _summarize_tool(tc)
+                g_match = generic_steps[tc_pos] if tc_pos < len(generic_steps) else None
+                if isinstance(g_match, dict):
+                    g_st = str(g_match.get("status") or "").upper()
+                    g_body, _ = _strip_generic_timestamps(str(g_match.get("content") or ""))
+                    if g_st in ("REJECTED", "CANCELED", "CANCELLED") or g_body.lower().startswith(
+                        ("rejected", "user rejected", "denied", "permission denied")
+                    ):
+                        t_sum["state"] = "REJECTED"
+                pending_tools.append(t_sum)
+                if msg_time:
+                    pending_tool_time = msg_time
+                tname = str(tc["name"])
+                targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                if tname in ("write_file", "edit_file", "write_to_file", "replace_file_content"):
+                    fp = str(targs.get("Path") or targs.get("TargetFile") or "").strip().strip('"')
+                    if fp:
+                        deliverable_cands.append(fp)
+
+                if tname == "ask_question":
+                    q_list = _parse_ask_question_args(targs)
+                    if q_list:
+                        g_q = g_match
+                        if g_q is None or not (
+                            re.search(r"(?:^|\n)A1\s*[:：]", str(g_q.get("content") or ""))
+                            or str(g_q.get("status") or "").upper() in ("WAITING", "RUNNING", "PENDING", "CANCELED", "CANCELLED", "REJECTED")
+                        ):
+                            for gc in generic_steps:
+                                gc_body = str(gc.get("content") or "")
+                                gc_st = str(gc.get("status") or "").upper()
+                                if re.search(r"(?:^|\n)A1\s*[:：]", gc_body) or gc_st in ("WAITING", "RUNNING", "PENDING", "CANCELED", "CANCELLED", "REJECTED"):
+                                    g_q = gc
+                                    break
+                        answers = [""] * len(q_list)
+                        sel_indices: list[list[int]] = [[] for _ in range(len(q_list))]
+                        custom_answers = [""] * len(q_list)
+                        answered_at = ""
+                        ix_status = "pending" if not has_later_turn else "answered"
+
+                        if isinstance(g_q, dict):
+                            g_st = str(g_q.get("status") or "").upper()
+                            g_body, comp_at = _strip_generic_timestamps(str(g_q.get("content") or ""))
+                            answered_at = comp_at or str(g_q.get("created_at") or "").strip()
+                            g_low = g_body.strip().lower()
+                            if g_st in ("WAITING", "RUNNING", "PENDING"):
+                                ix_status = "pending"
+                            elif g_st in ("CANCELED", "CANCELLED", "REJECTED", "ERROR") or g_low.startswith(
+                                ("user skip", "user cancel", "cancelled", "canceled", "dismissed", "skipped")
+                            ):
+                                ix_status = "cancelled"
+                            else:
+                                answers, sel_indices, custom_answers = _parse_ask_question_answers(g_body, q_list)
+                                ix_status = "answered" if (any(answers) or has_later_turn) else "pending"
+                        elif next_user_step is not None:
+                            u_ans_raw = str(next_user_step.get("content") or "")
+                            u_ans_atts = _extract_user_attachments(u_ans_raw, next_user_step.get("media"))
+                            u_ans_clean = _clean_user_text(u_ans_raw, strip_att_note=bool(u_ans_atts))
+                            answers, sel_indices, custom_answers = _parse_ask_question_answers(u_ans_clean, q_list)
+                            ix_status = "answered"
+                            answered_at = str(next_user_step.get("created_at") or "").strip()
+                        elif has_later_turn:
+                            ix_status = "answered"
+
+                        step_interactions.append({
+                            "id": f"hist_q_{s.get('step_index', s_idx)}_{tc_pos}",
+                            "kind": "ask_question",
+                            "source": own_src,
+                            "live": False,
+                            "status": ix_status,
+                            "questions": q_list,
+                            "answers": answers,
+                            "selectedIndices": sel_indices,
+                            "customAnswers": custom_answers,
+                            "answeredAt": answered_at,
+                        })
+                elif tname in ("write_file", "edit_file", "write_to_file"):
+                    pf_meta = _extract_plan_feedback_meta(tc)
+                    if pf_meta is not None:
+                        pf_status = "pending" if not has_later_turn else "answered"
+                        if isinstance(g_match, dict):
+                            gst = str(g_match.get("status") or "").upper()
+                            if gst in ("WAITING", "RUNNING", "PENDING"):
+                                pf_status = "pending"
+                            elif gst in ("CANCELED", "CANCELLED", "REJECTED"):
+                                pf_status = "cancelled"
+                        step_interactions.append({
+                            "id": f"hist_p_{s.get('step_index', s_idx)}_{tc_pos}",
+                            "kind": "plan_feedback",
+                            "source": own_src,
+                            "live": False,
+                            "status": pf_status,
+                            "summary": pf_meta["summary"],
+                            "path": pf_meta["path"],
+                        })
+
             a_txt = _clean_assistant_text(str(s.get("content") or ""))
-            if a_txt:
-                for mf in re.finditer(r"file:///([^)\s\"#>]+)", a_txt):
-                    u_dec = urllib.parse.unquote(mf.group(1)).split("#")[0].strip()
-                    if re.match(r"^/[A-Za-z]:/", u_dec):
-                        u_dec = u_dec[1:]
-                    deliverable_cands.append(u_dec)
-                own_messages.append({
+            if a_txt or step_interactions:
+                if a_txt:
+                    for mf in re.finditer(r"file:///([^)\s\"#>]+)", a_txt):
+                        u_dec = urllib.parse.unquote(mf.group(1)).split("#")[0].strip()
+                        if re.match(r"^/[A-Za-z]:/", u_dec):
+                            u_dec = u_dec[1:]
+                        deliverable_cands.append(u_dec)
+                a_msg: dict[str, Any] = {
                     "role": "assistant",
                     "text": a_txt,
                     "tools": list(pending_tools),
                     "thinking": "\n".join(pending_thinking)[-2000:],
                     "model": last_model,
                     "time": msg_time,
-                    "isFinal": not bool(tcs),
+                    "isFinal": (not bool(tcs)) and (not step_interactions),
                     "_src": own_src,
-                })
+                }
+                if step_interactions:
+                    a_msg["interactions"] = step_interactions
+                own_messages.append(a_msg)
                 pending_tools.clear()
                 pending_thinking.clear()
                 pending_tool_time = ""
@@ -2948,6 +3335,7 @@ def load_conversation_detail(
         except Exception:
             continue
 
+    live_pending_ix = get_pending_interactions_for_cid(cid, aliased_cli)
     active_run_snap = None
     with _ACTIVE_RUNS_LOCK:
         ar = _ACTIVE_RUNS.get(cid) or (aliased_cli and _ACTIVE_RUNS.get(aliased_cli)) or None
@@ -2958,6 +3346,7 @@ def load_conversation_detail(
                 "tools": list(ar.get("tools") or []),
                 "streamText": "".join(ar.get("chunks") or []),
                 "startedAt": ar.get("started_at"),
+                "pendingInteractions": live_pending_ix,
             }
 
     out_slice = messages[-120:] if _apply_revert_filter else messages
@@ -2972,6 +3361,7 @@ def load_conversation_detail(
         "messages": out_msgs,
         "deliverables": deliverables,
         "activeRun": active_run_snap,
+        "pendingInteractions": live_pending_ix,
     }
     if _include_parent or _include_cli_alias:
         detail_out["queue"] = get_conv_queue_snapshot(cid)
@@ -2980,13 +3370,36 @@ def load_conversation_detail(
     return detail_out
 
 
+def _format_bridge_msg_line(m: dict[str, Any], max_chars: int = 1600) -> str:
+    role = "用户" if m.get("role") == "user" else "助手"
+    parts: list[str] = []
+    txt = str(m.get("text") or "").strip()
+    if txt:
+        parts.append(txt)
+    for ix in (m.get("interactions") or []):
+        if isinstance(ix, dict) and ix.get("kind") == "ask_question":
+            qs = ix.get("questions") or []
+            ans_list = ix.get("answers") or []
+            for qi, q in enumerate(qs):
+                qt = str((q or {}).get("question") or "").strip()
+                ans = str(ans_list[qi] if qi < len(ans_list) else "").strip()
+                if qt:
+                    parts.append(f"[询问选项] {qt}" + (f" -> [已选] {ans}" if ans else ""))
+    joined = "\n".join(parts).strip()
+    if not joined:
+        return ""
+    if len(joined) > max_chars:
+        joined = joined[: max_chars - 1] + "…"
+    return f"[{role}] {joined}"
+
+
 def _build_desktop_initial_bridge(desktop_cid: str) -> tuple[str, str]:
     """Build initial Desktop->CLI context bridge from pure Desktop-only turns and return (text, latest_iso)."""
     detail = load_conversation_detail(desktop_cid, _include_parent=False, _include_cli_alias=False)
     msgs = detail.get("messages") or []
     if not msgs:
         return "", ""
-    recent = [m for m in msgs if str(m.get("text") or "").strip()][-6:]
+    recent = [m for m in msgs if str(m.get("text") or "").strip() or (m.get("interactions") or [])][-6:]
     if not recent:
         return "", ""
     latest_iso = ""
@@ -3003,16 +3416,13 @@ def _build_desktop_initial_bridge(desktop_cid: str) -> tuple[str, str]:
     body_lines: list[str] = []
     used = 0
     for m in reversed(recent):
-        role = "用户" if m.get("role") == "user" else "助手"
-        txt = str(m.get("text") or "").strip()
-        if len(txt) > 1600:
-            txt = txt[:1599] + "…"
-        line = f"[{role}] {txt}"
+        line = _format_bridge_msg_line(m, 1600)
+        if not line:
+            continue
         add_len = len(line) + (1 if body_lines else 0)
         if used + add_len > budget:
             if not body_lines:
-                avail = max(80, budget - len(f"[{role}] ") - 1)
-                body_lines.append(f"[{role}] {txt[:avail]}…")
+                body_lines.append(line[: max(80, budget - 1)] + "…")
             break
         body_lines.append(line)
         used += add_len
@@ -3044,8 +3454,8 @@ def _extract_desktop_delta_context(
     wm_ts = _parse_iso_ts(watermark_iso)
     delta_msgs: list[dict[str, Any]] = []
     for m in msgs:
-        txt = str(m.get("text") or "").strip()
-        if not txt:
+        has_content = bool(str(m.get("text") or "").strip() or (m.get("interactions") or []))
+        if not has_content:
             continue
         m_time = str(m.get("time") or "").strip()
         m_ts = _parse_iso_ts(m_time)
@@ -3073,16 +3483,13 @@ def _extract_desktop_delta_context(
     body_lines: list[str] = []
     used = 0
     for m in reversed(selected):
-        role = "用户" if m.get("role") == "user" else "助手"
-        txt = str(m.get("text") or "").strip()
-        if len(txt) > max_msg_chars:
-            txt = txt[: max_msg_chars - 1] + "…"
-        line = f"[{role}] {txt}"
+        line = _format_bridge_msg_line(m, max_msg_chars)
+        if not line:
+            continue
         add_len = len(line) + (1 if body_lines else 0)
         if used + add_len > budget:
             if not body_lines:
-                avail = max(80, budget - len(f"[{role}] ") - 1)
-                body_lines.append(f"[{role}] {txt[:avail]}…")
+                body_lines.append(line[: max(80, budget - 1)] + "…")
             break
         body_lines.append(line)
         used += add_len
@@ -3158,6 +3565,7 @@ def _find_active_run(cid: str) -> dict[str, Any] | None:
 
 
 def _clone_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    pm = str(item.get("permission_mode") or "").strip().lower()
     return {
         "id": str(item.get("id") or ""),
         "prompt": str(item.get("prompt") or ""),
@@ -3165,6 +3573,7 @@ def _clone_queue_item(item: dict[str, Any]) -> dict[str, Any]:
         "attachments": list(item.get("attachments") or []),
         "swarm_mode": bool(item.get("swarm_mode", False)),
         "priority": "urgent" if str(item.get("priority") or "") == "urgent" else "normal",
+        "permission_mode": pm if pm in _VALID_PERMISSION_MODES else "",
         "created_at": str(item.get("created_at") or ""),
     }
 
@@ -3260,6 +3669,95 @@ def _broadcast_queue_updated(cid: str, queue_snap: list[dict[str, Any]] | None =
     return snap
 
 
+def _serialize_interaction(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(rec.get("id") or ""),
+        "kind": str(rec.get("kind") or "permission"),
+        "run_id": str(rec.get("run_id") or ""),
+        "conversation_id": str(rec.get("conversation_id") or ""),
+        "live": bool(rec.get("live", True)),
+        "status": str(rec.get("status") or "pending"),
+        "created_at": str(rec.get("created_at") or ""),
+        "tool_name": str(rec.get("tool_name") or ""),
+        "tool_kind": str(rec.get("tool_kind") or "other"),
+        "title": str(rec.get("title") or ""),
+        "command": str(rec.get("command") or ""),
+        "description": str(rec.get("description") or ""),
+        "options": [dict(o) for o in (rec.get("options") or []) if isinstance(o, dict)],
+        "questions": [dict(q) for q in (rec.get("questions") or []) if isinstance(q, dict)],
+        "decision": str(rec.get("decision") or ""),
+        "option_id": str(rec.get("option_id") or ""),
+        "answered_at": str(rec.get("answered_at") or ""),
+    }
+
+
+def get_pending_interactions_for_cid(cid: str, aliased_cli: str = "") -> list[dict[str, Any]]:
+    targets = {k for k in (str(cid or "").strip(), str(aliased_cli or "").strip()) if k}
+    if not targets:
+        return []
+    canon, alias, extra = _get_cid_alias_candidates(next(iter(targets)))
+    targets.update(k for k in (canon, alias, *extra) if k)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    with _PENDING_INTERACTIONS_LOCK:
+        for rec in _PENDING_INTERACTIONS.values():
+            if rec.get("status") != "pending":
+                continue
+            r_cids = {str(rec.get("conversation_id") or ""), str(rec.get("cli_cid") or ""), str(rec.get("desktop_cid") or "")}
+            if not (targets & r_cids):
+                continue
+            ix_id = str(rec.get("id") or "")
+            if ix_id and ix_id not in seen:
+                seen.add(ix_id)
+                out.append(_serialize_interaction(rec))
+    out.sort(key=lambda x: str(x.get("created_at") or ""))
+    return out
+
+
+def _get_waiting_interaction_cids() -> set[str]:
+    out: set[str] = set()
+    with _PENDING_INTERACTIONS_LOCK:
+        for rec in _PENDING_INTERACTIONS.values():
+            if rec.get("status") != "pending":
+                continue
+            for k in (rec.get("conversation_id"), rec.get("cli_cid"), rec.get("desktop_cid")):
+                s = str(k or "").strip()
+                if s:
+                    out.add(s)
+    return out
+
+
+def _cancel_pending_interactions_for_run(run_id: str, reason: str = "cancelled") -> None:
+    if not run_id:
+        return
+    resolved_payloads: list[dict[str, Any]] = []
+    with _PENDING_INTERACTIONS_LOCK:
+        for ix_id, rec in list(_PENDING_INTERACTIONS.items()):
+            if str(rec.get("run_id") or "") != run_id:
+                continue
+            if rec.get("status") == "pending":
+                rec["status"] = "cancelled"
+                rec["decision"] = reason
+                rec["answered_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                rec["_resolution"] = {"cancelled": True, "reason": reason}
+                evt = rec.get("_event")
+                if isinstance(evt, threading.Event):
+                    evt.set()
+                resolved_payloads.append({
+                    "type": "run_interaction_resolved",
+                    "conversation_id": str(rec.get("conversation_id") or ""),
+                    "run_id": run_id,
+                    "interaction_id": ix_id,
+                    "kind": str(rec.get("kind") or "permission"),
+                    "status": "cancelled",
+                    "decision": reason,
+                    "option_id": "",
+                })
+            _PENDING_INTERACTIONS.pop(ix_id, None)
+    for pl in resolved_payloads:
+        _broadcast_ws(pl)
+
+
 def _terminate_proc_safely(proc: subprocess.Popen[Any] | None) -> None:
     if proc is None or proc.poll() is not None:
         return
@@ -3305,7 +3803,9 @@ def _build_queue_item(
     attachments: list[str],
     swarm_mode: bool = False,
     priority: str = "normal",
+    permission_mode: str = "",
 ) -> dict[str, Any]:
+    pm = str(permission_mode or "").strip().lower()
     return {
         "id": f"q_{secrets.token_hex(5)}",
         "prompt": str(prompt or "").strip(),
@@ -3313,6 +3813,7 @@ def _build_queue_item(
         "attachments": list(attachments),
         "swarm_mode": bool(swarm_mode),
         "priority": "urgent" if priority == "urgent" else "normal",
+        "permission_mode": pm if pm in _VALID_PERMISSION_MODES else "",
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -3344,6 +3845,7 @@ def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
             str(item.get("model") or ""),
             list(item.get("attachments") or []),
             bool(item.get("swarm_mode", False)),
+            permission_mode=str(item.get("permission_mode") or "") or None,
         )
         if not res.get("ok"):
             # Re-insert at index 0 so the user's queued message is never silently lost
@@ -3372,12 +3874,578 @@ def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
             _DRAINING_CIDS.discard(canon)
 
 
+_ACP_MODEL_ALIASES: dict[str, str] = {
+    "gemini-pro-orchestrator-g1-pro": "gemini-pro-orchestrator",
+    "claude-opus-5-5-thinking": "claude-opus-5-5-high",
+    "claude-sonnet-5-5-thinking": "claude-sonnet-5-5-high",
+}
+
+
+def _resolve_acp_model_id(requested_model: str, available_ids: set[str]) -> str:
+    req = str(requested_model or "").strip()
+    if not req:
+        return "gemini-4-neon-medium"
+    if not available_ids or req in available_ids:
+        return req
+    mapped = _ACP_MODEL_ALIASES.get(req)
+    if mapped and mapped in available_ids:
+        return mapped
+    return req
+
+
+def _extract_acp_perm_details(tc: dict[str, Any], params: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    tname = str(tc.get("name") or params.get("toolName") or "").strip() or "tool"
+    tkind = str(tc.get("kind") or "other").strip().lower() or "other"
+    title = str(tc.get("title") or tname).strip()
+    raw_args = tc.get("args") if isinstance(tc.get("args"), dict) else (tc.get("rawInput") if isinstance(tc.get("rawInput"), dict) else {})
+    cmd_preview = ""
+    for k in ("CommandLine", "command", "Path", "TargetFile", "path", "Url", "query", "SearchPath", "PackageName"):
+        v = raw_args.get(k)
+        if v:
+            cmd_preview = str(v).strip()
+            break
+    if not cmd_preview and title and title != tname:
+        cmd_preview = title
+    desc = str(raw_args.get("toolSummary") or raw_args.get("Description") or "").strip()
+    content_items = tc.get("content") if isinstance(tc.get("content"), list) else []
+    for ci in content_items:
+        if isinstance(ci, dict) and ci.get("type") == "diff" and ci.get("path"):
+            diff_hdr = str(ci.get("path") or "").strip()
+            if not cmd_preview:
+                cmd_preview = diff_hdr
+            if not desc:
+                desc = f"Diff: {diff_hdr}"
+            break
+    return tname, tkind, title[:160], cmd_preview[:1500], desc[:400]
+
+
+def _start_acp_chat_run(
+    agy_bin: str,
+    eff_model: str,
+    eff_perm_mode: str,
+    prompt: str,
+    full_prompt: str,
+    att_metas: list[dict[str, Any]],
+    resume_cli_cid: str,
+    source_desktop_cid: str,
+    pending_watermark: str,
+    is_new: bool,
+    swarm_mode: bool,
+) -> dict[str, Any] | None:
+    """Launch a live interactive ACP session supporting real-time tool permissions and ask_question turns.
+
+    Returns result dict on successful handshake+dispatch, or None if ACP init/resume fails (caller falls back to -p).
+    """
+    import queue as _q
+
+    acp_cmd = [agy_bin, "acp"]
+    if eff_perm_mode == "bypass":
+        acp_cmd.append("--dangerously-skip-permissions")
+    elif eff_perm_mode == "ask":
+        acp_cmd.extend(["--cli_dir_name", _ensure_mobile_ask_profile()])
+
+    try:
+        proc = subprocess.Popen(
+            acp_cmd,
+            cwd=str(WORKSPACE_ROOT),
+            env=_build_cli_env(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=_NO_WINDOW,
+        )
+    except Exception:
+        return None
+
+    write_lock = threading.Lock()
+    rpc_lock = threading.Lock()
+    rpc_seq = 0
+    rpc_pending: dict[int, _q.Queue[dict[str, Any]]] = {}
+    run_id = uuid.uuid4().hex[:10]
+    pending_key = f"pending-{run_id}"
+    canonical_disp = source_desktop_cid or resume_cli_cid
+    stderr_lines: collections.deque[str] = collections.deque(maxlen=40)
+    tool_idx_by_id: dict[str, int] = {}
+
+    run_rec: dict[str, Any] = {
+        "run_id": run_id,
+        "cid": resume_cli_cid,
+        "display_cid": canonical_disp,
+        "proc": proc,
+        "prompt": prompt,
+        "attachments": att_metas,
+        "model": eff_model,
+        "permission_mode": eff_perm_mode,
+        "swarm_mode": bool(swarm_mode),
+        "tools": [],
+        "chunks": [],
+        "running": True,
+        "canceled": False,
+        "cancel_reason": "",
+        "started_at": time.time(),
+        "stderr": "",
+        "ended_with_question": False,
+        "acp": True,
+    }
+
+    def _acp_send_raw(payload: dict[str, Any]) -> bool:
+        if proc.poll() is not None or proc.stdin is None:
+            return False
+        raw_ln = json.dumps(payload, ensure_ascii=False) + "\n"
+        try:
+            with write_lock:
+                proc.stdin.write(raw_ln)
+                proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
+    def _acp_rpc(method: str, params: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+        nonlocal rpc_seq
+        with rpc_lock:
+            rpc_seq += 1
+            rid = rpc_seq
+            q: _q.Queue[dict[str, Any]] = _q.Queue(maxsize=4)
+            rpc_pending[rid] = q
+        try:
+            if not _acp_send_raw({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}):
+                return {"error": {"code": -32000, "message": "failed to write ACP stdin"}}
+            try:
+                return q.get(timeout=timeout)
+            except _q.Empty:
+                return {"error": {"code": -32001, "message": f"ACP timeout after {timeout:.0f}s ({method})"}}
+        finally:
+            rpc_pending.pop(rid, None)
+
+    def _acp_cancel() -> None:
+        _cancel_pending_interactions_for_run(run_id, reason="cancelled")
+        sid_cur = str(run_rec.get("cid") or "").strip()
+        if sid_cur:
+            _acp_send_raw({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid_cur}})
+
+    run_rec["acp_cancel"] = _acp_cancel
+
+    def _wait_perm_and_reply(raw_req_id: Any, ix_rec: dict[str, Any]) -> None:
+        ix_id = str(ix_rec.get("id") or "")
+        evt: threading.Event = ix_rec["_event"]
+        timed_out = not evt.wait(timeout=600.0)
+        res = ix_rec.get("_resolution") if isinstance(ix_rec.get("_resolution"), dict) else None
+        with _PENDING_INTERACTIONS_LOCK:
+            _PENDING_INTERACTIONS.pop(ix_id, None)
+            if timed_out and ix_rec.get("status") == "pending":
+                ix_rec["status"] = "cancelled"
+                ix_rec["decision"] = "timeout"
+        if timed_out:
+            _broadcast_ws({
+                "type": "run_interaction_resolved",
+                "conversation_id": str(ix_rec.get("conversation_id") or ""),
+                "run_id": run_id,
+                "interaction_id": ix_id,
+                "kind": "permission",
+                "status": "cancelled",
+                "decision": "timeout",
+                "option_id": "",
+            })
+        if res and not res.get("cancelled") and res.get("option_id"):
+            _acp_send_raw({
+                "jsonrpc": "2.0",
+                "id": raw_req_id,
+                "result": {"outcome": {"outcome": "selected", "optionId": str(res["option_id"])}},
+            })
+        else:
+            _acp_send_raw({
+                "jsonrpc": "2.0",
+                "id": raw_req_id,
+                "result": {"outcome": {"outcome": "cancelled"}},
+            })
+
+    def _handle_server_request(msg: dict[str, Any]) -> None:
+        # IMPORTANT: Preserve exact JSON-RPC `id` type (ACP sends string ids like "1").
+        raw_req_id = msg.get("id")
+        method = str(msg.get("method") or "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if "permission" in method.lower():
+            tc = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+            raw_opts = params.get("options") if isinstance(params.get("options"), list) else []
+            norm_opts: list[dict[str, str]] = []
+            for o in raw_opts:
+                if isinstance(o, dict) and o.get("optionId"):
+                    norm_opts.append({
+                        "option_id": str(o.get("optionId") or ""),
+                        "name": str(o.get("name") or o.get("optionId") or ""),
+                        "kind": str(o.get("kind") or "allow_once"),
+                    })
+            if not norm_opts:
+                norm_opts = [
+                    {"option_id": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"option_id": "deny", "name": "Deny", "kind": "reject_once"},
+                ]
+            tname, tkind, title, cmd_preview, desc = _extract_acp_perm_details(tc, params)
+            cur_disp = str(run_rec.get("display_cid") or run_rec.get("cid") or canonical_disp or pending_key)
+            ix_id = f"int_{secrets.token_hex(6)}"
+            ix_rec: dict[str, Any] = {
+                "id": ix_id,
+                "kind": "permission",
+                "run_id": run_id,
+                "conversation_id": cur_disp,
+                "cli_cid": str(run_rec.get("cid") or ""),
+                "desktop_cid": source_desktop_cid,
+                "live": True,
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "tool_name": tname,
+                "tool_kind": tkind,
+                "title": title,
+                "command": cmd_preview,
+                "description": desc,
+                "options": norm_opts,
+                "questions": [],
+                "decision": "",
+                "option_id": "",
+                "answered_at": "",
+                "_event": threading.Event(),
+                "_resolution": None,
+            }
+            with _PENDING_INTERACTIONS_LOCK:
+                _PENDING_INTERACTIONS[ix_id] = ix_rec
+            _broadcast_ws({
+                "type": "run_interaction",
+                "conversation_id": cur_disp,
+                "run_id": run_id,
+                "interaction": _serialize_interaction(ix_rec),
+            })
+            threading.Thread(
+                target=_wait_perm_and_reply,
+                args=(raw_req_id, ix_rec),
+                name=f"acp-perm-{ix_id}",
+                daemon=True,
+            ).start()
+            return
+        _acp_send_raw({
+            "jsonrpc": "2.0",
+            "id": raw_req_id,
+            "error": {"code": -32601, "message": f"Unsupported method {method}"},
+        })
+
+    def _stderr_reader() -> None:
+        try:
+            if proc.stderr is not None:
+                for ln in proc.stderr:
+                    s = ln.strip()
+                    if s:
+                        stderr_lines.append(s[:300])
+        except Exception:
+            pass
+
+    def _stdout_reader() -> None:
+        try:
+            if proc.stdout is None:
+                return
+            for raw_ln in proc.stdout:
+                s_ln = raw_ln.strip()
+                if not s_ln:
+                    continue
+                try:
+                    msg = json.loads(s_ln)
+                except Exception:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if "method" in msg and "id" in msg:
+                    _handle_server_request(msg)
+                    continue
+                if "id" in msg and msg["id"] is not None:
+                    try:
+                        rid_i = int(msg["id"])
+                    except Exception:
+                        rid_i = -1
+                    q = rpc_pending.get(rid_i)
+                    if q is not None:
+                        try:
+                            q.put_nowait(msg)
+                        except Exception:
+                            pass
+                    continue
+                if msg.get("method") == "session/update":
+                    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                    upd = params.get("update") if isinstance(params.get("update"), dict) else {}
+                    ukind = str(upd.get("sessionUpdate") or "")
+                    cur_disp = str(run_rec.get("display_cid") or run_rec.get("cid") or canonical_disp or pending_key)
+                    if ukind == "agent_message_chunk":
+                        content = upd.get("content") if isinstance(upd.get("content"), dict) else {}
+                        delta = str(content.get("text") or "")
+                        if delta:
+                            run_rec["chunks"].append(delta)
+                            _broadcast_ws({
+                                "type": "run_delta",
+                                "conversation_id": cur_disp,
+                                "run_id": run_id,
+                                "delta": delta,
+                            })
+                    elif ukind in ("tool_call", "tool_call_update"):
+                        tname = str(upd.get("name") or "").strip()
+                        raw_st = str(upd.get("status") or "").lower()
+                        if raw_st == "completed":
+                            tstate = "DONE"
+                        elif raw_st in ("failed", "cancelled", "rejected", "error"):
+                            tstate = "REJECTED" if raw_st == "rejected" else "DONE"
+                        else:
+                            tstate = "ACTIVE"
+                        targs = upd.get("args") if isinstance(upd.get("args"), dict) else (upd.get("rawInput") if isinstance(upd.get("rawInput"), dict) else {})
+                        if tname == "ask_question" and raw_st in ("in_progress", "pending"):
+                            run_rec["ended_with_question"] = True
+                        target = ""
+                        if tname == "ask_question":
+                            qs = _parse_ask_question_args(targs)
+                            if qs and qs[0].get("question"):
+                                target = str(qs[0]["question"]).strip().splitlines()[0][:80]
+                        if not target and isinstance(targs, dict):
+                            for tk in ("Path", "TargetFile", "CommandLine", "toolSummary", "query", "Url", "path", "Role"):
+                                if targs.get(tk):
+                                    target = str(targs[tk]).strip().splitlines()[0][:80]
+                                    break
+                        if not target and upd.get("title"):
+                            target = str(upd["title"]).strip().splitlines()[0][:80]
+                        if tname:
+                            tool_item = {"name": tname, "target": target, "state": tstate}
+                            tc_id = str(upd.get("toolCallId") or "").strip()
+                            if tc_id and tc_id in tool_idx_by_id:
+                                run_rec["tools"][tool_idx_by_id[tc_id]] = tool_item
+                            else:
+                                if tstate != "ACTIVE" and run_rec["tools"] and run_rec["tools"][-1]["name"] == tname and run_rec["tools"][-1].get("state") == "ACTIVE":
+                                    idx_t = len(run_rec["tools"]) - 1
+                                    run_rec["tools"][idx_t] = tool_item
+                                else:
+                                    idx_t = len(run_rec["tools"])
+                                    run_rec["tools"].append(tool_item)
+                                if tc_id:
+                                    tool_idx_by_id[tc_id] = idx_t
+                            _broadcast_ws({
+                                "type": "run_tool",
+                                "conversation_id": cur_disp,
+                                "run_id": run_id,
+                                "tool": tool_item,
+                            })
+        except Exception:
+            pass
+        finally:
+            run_rec["stderr"] = "\n".join(stderr_lines)
+            for q in list(rpc_pending.values()):
+                try:
+                    q.put_nowait({"error": {"code": -32000, "message": "ACP process exited unexpectedly"}})
+                except Exception:
+                    pass
+
+    threading.Thread(target=_stderr_reader, name=f"acp-err-{run_id}", daemon=True).start()
+    threading.Thread(target=_stdout_reader, name=f"acp-out-{run_id}", daemon=True).start()
+
+    init_resp = _acp_rpc(
+        "initialize",
+        {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "antigravity-mobile", "version": APP_VERSION},
+        },
+        timeout=25.0,
+    )
+    if not isinstance(init_resp, dict) or "error" in init_resp:
+        _terminate_proc_safely(proc)
+        return None
+
+    sess_params = {"cwd": str(WORKSPACE_ROOT), "mcpServers": []}
+    if resume_cli_cid:
+        sess_resp = _acp_rpc(
+            "session/resume",
+            {"sessionId": resume_cli_cid, **sess_params},
+            timeout=20.0,
+        )
+    else:
+        sess_resp = _acp_rpc("session/new", sess_params, timeout=20.0)
+
+    if not isinstance(sess_resp, dict) or "error" in sess_resp or not isinstance(sess_resp.get("result"), dict):
+        _terminate_proc_safely(proc)
+        return None
+
+    s_res = sess_resp["result"]
+    bound_cid = str(s_res.get("sessionId") or resume_cli_cid).strip()
+    if not bound_cid:
+        _terminate_proc_safely(proc)
+        return None
+
+    disp_cid = source_desktop_cid or bound_cid
+    run_rec["cid"] = bound_cid
+    run_rec["display_cid"] = disp_cid
+
+    avail_model_ids = {
+        str(m.get("modelId") or "").strip()
+        for m in ((s_res.get("models") or {}).get("availableModels") or [])
+        if isinstance(m, dict) and m.get("modelId")
+    }
+    acp_model = _resolve_acp_model_id(eff_model, avail_model_ids)
+    _acp_rpc("session/set_model", {"sessionId": bound_cid, "modelId": acp_model}, timeout=12.0)
+
+    avail_modes = [
+        str(m.get("id") or "").strip()
+        for m in ((s_res.get("modes") or {}).get("availableModes") or [])
+        if isinstance(m, dict) and m.get("id")
+    ]
+    target_mode = ""
+    if eff_perm_mode == "ask":
+        if "default" in avail_modes:
+            target_mode = "default"
+    else:
+        for cand_m in ("auto", "accept-edits", "default"):
+            if cand_m in avail_modes:
+                target_mode = cand_m
+                break
+    if target_mode:
+        _acp_rpc("session/set_mode", {"sessionId": bound_cid, "modeId": target_mode}, timeout=10.0)
+
+    if source_desktop_cid and source_desktop_cid != bound_cid:
+        set_desktop_cli_alias(source_desktop_cid, bound_cid)
+        _migrate_conv_queue(bound_cid, source_desktop_cid)
+        if pending_watermark:
+            set_desktop_bridge_watermark(bound_cid, pending_watermark)
+    elif is_new or not source_desktop_cid:
+        register_mobile_own_cid(bound_cid)
+
+    with _ACTIVE_RUNS_LOCK:
+        _ACTIVE_RUNS[bound_cid] = run_rec
+        _ACTIVE_RUNS[disp_cid] = run_rec
+    _migrate_conv_queue(pending_key, disp_cid)
+
+    _broadcast_ws({
+        "type": "run_init" if is_new else "run_start",
+        "conversation_id": disp_cid,
+        "run_id": run_id,
+        "prompt": prompt,
+        "attachments": att_metas,
+        "model": eff_model,
+    })
+
+    def _acp_prompt_worker() -> None:
+        final_resp = ""
+        usage: dict[str, Any] = {}
+        prompt_err = ""
+        try:
+            pr = _acp_rpc(
+                "session/prompt",
+                {"sessionId": bound_cid, "prompt": [{"type": "text", "text": full_prompt}]},
+                timeout=1800.0,
+            )
+            if isinstance(pr, dict) and "error" in pr:
+                err_o = pr.get("error") if isinstance(pr.get("error"), dict) else {}
+                prompt_err = str(err_o.get("message") or pr["error"] or "ACP execution error")
+            elif isinstance(pr, dict) and isinstance(pr.get("result"), dict):
+                raw_u = pr["result"].get("usage")
+                if isinstance(raw_u, dict):
+                    usage = dict(raw_u)
+                if str(pr["result"].get("stopReason") or "").lower() == "cancelled" and not run_rec.get("canceled"):
+                    run_rec["canceled"] = True
+                    run_rec["cancel_reason"] = "user"
+        except Exception as exc:
+            prompt_err = str(exc)
+        finally:
+            _cancel_pending_interactions_for_run(run_id, reason="ended")
+            if not run_rec.get("canceled") and proc.poll() is None:
+                try:
+                    _acp_rpc("session/close", {"sessionId": bound_cid}, timeout=4.0)
+                except Exception:
+                    pass
+            _terminate_proc_safely(proc)
+            try:
+                proc.wait(timeout=3.0)
+            except Exception:
+                pass
+            run_rec["running"] = False
+            if not final_resp and run_rec["chunks"]:
+                final_resp = _clean_assistant_text("".join(run_rec["chunks"]))
+            cid_end = disp_cid or bound_cid or pending_key
+            if cid_end != pending_key:
+                _migrate_conv_queue(pending_key, cid_end)
+            if bound_cid and bound_cid != cid_end:
+                _migrate_conv_queue(bound_cid, cid_end)
+            with _ACTIVE_RUNS_LOCK:
+                for k_rm in (pending_key, cid_end, bound_cid, run_rec.get("display_cid") or "", run_rec.get("cid") or ""):
+                    if k_rm and _ACTIVE_RUNS.get(k_rm) is run_rec:
+                        _ACTIVE_RUNS.pop(k_rm, None)
+
+            cancel_reason = str(run_rec.get("cancel_reason") or ("user" if run_rec.get("canceled") else ""))
+            should_drain = False
+            if run_rec.get("canceled"):
+                _broadcast_ws({
+                    "type": "run_canceled",
+                    "conversation_id": cid_end,
+                    "run_id": run_id,
+                    "reason": cancel_reason or "user",
+                })
+                if cancel_reason == "interrupt":
+                    should_drain = True
+            elif (prompt_err or (proc.returncode not in (0, None))) and not final_resp and not run_rec.get("ended_with_question"):
+                err_src = prompt_err or "\n".join(stderr_lines) or f"exit code {proc.returncode}"
+                err_clean = _sanitize_error_text(err_src)
+                err_cat = _classify_run_error(err_clean)
+                _broadcast_ws({
+                    "type": "run_error",
+                    "conversation_id": cid_end,
+                    "run_id": run_id,
+                    "error": err_clean,
+                    "error_category": err_cat,
+                    "prompt": str(run_rec.get("prompt") or ""),
+                    "attachments": [
+                        str(a.get("path") or "")
+                        for a in (run_rec.get("attachments") or [])
+                        if isinstance(a, dict) and a.get("path")
+                    ],
+                    "model": eff_model,
+                    "swarm_mode": bool(run_rec.get("swarm_mode", False)),
+                })
+                should_drain = err_cat not in ("quota", "rate_limit", "auth")
+            else:
+                cw = compute_conversation_context_window(cid_end)
+                _broadcast_ws({
+                    "type": "run_done",
+                    "conversation_id": cid_end,
+                    "run_id": run_id,
+                    "response": final_resp,
+                    "tools": run_rec["tools"],
+                    "usage": usage,
+                    "model": eff_model,
+                    "context_window": cw,
+                    "has_pending_question": bool(run_rec.get("ended_with_question")),
+                })
+                should_drain = True
+
+            if should_drain and get_conv_queue_snapshot(cid_end):
+                threading.Thread(
+                    target=_drain_next_queued_run,
+                    args=(cid_end,),
+                    name=f"queue-drain-{cid_end[:8]}",
+                    daemon=True,
+                ).start()
+
+    threading.Thread(target=_acp_prompt_worker, name=f"acp-turn-{run_id}", daemon=True).start()
+    return {
+        "ok": True,
+        "conversation_id": disp_cid,
+        "run_id": run_id,
+        "created_new": bool(is_new),
+        "model": eff_model,
+        "permission_mode": eff_perm_mode,
+    }
+
+
 def start_cli_chat_run(
     requested_cid: str,
     prompt: str,
     model: str,
     attachments: list[str] | None = None,
     swarm_mode: bool = False,
+    permission_mode: str | None = None,
 ) -> dict[str, Any]:
     global _PENDING_SPAWNS
     agy_bin = _find_agy_bin()
@@ -3392,6 +4460,8 @@ def start_cli_chat_run(
     eff_model = str(model or "").strip() or str(load_or_create_config().get("default_model") or "gemini-4-neon-medium").strip()
     if not _is_valid_model_id(eff_model):
         return {"ok": False, "error": "无效的模型名称"}
+    raw_pm = str(permission_mode or "").strip().lower()
+    eff_perm_mode = raw_pm if raw_pm in _VALID_PERMISSION_MODES else get_permission_mode()
 
     # Validate attachments strictly against UPLOAD_DIR / WORKSPACE_ROOT before building prompt
     valid_att_paths, att_err = _validate_chat_attachments(attachments)
@@ -3446,6 +4516,45 @@ def start_cli_chat_run(
         full_prompt = "/swarm " + full_prompt
     if len(full_prompt) > 24000:
         full_prompt = full_prompt[-24000:]
+
+    att_metas_acp: list[dict[str, Any]] = []
+    for ap in valid_att_paths:
+        ext = ap.suffix.lower()
+        is_img = ext in _IMAGE_EXTS
+        norm_p = ap.as_posix()
+        att_metas_acp.append({
+            "name": ap.name,
+            "path": norm_p,
+            "is_image": is_img,
+            "preview_url": f"/api/files/preview?path={urllib.parse.quote(norm_p)}",
+        })
+
+    # For standard interactive chat (non-swarm), prefer live ACP driver (real permissions & ask_question)
+    if not swarm_mode:
+        with _ACTIVE_RUNS_LOCK:
+            active_cnt = len({id(v) for v in _ACTIVE_RUNS.values() if v.get("running")}) + _PENDING_SPAWNS
+            if active_cnt >= _MAX_CONCURRENT_RUNS:
+                return {"ok": False, "error": f"当前并发任务数已达上限（{_MAX_CONCURRENT_RUNS}），请等待任务完成或停止后再试"}
+            _PENDING_SPAWNS += 1
+        try:
+            acp_res = _start_acp_chat_run(
+                agy_bin=agy_bin,
+                eff_model=eff_model,
+                eff_perm_mode=eff_perm_mode,
+                prompt=prompt,
+                full_prompt=full_prompt,
+                att_metas=att_metas_acp,
+                resume_cli_cid=resume_cli_cid,
+                source_desktop_cid=source_desktop_cid,
+                pending_watermark=pending_watermark,
+                is_new=is_new,
+                swarm_mode=swarm_mode,
+            )
+            if acp_res is not None:
+                return acp_res
+        finally:
+            with _ACTIVE_RUNS_LOCK:
+                _PENDING_SPAWNS = max(0, _PENDING_SPAWNS - 1)
 
     cmd = [
         agy_bin,
@@ -3935,11 +5044,128 @@ async def handle_server_info(_request: web.Request) -> web.Response:
         "agy_cli_ready": bool(_find_agy_bin()),
         "qqbot_available": bool(qqbot_ok),
         "default_model": cfg.get("default_model", "gemini-4-neon-medium"),
+        "permission_mode": get_permission_mode(),
         "running_tasks": running_cnt,
         "apk_name": APK_FILENAME,
         "apk_ready": apk_p.is_file(),
         "apk_size": apk_p.stat().st_size if apk_p.is_file() else 0,
     })
+
+
+async def handle_set_permission_mode(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+    raw = str(body.get("permission_mode") or body.get("mode") or "").strip().lower()
+    if raw not in _VALID_PERMISSION_MODES:
+        return web.json_response(
+            {"ok": False, "error": f"invalid permission_mode: {raw}"},
+            status=400,
+        )
+    _update_config(lambda cfg: cfg.__setitem__("permission_mode", raw))
+    _broadcast_ws({"type": "settings_updated", "permission_mode": raw})
+    return web.json_response({"ok": True, "permission_mode": raw})
+
+
+async def handle_chat_interaction_respond(request: web.Request) -> web.Response:
+    ix_id = str(request.match_info.get("interaction_id") or "").strip()
+    if not _INTERACTION_ID_RE.match(ix_id):
+        return web.json_response({"ok": False, "error": "invalid interaction_id"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+
+    decision = str(body.get("decision") or "").strip().lower()
+    option_id = str(body.get("option_id") or body.get("optionId") or "").strip()
+    if decision and decision not in _VALID_PERM_DECISIONS:
+        return web.json_response({"ok": False, "error": "invalid decision"}, status=400)
+    if not decision and not option_id:
+        return web.json_response({"ok": False, "error": "decision or option_id required"}, status=400)
+
+    serialized: dict[str, Any] | None = None
+    with _PENDING_INTERACTIONS_LOCK:
+        rec = _PENDING_INTERACTIONS.get(ix_id)
+        if rec is None:
+            return web.json_response({"ok": False, "error": "交互请求不存在或已失效"}, status=404)
+        if rec.get("status") != "pending":
+            return web.json_response({"ok": False, "error": "该交互请求已处理"}, status=409)
+
+        opts = [o for o in (rec.get("options") or []) if isinstance(o, dict)]
+        cancelled = decision == "cancel"
+        resolved_opt_id = ""
+        final_decision = decision
+
+        if not cancelled:
+            matched: dict[str, Any] | None = None
+            if option_id:
+                for o in opts:
+                    if str(o.get("option_id") or "") == option_id:
+                        matched = o
+                        break
+                if matched is None:
+                    return web.json_response({"ok": False, "error": "invalid option_id"}, status=400)
+            elif decision:
+                for o in opts:
+                    if str(o.get("kind") or "").lower() == decision:
+                        matched = o
+                        break
+                if matched is None and decision.startswith("allow"):
+                    for o in opts:
+                        if str(o.get("kind") or "").lower().startswith("allow"):
+                            matched = o
+                            break
+                elif matched is None and decision.startswith("reject"):
+                    for o in opts:
+                        k = str(o.get("kind") or "").lower()
+                        if k.startswith("reject") or k == "deny":
+                            matched = o
+                            break
+                if matched is None:
+                    if decision.startswith("reject"):
+                        cancelled = True
+                    elif opts:
+                        matched = opts[0]
+            if matched is not None:
+                resolved_opt_id = str(matched.get("option_id") or "")
+                if not final_decision:
+                    final_decision = str(matched.get("kind") or "selected").lower()
+            elif not cancelled:
+                return web.json_response({"ok": False, "error": "no matching option"}, status=400)
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rec["status"] = "cancelled" if cancelled else "resolved"
+        rec["decision"] = final_decision or ("cancel" if cancelled else "selected")
+        rec["option_id"] = resolved_opt_id
+        rec["answered_at"] = now_iso
+        rec["_resolution"] = (
+            {"cancelled": True, "reason": "user"}
+            if cancelled
+            else {"cancelled": False, "option_id": resolved_opt_id, "decision": rec["decision"]}
+        )
+        evt = rec.get("_event")
+        if isinstance(evt, threading.Event):
+            evt.set()
+        _PENDING_INTERACTIONS.pop(ix_id, None)
+        serialized = _serialize_interaction(rec)
+
+    if serialized:
+        _broadcast_ws({
+            "type": "run_interaction_resolved",
+            "conversation_id": serialized["conversation_id"],
+            "run_id": serialized["run_id"],
+            "interaction_id": ix_id,
+            "kind": serialized["kind"],
+            "status": serialized["status"],
+            "decision": serialized["decision"],
+            "option_id": serialized["option_id"],
+        })
+    return web.json_response({"ok": True, "interaction": serialized})
 
 
 async def handle_pair_claim(request: web.Request) -> web.Response:
@@ -4136,6 +5362,9 @@ async def handle_chat_send(request: web.Request) -> web.Response:
     if mode not in ("normal", "queue", "interrupt"):
         return web.json_response({"ok": False, "error": "invalid mode"}, status=400)
     priority = "urgent" if str(body.get("priority") or "").strip().lower() == "urgent" else "normal"
+    raw_pm = str(body.get("permission_mode") or "").strip().lower()
+    if raw_pm and raw_pm not in _VALID_PERMISSION_MODES:
+        return web.json_response({"ok": False, "error": "invalid permission_mode"}, status=400)
 
     valid_att_paths, att_err = await asyncio.to_thread(_validate_chat_attachments, attachments)
     if valid_att_paths is None:
@@ -4158,14 +5387,29 @@ async def handle_chat_send(request: web.Request) -> web.Response:
 
     # Idle conversation (or new chat): execute immediately
     if active_rec is None:
-        res = await asyncio.to_thread(start_cli_chat_run, canon or cid, prompt, eff_model, norm_atts, swarm_mode)
+        res = await asyncio.to_thread(
+            start_cli_chat_run,
+            canon or cid,
+            prompt,
+            eff_model,
+            norm_atts,
+            swarm_mode,
+            raw_pm or None,
+        )
         if res.get("ok"):
             res["queued"] = False
         return web.json_response(res, status=200 if res.get("ok") else 400)
 
     target_cid = canon or cid
     item_priority = "urgent" if (mode == "interrupt" or priority == "urgent") else "normal"
-    item = _build_queue_item(prompt, eff_model, norm_atts, swarm_mode=swarm_mode, priority=item_priority)
+    item = _build_queue_item(
+        prompt,
+        eff_model,
+        norm_atts,
+        swarm_mode=swarm_mode,
+        priority=item_priority,
+        permission_mode=raw_pm,
+    )
     with _CONV_QUEUES_LOCK:
         q = _consolidate_queue_unlocked(target_cid, cands)
         if len(q) >= _CONV_QUEUE_MAX:
@@ -4185,6 +5429,7 @@ async def handle_chat_send(request: web.Request) -> web.Response:
 
     if mode == "interrupt":
         proc = None
+        acp_cancel = None
         still_running = False
         with _ACTIVE_RUNS_LOCK:
             for k in cands:
@@ -4193,9 +5438,15 @@ async def handle_chat_send(request: web.Request) -> web.Response:
                     cur_rec["canceled"] = True
                     cur_rec["cancel_reason"] = "interrupt"
                     proc = cur_rec.get("proc")
+                    acp_cancel = cur_rec.get("acp_cancel")
                     still_running = True
                     break
         _broadcast_queue_updated(target_cid, snap)
+        if callable(acp_cancel):
+            try:
+                acp_cancel()
+            except Exception:
+                pass
         if proc is not None:
             _terminate_proc_safely(proc)
         elif not still_running:
@@ -4385,6 +5636,7 @@ async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
 
     proc = None
+    acp_cancel = None
     still_running = False
     with _ACTIVE_RUNS_LOCK:
         for k in cands:
@@ -4393,11 +5645,17 @@ async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
                 cur_rec["canceled"] = True
                 cur_rec["cancel_reason"] = "interrupt"
                 proc = cur_rec.get("proc")
+                acp_cancel = cur_rec.get("acp_cancel")
                 still_running = True
                 break
 
     if still_running:
         _broadcast_queue_updated(target_cid, snap)
+        if callable(acp_cancel):
+            try:
+                acp_cancel()
+            except Exception:
+                pass
         if proc is not None:
             _terminate_proc_safely(proc)
         return web.json_response({
@@ -4480,6 +5738,7 @@ async def handle_chat_cancel(request: web.Request) -> web.Response:
     canon, _, cands = _get_cid_alias_candidates(cid)
     target_cid = canon or cid
     proc = None
+    acp_cancel = None
     with _ACTIVE_RUNS_LOCK:
         for k in cands:
             rec = _ACTIVE_RUNS.get(k)
@@ -4487,10 +5746,20 @@ async def handle_chat_cancel(request: web.Request) -> web.Response:
                 rec["canceled"] = True
                 rec["cancel_reason"] = "user"
                 proc = rec.get("proc")
+                acp_cancel = rec.get("acp_cancel")
                 break
+    did_cancel = False
+    if callable(acp_cancel):
+        try:
+            acp_cancel()
+            did_cancel = True
+        except Exception:
+            pass
     q_snap = get_conv_queue_snapshot(target_cid)
     if proc is not None and proc.poll() is None:
         _terminate_proc_safely(proc)
+        did_cancel = True
+    if did_cancel:
         return web.json_response({"ok": True, "conversation_id": target_cid, "canceled": True, "queue": q_snap})
     return web.json_response({"ok": True, "conversation_id": target_cid, "canceled": False, "note": "无正在运行的手机端任务", "queue": q_snap})
 
@@ -7406,6 +8675,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/local-auth", handle_local_auth)
 
     app.router.add_get("/api/server-info", handle_server_info)
+    app.router.add_post("/api/settings/permission-mode", handle_set_permission_mode)
     app.router.add_get("/api/models", handle_models)
     app.router.add_get("/api/conversations", handle_conversations)
     app.router.add_get("/api/conversations/{cid}", handle_conversation_detail)
@@ -7413,6 +8683,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/conversations/{cid}/swarm", handle_conversation_swarm)
     app.router.add_post("/api/conversations/{cid}/revert", handle_conversation_revert)
     app.router.add_post("/api/chat/send", handle_chat_send)
+    app.router.add_post("/api/chat/interaction/{interaction_id}/respond", handle_chat_interaction_respond)
     app.router.add_get("/api/chat/queue/{cid}", handle_chat_queue_get)
     app.router.add_post("/api/chat/queue/{cid}/resume", handle_chat_queue_resume)
     app.router.add_put("/api/chat/queue/{cid}/{item_id}", handle_chat_queue_update)

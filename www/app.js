@@ -178,6 +178,11 @@
     failoverInFlight: false,
     wsPingTimer: null,
     wsLastPongAt: 0,
+
+    // v1.7.3: Interactive questions, permission approvals & execution mode
+    permissionMode: "auto",
+    pendingInteractions: [],
+    interactionDrafts: {},
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -1849,6 +1854,11 @@
       state.serverInfo = data;
       state.qqbotAvailable = Boolean(data.qqbot_available);
       $("settings-open-qqbot")?.classList.toggle("hidden", !state.qqbotAvailable);
+      const pm = String(data.permission_mode || "").trim().toLowerCase();
+      if (pm === "auto" || pm === "ask" || pm === "bypass") {
+        state.permissionMode = pm;
+        syncPermissionModeUi();
+      }
 
       if (data.workspace_root) {
         state.workspaceRoot = String(data.workspace_root);
@@ -1946,7 +1956,7 @@
           ensurePeerStreamAttached("", [], ev.model);
         }
         const t = ev.tool;
-        if (t && t.state === "DONE" && state.streamTools.length && state.streamTools[state.streamTools.length - 1].name === t.name) {
+        if (t && (t.state === "DONE" || t.state === "REJECTED") && state.streamTools.length && state.streamTools[state.streamTools.length - 1].name === t.name) {
           state.streamTools[state.streamTools.length - 1] = t;
         } else if (t) {
           state.streamTools.push(t);
@@ -1970,6 +1980,7 @@
         clearConvError(state.currentCid);
         state.interruptPendingUntil = 0;
         state.streaming = false;
+        state.pendingInteractions = [];
         if (ev.context_window && typeof ev.context_window === "object") {
           setCurrentContext(ev.context_window);
         }
@@ -1991,6 +2002,7 @@
           setCurrentQueue(ev.queue);
         }
         const isCutinHandoff = Boolean(ev.interrupted || ev.reason === "interrupt" || Date.now() < state.interruptPendingUntil);
+        state.pendingInteractions = [];
         if (isCutinHandoff) {
           state.streamBuffer = "";
           state.streamTools = [];
@@ -2013,6 +2025,7 @@
         state.streaming = false;
         state.streamBuffer = "";
         state.streamTools = [];
+        state.pendingInteractions = [];
         const errText = String(ev.error || t("err.unknown"));
         const errKey = getConvErrKey(state.currentCid);
         if (ev.run_id) clearConvError(`pending-${ev.run_id}`);
@@ -2065,6 +2078,52 @@
       );
       if (matchesCurrent) {
         setCurrentQueue(Array.isArray(ev.queue) ? ev.queue : []);
+      }
+    } else if (ev.type === "run_interaction" && ev.interaction) {
+      adoptPendingCid();
+      const ix = ev.interaction;
+      const aliasedCid = ev.aliased_cid || "";
+      const matchesCurrent = Boolean(state.currentCid) && (
+        cid === state.currentCid ||
+        (aliasedCid && aliasedCid === state.currentCid) ||
+        (ev.run_id && state.currentCid === `pending-${ev.run_id}`)
+      );
+      if (matchesCurrent) {
+        if (!state.streaming || !$("streaming-row")) {
+          ensurePeerStreamAttached("", [], ev.model);
+        }
+        const curList = Array.isArray(state.pendingInteractions) ? state.pendingInteractions.slice() : [];
+        const prevIdx = curList.findIndex((x) => x && x.id === ix.id);
+        if (prevIdx >= 0) curList[prevIdx] = ix;
+        else curList.push(ix);
+        state.pendingInteractions = curList;
+        updateStreamingRow();
+        haptic("medium");
+      } else {
+        const convMeta = (state.conversations || []).find((c) => c && (c.id === cid || (aliasedCid && c.id === aliasedCid)));
+        const cTitle = (convMeta && convMeta.title) || (cid ? cid.slice(0, 8) : "Antigravity");
+        const ixSum = ix.title || ix.command || ix.tool_name || t("ix.permTitle");
+        showToast(t("ix.otherConvWaiting", { title: cTitle, summary: String(ixSum).slice(0, 48) }));
+        haptic("medium");
+      }
+      refreshConversationsThrottled(300);
+    } else if (ev.type === "run_interaction_resolved") {
+      const ixId = String(ev.interaction_id || "");
+      if (ixId) {
+        state.pendingInteractions = (state.pendingInteractions || []).filter((x) => x && x.id !== ixId);
+        delete state.interactionDrafts[ixId];
+        if (state.streaming && $("streaming-row")) {
+          updateStreamingRow();
+        } else if ($("live-interaction-row")) {
+          renderConversation({ preserveScroll: true });
+        }
+      }
+      refreshConversationsThrottled(300);
+    } else if (ev.type === "settings_updated") {
+      const pm = String(ev.permission_mode || "").trim().toLowerCase();
+      if (pm === "auto" || pm === "ask" || pm === "bypass") {
+        state.permissionMode = pm;
+        syncPermissionModeUi();
       }
     } else if (ev.type === "tunnel_status" && ev.tunnel) {
       if (isLocalDesktopBrowser()) {
@@ -4697,6 +4756,513 @@
     };
   }
 
+  function syncPermissionModeUi() {
+    const mode = state.permissionMode === "ask" || state.permissionMode === "bypass" ? state.permissionMode : "auto";
+    document.querySelectorAll(".perm-mode-opt[data-perm-mode]").forEach((btn) => {
+      const isAct = btn.dataset.permMode === mode;
+      btn.classList.toggle("active", isAct);
+      btn.setAttribute("aria-checked", String(isAct));
+    });
+    const badgeEl = $("settings-perm-badge");
+    const descEl = $("settings-perm-desc");
+    if (badgeEl) {
+      const bKey = mode === "ask" ? "settings.permBadgeAsk" : (mode === "bypass" ? "settings.permBadgeBypass" : "settings.permBadgeAuto");
+      badgeEl.textContent = t(bKey);
+    }
+    if (descEl) {
+      const dKey = mode === "ask" ? "settings.permDescAsk" : (mode === "bypass" ? "settings.permDescBypass" : "settings.permDescAuto");
+      descEl.textContent = t(dKey);
+    }
+  }
+
+  async function setPermissionMode(nextMode) {
+    const mode = nextMode === "ask" || nextMode === "bypass" ? nextMode : "auto";
+    const prevMode = state.permissionMode;
+    state.permissionMode = mode;
+    syncPermissionModeUi();
+    try {
+      const res = await apiFetch("/api/settings/permission-mode", {
+        method: "POST",
+        body: JSON.stringify({ permission_mode: mode }),
+      });
+      const confirmed = String((res && res.permission_mode) || mode).toLowerCase();
+      if (confirmed === "auto" || confirmed === "ask" || confirmed === "bypass") {
+        state.permissionMode = confirmed;
+        syncPermissionModeUi();
+      }
+      const lblKey = state.permissionMode === "ask" ? "settings.permAsk" : (state.permissionMode === "bypass" ? "settings.permBypass" : "settings.permAuto");
+      showToast(t("toast.permSaved", { mode: t(lblKey) }));
+    } catch (e) {
+      state.permissionMode = prevMode;
+      syncPermissionModeUi();
+      showToast(t("toast.permSaveFail", { err: (e && e.message) || t("err.unknown") }));
+    }
+  }
+
+  function parseQuestionOption(rawOpt) {
+    let raw = "";
+    let extraDesc = "";
+    let rec = false;
+    if (rawOpt && typeof rawOpt === "object") {
+      raw = String(rawOpt.label || rawOpt.text || rawOpt.value || "").trim();
+      extraDesc = String(rawOpt.description || "").trim();
+      rec = Boolean(rawOpt.recommended);
+    } else {
+      raw = String(rawOpt ?? "").trim();
+    }
+    let clean = raw;
+    const recRe = /^(?:\(\s*recommended\s*\)|（\s*推荐\s*）|\[\s*(?:recommended|推荐)\s*\])\s*/i;
+    if (recRe.test(clean)) {
+      rec = true;
+      clean = clean.replace(recRe, "").trim();
+    }
+    let label = clean;
+    let desc = extraDesc;
+    if (!desc) {
+      const splitIdx = clean.indexOf(" — ");
+      if (splitIdx > 0) {
+        label = clean.slice(0, splitIdx).trim();
+        desc = clean.slice(splitIdx + 3).trim();
+      }
+    }
+    return { raw, label: label || raw, desc, recommended: rec };
+  }
+
+  function getInteractionDraft(ixId) {
+    if (!state.interactionDrafts[ixId]) {
+      state.interactionDrafts[ixId] = { questions: {}, submitting: false };
+    }
+    return state.interactionDrafts[ixId];
+  }
+
+  function findInteractionById(ixId) {
+    if (!ixId) return null;
+    const liveHit = (state.pendingInteractions || []).find((x) => x && x.id === ixId);
+    if (liveHit) return liveHit;
+    const msgs = (state.currentConv && Array.isArray(state.currentConv.messages)) ? state.currentConv.messages : [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const list = msgs[i] && Array.isArray(msgs[i].interactions) ? msgs[i].interactions : [];
+      const hit = list.find((x) => x && x.id === ixId);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  function formatAskQuestionReply(ix, draft) {
+    const qs = Array.isArray(ix && ix.questions) ? ix.questions : [];
+    const perQ = qs.map((q, qIdx) => {
+      const opts = Array.isArray(q && q.options) ? q.options : [];
+      const qd = (draft && draft.questions && draft.questions[qIdx]) || {};
+      const selIdxs = Array.isArray(qd.selected) ? qd.selected : [];
+      const parts = [];
+      for (const oIdx of selIdxs) {
+        if (oIdx >= 0 && oIdx < opts.length) {
+          const parsed = parseQuestionOption(opts[oIdx]);
+          if (parsed.raw) parts.push(parsed.raw);
+        }
+      }
+      const other = String(qd.otherText || "").trim();
+      if (other) parts.push(other);
+      return parts.join(", ");
+    });
+    if (qs.length <= 1) {
+      return `已选择：${perQ[0] || ""}`;
+    }
+    return perQ.map((ans, idx) => `A${idx + 1}: ${ans || "(Skipped)"}`).join("\n");
+  }
+
+  function formatPermOptLabel(opt) {
+    const k = String((opt && opt.kind) || "").toLowerCase();
+    if (k === "allow_once") return t("ix.permAllowOnce");
+    if (k === "allow_always") return t("ix.permAllowAlways");
+    if (k === "reject_once" || k === "reject_always" || k === "deny") return t("ix.permRejectOnce");
+    return String((opt && (opt.name || opt.option_id)) || "");
+  }
+
+  function renderInteractionCardHtml(ix) {
+    if (!ix || typeof ix !== "object") return "";
+    const ixId = String(ix.id || "");
+    const rawKind = String(ix.kind || "permission");
+    const kind = rawKind === "ask_question" ? "question" : rawKind;
+    const status = String(ix.status || "pending");
+    const isPending = status === "pending";
+    const draft = isPending ? getInteractionDraft(ixId) : { questions: {}, submitting: false };
+    const isBusy = Boolean(draft.submitting);
+
+    if (kind === "permission") {
+      const dec = String(ix.decision || "").toLowerCase();
+      let pillText = t("ix.permWaiting");
+      let pillCls = "is-waiting";
+      if (!isPending) {
+        if (dec.startsWith("reject") || dec === "deny") {
+          pillText = t("ix.permDenied");
+          pillCls = "is-denied";
+        } else if (status === "cancelled" || dec === "cancel" || dec === "timeout") {
+          pillText = dec === "timeout" ? t("ix.permExpired") : t("ix.permCancelled");
+          pillCls = "is-muted";
+        } else {
+          pillText = t("ix.permAllowed");
+          pillCls = "is-done";
+        }
+      }
+      const opts = Array.isArray(ix.options) && ix.options.length
+        ? ix.options
+        : [
+            { option_id: "allow", name: "Allow", kind: "allow_once" },
+            { option_id: "deny", name: "Deny", kind: "reject_once" },
+          ];
+      const btnsHtml = isPending
+        ? `<div class="ix-actions">${opts
+            .map((o) => {
+              const okind = String(o.kind || "allow_once").toLowerCase();
+              const bCls = okind.startsWith("reject") || okind === "deny"
+                ? "danger"
+                : (okind === "allow_once" ? "primary" : "");
+              return `<button type="button" class="ix-action-btn ${bCls}" data-ix-id="${escHtml(ixId)}" data-ix-act="perm" data-decision="${escHtml(okind)}" data-opt-id="${escHtml(o.option_id || "")}" ${isBusy ? "disabled" : ""}>${escHtml(formatPermOptLabel(o))}</button>`;
+            })
+            .join("")}</div>`
+        : "";
+      const headTitle = String(ix.title || ix.tool_name || t("ix.permTitle"));
+      return `<div class="interaction-card kind-permission ${isPending ? "is-pending" : "is-resolved"}" data-ix-id="${escHtml(ixId)}" data-ix-kind="permission">
+        <div class="ix-head">
+          <div class="ix-head-left">
+            <span class="ix-icon" aria-hidden="true">!</span>
+            <span class="ix-title">${escHtml(headTitle)}</span>
+          </div>
+          <span class="ix-status-pill ${pillCls}">${escHtml(pillText)}</span>
+        </div>
+        ${ix.command ? `<pre class="ix-perm-cmd">${escHtml(ix.command)}</pre>` : ""}
+        ${ix.description ? `<div class="ix-perm-desc">${escHtml(ix.description)}</div>` : ""}
+        ${btnsHtml}
+      </div>`;
+    }
+
+    if (kind === "plan_feedback") {
+      const pillText = isPending
+        ? t("ix.planWaiting")
+        : (status === "cancelled" ? t("ix.permCancelled") : t("ix.questionAnswered"));
+      const pillCls = isPending ? "is-waiting" : (status === "cancelled" ? "is-muted" : "is-done");
+      const summary = String(ix.summary || ix.description || "");
+      const pathTxt = String(ix.path || "");
+      const actionsHtml = isPending
+        ? `<div class="ix-actions">
+            <button type="button" class="ix-action-btn ghost" data-ix-id="${escHtml(ixId)}" data-ix-act="plan-modify" ${isBusy ? "disabled" : ""}>${escHtml(t("ix.planModifyBtn"))}</button>
+            <button type="button" class="ix-action-btn primary" data-ix-id="${escHtml(ixId)}" data-ix-act="plan-proceed" ${isBusy ? "disabled" : ""}>${escHtml(t("ix.planProceedBtn"))}</button>
+          </div>`
+        : "";
+      return `<div class="interaction-card kind-plan ${isPending ? "is-pending" : "is-resolved"}" data-ix-id="${escHtml(ixId)}" data-ix-kind="plan_feedback">
+        <div class="ix-head">
+          <div class="ix-head-left">
+            <span class="ix-icon" aria-hidden="true">✎</span>
+            <span class="ix-title">${escHtml(t("ix.planTitle"))}</span>
+          </div>
+          <span class="ix-status-pill ${pillCls}">${escHtml(pillText)}</span>
+        </div>
+        ${pathTxt ? `<div class="ix-perm-cmd">${escHtml(pathTxt)}</div>` : ""}
+        ${summary ? `<div class="ix-perm-desc">${escHtml(summary)}</div>` : ""}
+        ${actionsHtml}
+      </div>`;
+    }
+
+    // kind === "question" (ask_question)
+    const qs = Array.isArray(ix.questions) ? ix.questions : [];
+    const selMatrix = Array.isArray(ix.selectedIndices) ? ix.selectedIndices : [];
+    const customList = Array.isArray(ix.customAnswers) ? ix.customAnswers : [];
+    const pillText = isPending
+      ? t("ix.questionWaiting")
+      : (status === "skipped" ? t("ix.questionSkipped") : t("ix.questionAnswered"));
+    const pillCls = isPending ? "is-waiting" : (status === "skipped" ? "is-muted" : "is-done");
+
+    const qBlocksHtml = qs
+      .map((q, qIdx) => {
+        const isMulti = Boolean(q && q.is_multi_select);
+        const opts = Array.isArray(q && q.options) ? q.options : [];
+        const qDraft = (draft.questions && draft.questions[qIdx]) || {};
+        const selectedSet = new Set(
+          isPending
+            ? (Array.isArray(qDraft.selected) ? qDraft.selected : [])
+            : (Array.isArray(selMatrix[qIdx]) ? selMatrix[qIdx] : [])
+        );
+        const customAnswer = String((isPending ? qDraft.otherText : customList[qIdx]) || "");
+        const progressPrefix = qs.length > 1 ? `${t("ix.questionProgress", { cur: qIdx + 1, total: qs.length })} · ` : "";
+        const hintText = `${progressPrefix}${isMulti ? t("ix.multiHint") : t("ix.singleHint")}`;
+
+        const optsHtml = opts
+          .map((rawOpt, oIdx) => {
+            const p = parseQuestionOption(rawOpt);
+            const isSel = selectedSet.has(oIdx);
+            return `<button type="button" class="ix-opt-btn ${isMulti ? "is-multi" : ""} ${isSel ? "selected" : ""}" data-ix-id="${escHtml(ixId)}" data-q-idx="${qIdx}" data-opt-idx="${oIdx}" ${(isPending && !isBusy) ? "" : "disabled"}>
+              <span class="ix-opt-check" aria-hidden="true">${isSel ? "✓" : ""}</span>
+              <span class="ix-opt-main">
+                <span class="ix-opt-label-row">
+                  <span class="ix-opt-label">${escHtml(p.label)}</span>
+                  ${p.recommended ? `<span class="ix-opt-rec">${escHtml(t("ix.recommendedTag"))}</span>` : ""}
+                </span>
+                ${p.desc ? `<span class="ix-opt-desc">${escHtml(p.desc)}</span>` : ""}
+              </span>
+            </button>`;
+          })
+          .join("");
+
+        const otherHtml = isPending
+          ? `<div class="ix-other-wrap">
+              <input type="text" class="ix-other-input" data-ix-id="${escHtml(ixId)}" data-q-idx="${qIdx}" value="${escHtml(customAnswer)}" placeholder="${escHtml(t("ix.otherPlaceholder"))}" ${isBusy ? "disabled" : ""} />
+            </div>`
+          : (customAnswer.trim()
+            ? `<div class="ix-custom-answer">${escHtml(t("ix.customReplyLabel", { text: customAnswer.trim() }))}</div>`
+            : "");
+
+        return `<div class="ix-q-block">
+          <div class="ix-q-header">
+            <div class="ix-q-prompt">${escHtml(String((q && q.question) || ""))}</div>
+            <span class="ix-q-hint">${escHtml(hintText)}</span>
+          </div>
+          <div class="ix-options">${optsHtml}</div>
+          ${otherHtml}
+        </div>`;
+      })
+      .join("");
+
+    const hasAnyPick = isPending && qs.some((_q, qIdx) => {
+      const qd = (draft.questions && draft.questions[qIdx]) || {};
+      return (Array.isArray(qd.selected) && qd.selected.length > 0) || Boolean(String(qd.otherText || "").trim());
+    });
+    const footerHtml = isPending
+      ? `<div class="ix-actions">
+          <button type="button" class="ix-action-btn ghost" data-ix-id="${escHtml(ixId)}" data-ix-act="skip" ${isBusy ? "disabled" : ""}>${escHtml(t("ix.skipBtn"))}</button>
+          <button type="button" class="ix-action-btn primary" data-ix-id="${escHtml(ixId)}" data-ix-act="confirm" ${(isBusy || !hasAnyPick) ? "disabled" : ""}>${escHtml(isBusy ? t("ix.submittingBtn") : t("ix.confirmBtn"))}</button>
+        </div>`
+      : "";
+
+    return `<div class="interaction-card kind-question ${isPending ? "is-pending" : "is-answered"}" data-ix-id="${escHtml(ixId)}" data-ix-kind="ask_question">
+      <div class="ix-head">
+        <div class="ix-head-left">
+          <span class="ix-icon" aria-hidden="true">?</span>
+          <span class="ix-title">${escHtml(t("ix.questionTitle"))}</span>
+        </div>
+        <span class="ix-status-pill ${pillCls}">${escHtml(pillText)}</span>
+      </div>
+      ${qBlocksHtml}
+      ${footerHtml}
+    </div>`;
+  }
+
+  function refreshInteractionCardDom(ix) {
+    if (!ix || !ix.id) return;
+    const selector = `.interaction-card[data-ix-id="${String(ix.id).replace(/"/g, '\\"')}"]`;
+    const el = document.querySelector(selector);
+    if (el) {
+      el.outerHTML = renderInteractionCardHtml(ix);
+    }
+  }
+
+  async function sendQuickReplyText(rawPromptText) {
+    const text = String(rawPromptText || "").trim();
+    if (!text) return false;
+    const sendDraftKey = currentDraftKey();
+    const targetCid = state.currentCid || "__new__";
+    clearConvError(sendDraftKey);
+
+    if (state.streaming) {
+      const res = await apiFetch("/api/chat/send", {
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: targetCid,
+          prompt: text,
+          model: state.selectedModel,
+          attachments: [],
+          swarm_mode: state.swarmMode,
+          permission_mode: state.permissionMode,
+          mode: "queue",
+          priority: "normal",
+        }),
+      });
+      if (Array.isArray(res.queue)) {
+        setCurrentQueue(res.queue);
+      }
+      showToast(t("toast.queuedPrompt"));
+      refreshConversations();
+      return true;
+    }
+
+    if (!state.currentConv) {
+      state.sidecarUserPicked = true;
+      state.currentConv = {
+        id: "",
+        title: text.slice(0, 36),
+        source: "mobile",
+        messages: [],
+        deliverables: [],
+      };
+    }
+    const targetConv = state.currentConv;
+    const optimisticMsg = {
+      role: "user",
+      text: text,
+      attachments: [],
+      time: new Date().toISOString(),
+    };
+    targetConv.messages.push(optimisticMsg);
+    const sendSeq = ++state.openConvSeq;
+    state.streaming = true;
+    state.streamBuffer = "";
+    state.streamTools = [];
+    renderConversation();
+
+    try {
+      const res = await apiFetch("/api/chat/send", {
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: targetCid,
+          prompt: text,
+          model: state.selectedModel,
+          attachments: [],
+          swarm_mode: state.swarmMode,
+          permission_mode: state.permissionMode,
+          mode: "normal",
+          priority: "normal",
+        }),
+      });
+      if (sendSeq === state.openConvSeq) {
+        if (res.queued === true) {
+          const msgIdx = targetConv.messages.lastIndexOf(optimisticMsg);
+          if (msgIdx !== -1) targetConv.messages.splice(msgIdx, 1);
+          if (Array.isArray(res.queue)) setCurrentQueue(res.queue);
+          renderConversation({ preserveScroll: true });
+          showToast(t("toast.queuedPrompt"));
+          return true;
+        }
+        const nextCid = res.conversation_id;
+        if (
+          nextCid &&
+          !(String(nextCid).startsWith("pending-") && state.currentCid && !state.currentCid.startsWith("pending-"))
+        ) {
+          state.currentCid = nextCid;
+          if (state.currentConv) state.currentConv.id = nextCid;
+          updateSidecarHeaderActions();
+        }
+        if (Array.isArray(res.queue)) setCurrentQueue(res.queue);
+      }
+      refreshConversations();
+      return true;
+    } catch (e) {
+      const msgIdx = targetConv.messages.lastIndexOf(optimisticMsg);
+      if (msgIdx !== -1) targetConv.messages.splice(msgIdx, 1);
+      state.streaming = false;
+      state.streamBuffer = "";
+      state.streamTools = [];
+      setConvError(
+        sendDraftKey,
+        buildErrorCardRecord(e.message || t("err.unknown"), e.errorCategory || classifyClientError(e.message), {
+          prompt: text,
+          attachments: [],
+          model: state.selectedModel,
+          swarmMode: state.swarmMode,
+        })
+      );
+      renderConversation({ preserveScroll: true });
+      showToast(t("ix.submitFail", { err: (e && e.message) || t("err.unknown") }));
+      return false;
+    }
+  }
+
+  async function handleInteractionAction(ixId, act, btnEl) {
+    const ix = findInteractionById(ixId);
+    if (!ix || ix.status !== "pending") return;
+    const draft = getInteractionDraft(ixId);
+    if (draft.submitting) return;
+
+    if (act === "perm") {
+      const decision = String((btnEl && btnEl.dataset.decision) || "allow_once");
+      const optionId = String((btnEl && btnEl.dataset.optId) || "");
+      draft.submitting = true;
+      refreshInteractionCardDom(ix);
+      haptic("light");
+      try {
+        await apiFetch(`/api/chat/interaction/${encodeURIComponent(ixId)}/respond`, {
+          method: "POST",
+          body: JSON.stringify({ decision, option_id: optionId }),
+        });
+        state.pendingInteractions = (state.pendingInteractions || []).filter((x) => x && x.id !== ixId);
+        delete state.interactionDrafts[ixId];
+        if (state.streaming && $("streaming-row")) updateStreamingRow();
+        else renderConversation({ preserveScroll: true });
+        showToast(t("ix.permResolvedToast", { decision: btnEl ? btnEl.textContent : decision }));
+      } catch (e) {
+        draft.submitting = false;
+        const msg = String((e && e.message) || "");
+        if (msg.includes("404") || msg.includes("409") || msg.includes("不存在") || msg.includes("已处理")) {
+          state.pendingInteractions = (state.pendingInteractions || []).filter((x) => x && x.id !== ixId);
+          delete state.interactionDrafts[ixId];
+          if (state.streaming && $("streaming-row")) updateStreamingRow();
+          else renderConversation({ preserveScroll: true });
+        } else {
+          refreshInteractionCardDom(ix);
+        }
+        showToast(t("ix.submitFail", { err: msg || t("err.unknown") }));
+      }
+      return;
+    }
+
+    if (act === "confirm") {
+      const qs = Array.isArray(ix.questions) ? ix.questions : [];
+      const hasAny = qs.some((_q, qIdx) => {
+        const qd = (draft.questions && draft.questions[qIdx]) || {};
+        return (Array.isArray(qd.selected) && qd.selected.length > 0) || Boolean(String(qd.otherText || "").trim());
+      });
+      if (!hasAny) {
+        showToast(t("ix.pickOptionFirst"));
+        return;
+      }
+      const replyText = formatAskQuestionReply(ix, draft);
+      draft.submitting = true;
+      refreshInteractionCardDom(ix);
+      haptic("light");
+      ix.status = "answered";
+      ix.selectedIndices = qs.map((_q, qIdx) => {
+        const qd = (draft.questions && draft.questions[qIdx]) || {};
+        return Array.isArray(qd.selected) ? qd.selected.slice() : [];
+      });
+      ix.customAnswers = qs.map((_q, qIdx) => {
+        const qd = (draft.questions && draft.questions[qIdx]) || {};
+        return String(qd.otherText || "").trim();
+      });
+      delete state.interactionDrafts[ixId];
+      await sendQuickReplyText(replyText);
+      showToast(t("ix.submittedToast"));
+      return;
+    }
+
+    if (act === "skip") {
+      haptic("light");
+      ix.status = "skipped";
+      delete state.interactionDrafts[ixId];
+      await sendQuickReplyText(t("ix.questionSkipped"));
+      showToast(t("ix.submittedToast"));
+      return;
+    }
+
+    if (act === "plan-proceed") {
+      haptic("light");
+      ix.status = "answered";
+      delete state.interactionDrafts[ixId];
+      await sendQuickReplyText(t("ix.planProceedMsg"));
+      showToast(t("ix.submittedToast"));
+      return;
+    }
+
+    if (act === "plan-modify") {
+      haptic("light");
+      const inp = $("prompt-input");
+      if (inp) {
+        const prefix = t("ix.planModifyMsg");
+        if (!inp.value.trim()) inp.value = prefix;
+        resizePromptInput();
+        inp.focus();
+      }
+    }
+  }
+
   function renderErrorCardHtml(errRec) {
     if (!errRec) return "";
     const meta = getErrCardMeta(errRec.category);
@@ -4840,7 +5406,19 @@
     const title = conv.title || "";
     const errRec = state.convErrors[getConvErrKey(cid)];
     const errTag = errRec ? String(errRec.timestamp || 1) : "";
-    return `${cid}|${msgs.length}|${lastRole}|${lastTime}|${lastTextLen}|${totalTextLen}|${lastToolsLen}|${lastAttsLen}|${running}|${delivs.length}|${title}|${errTag}`;
+    const msgIxTag = msgs
+      .map((m) =>
+        (m && Array.isArray(m.interactions) ? m.interactions : [])
+          .map((ix) => `${ix.id}:${ix.status}:${Array.isArray(ix.selectedIndices) ? ix.selectedIndices.join(",") : ""}`)
+          .join(";")
+      )
+      .filter(Boolean)
+      .join("|");
+    const liveIxTag = (state.pendingInteractions || [])
+      .map((ix) => `${ix.id}:${ix.status}:${ix.decision || ""}`)
+      .join(";");
+    const waitFlag = conv.waitingInteraction ? 1 : 0;
+    return `${cid}|${msgs.length}|${lastRole}|${lastTime}|${lastTextLen}|${totalTextLen}|${lastToolsLen}|${lastAttsLen}|${running}|${delivs.length}|${title}|${errTag}|${waitFlag}|${msgIxTag}|${liveIxTag}`;
   }
 
   function renderConversation(opts = {}) {
@@ -4984,7 +5562,7 @@
             .map(
               (tool) =>
                 `<div class="tool-step">` +
-                  `<span class="tool-step-status">✓</span>` +
+                  `<span class="tool-step-status ${tool.state === "REJECTED" ? "rejected" : ""}">${tool.state === "REJECTED" ? "✕" : "✓"}</span>` +
                   `<span class="tool-step-name">${escHtml(tool.name)}</span>` +
                   `<span class="tool-step-target">${escHtml(tool.target || "")}</span>` +
                 `</div>`
@@ -5005,6 +5583,9 @@
             </details>`;
         }
 
+        const ixCardsHtml = (Array.isArray(msg.interactions) && msg.interactions.length)
+          ? msg.interactions.map((ix) => renderInteractionCardHtml(ix)).join("")
+          : "";
         const mLabel = msg.model ? shortModelLabel(msg.model) : shortModelLabel(state.selectedModel);
         row.innerHTML = `
           <div class="assistant-flow">
@@ -5014,6 +5595,7 @@
             </div>
             ${toolsHtml}
             ${msg.text ? `<div class="md-body">${renderMarkdown(msg.text)}</div>` : ""}
+            ${ixCardsHtml}
             ${
               msg.text
                 ? `<div class="msg-actions">
@@ -5043,6 +5625,12 @@
       eRow.className = "msg-row error-row";
       eRow.innerHTML = renderErrorCardHtml(activeErrRec);
       list.appendChild(eRow);
+    } else if (Array.isArray(state.pendingInteractions) && state.pendingInteractions.length) {
+      const liveIxRow = document.createElement("div");
+      liveIxRow.id = "live-interaction-row";
+      liveIxRow.className = "msg-row assistant";
+      liveIxRow.innerHTML = `<div class="assistant-flow">${state.pendingInteractions.map((ix) => renderInteractionCardHtml(ix)).join("")}</div>`;
+      list.appendChild(liveIxRow);
     }
 
     // Inline Deliverables (Default Collapsed; preserve expanded state on silent refresh)
@@ -5113,7 +5701,7 @@
       .map(
         (tool) =>
           `<div class="tool-step">` +
-            `<span class="tool-step-status ${tool.state === "ACTIVE" ? "active" : ""}">${tool.state === "ACTIVE" ? "●" : "✓"}</span>` +
+            `<span class="tool-step-status ${tool.state === "ACTIVE" ? "active" : (tool.state === "REJECTED" ? "rejected" : "")}">${tool.state === "ACTIVE" ? "●" : (tool.state === "REJECTED" ? "✕" : "✓")}</span>` +
             `<span class="tool-step-name">${escHtml(tool.name)}</span>` +
             `<span class="tool-step-target">${escHtml(tool.target || "")}</span>` +
           `</div>`
@@ -5150,16 +5738,56 @@
          </button>`
       : "";
 
-    sRow.innerHTML = `
-      <div class="assistant-flow">
-        <div class="assistant-head">
-          <span class="assistant-avatar">${assistantMarkSvg()}</span>
-          <span>${escHtml(t("chat.liveOutput", { model: shortModelLabel(state.selectedModel) }))}</span>
-        </div>
-        ${swarmStripHtml}
-        ${traceHtml}
-        ${state.streamBuffer ? `<div class="md-body">${renderMarkdown(state.streamBuffer)}</div>` : ""}
-      </div>`;
+    const mdHtml = state.streamBuffer ? `<div class="md-body">${renderMarkdown(state.streamBuffer)}</div>` : "";
+    const liveIxs = Array.isArray(state.pendingInteractions) ? state.pendingInteractions : [];
+    const ixSig = liveIxs.map((x) => `${x.id}:${x.status}:${x.decision || ""}`).join("|");
+    const ixHtml = liveIxs.map((ix) => renderInteractionCardHtml(ix)).join("");
+
+    let flowEl = sRow.querySelector('[data-stream-flow="1"]');
+    if (!flowEl) {
+      sRow.innerHTML = `
+        <div class="assistant-flow" data-stream-flow="1">
+          <div class="assistant-head">
+            <span class="assistant-avatar">${assistantMarkSvg()}</span>
+            <span class="stream-head-label">${escHtml(t("chat.liveOutput", { model: shortModelLabel(state.selectedModel) }))}</span>
+          </div>
+          <div class="stream-swarm-slot"></div>
+          <div class="stream-trace-slot"></div>
+          <div class="stream-md-slot"></div>
+          <div class="stream-ix-slot"></div>
+        </div>`;
+      flowEl = sRow.querySelector('[data-stream-flow="1"]');
+    }
+    const headLbl = flowEl.querySelector(".stream-head-label");
+    if (headLbl) headLbl.textContent = t("chat.liveOutput", { model: shortModelLabel(state.selectedModel) });
+    const swarmSlot = flowEl.querySelector(".stream-swarm-slot");
+    if (swarmSlot && swarmSlot.dataset.lastHtml !== swarmStripHtml) {
+      swarmSlot.dataset.lastHtml = swarmStripHtml;
+      swarmSlot.innerHTML = swarmStripHtml;
+    }
+    const traceSlot = flowEl.querySelector(".stream-trace-slot");
+    if (traceSlot && traceSlot.dataset.lastHtml !== traceHtml) {
+      const prevDet = traceSlot.querySelector("details.m3-tool-card");
+      const wasOpen = prevDet ? prevDet.open : true;
+      traceSlot.dataset.lastHtml = traceHtml;
+      traceSlot.innerHTML = traceHtml;
+      const newDet = traceSlot.querySelector("details.m3-tool-card");
+      if (newDet) newDet.open = wasOpen;
+    }
+    const mdSlot = flowEl.querySelector(".stream-md-slot");
+    if (mdSlot && mdSlot.dataset.lastRaw !== (state.streamBuffer || "")) {
+      mdSlot.dataset.lastRaw = state.streamBuffer || "";
+      mdSlot.innerHTML = mdHtml;
+    }
+    const ixSlot = flowEl.querySelector(".stream-ix-slot");
+    if (ixSlot) {
+      const activeEl = document.activeElement;
+      const hasFocusInIx = Boolean(activeEl && ixSlot.contains(activeEl) && activeEl.classList && activeEl.classList.contains("ix-other-input"));
+      if (!hasFocusInIx && ixSlot.dataset.ixSig !== ixSig) {
+        ixSlot.dataset.ixSig = ixSig;
+        ixSlot.innerHTML = ixHtml;
+      }
+    }
     scrollToBottom(false);
   }
 
@@ -5311,7 +5939,9 @@
       .map((c) => {
         const act = c.id === state.currentCid ? "active" : "";
         let badge = "";
-        if (c.status === "running") {
+        if (c.waitingInteraction) {
+          badge = `<span class="ci-badge wait">${escHtml(t("drawer.badgeWaiting"))}</span>`;
+        } else if (c.status === "running") {
           badge = `<span class="ci-badge run">${escHtml(t("drawer.badgeRun"))}</span>`;
         } else if (c.source === "external") {
           badge = `<span class="ci-badge ext">${escHtml(t("drawer.badgeExt"))}</span>`;
@@ -5357,6 +5987,7 @@
       saveCurrentDraft(prevKey);
       state.currentCid = cid;
       state.lastRenderedConvFp = "";
+      state.pendingInteractions = [];
       state.currentQueue = [];
       state.editingQueueItemId = "";
       state.editingQueueDraft = "";
@@ -5385,6 +6016,7 @@
       if (reqSeq !== state.openConvSeq || state.currentCid !== cid) return;
       const nextConv = data.conversation;
       const nextRunning = Boolean(nextConv && nextConv.activeRun && nextConv.activeRun.running);
+      state.pendingInteractions = Array.isArray(nextConv && nextConv.pendingInteractions) ? nextConv.pendingInteractions : [];
       const nextFp = computeConvFingerprint(nextConv, nextRunning);
 
       state.currentConv = nextConv;
@@ -5468,6 +6100,7 @@
       state.lastRenderedConvFp = "";
       state.currentCid = "";
       state.currentConv = null;
+      state.pendingInteractions = [];
       state.currentQueue = [];
       state.editingQueueItemId = "";
       state.editingQueueDraft = "";
@@ -5491,6 +6124,7 @@
       renderConversation();
       renderConvList();
     } else {
+      state.pendingInteractions = [];
       state.currentQueue = [];
       state.editingQueueItemId = "";
       state.editingQueueDraft = "";
@@ -5554,6 +6188,7 @@
             model: state.selectedModel,
             attachments: attPaths,
             swarm_mode: state.swarmMode,
+            permission_mode: state.permissionMode,
             mode: normalizedMode,
             priority: normalizedMode === "interrupt" ? "urgent" : "normal",
           }),
@@ -5665,6 +6300,7 @@
           model: state.selectedModel,
           attachments: attPaths,
           swarm_mode: state.swarmMode,
+          permission_mode: state.permissionMode,
           mode: "normal",
           priority: "normal",
         }),
@@ -7277,6 +7913,7 @@
     renderSettingsHosts();
     syncDownloadSettingsUi();
     syncFilterUi();
+    syncPermissionModeUi();
     $("settings-open-qqbot")?.classList.toggle("hidden", !state.qqbotAvailable);
     showBanner($("settings-hosts-msg"), "", "");
     showBanner($("settings-add-msg"), "", "");
@@ -7607,7 +8244,7 @@
     // --- Bidirectional Horizontal Touch Swipe Gestures (Left Drawer <-> Right Swarm Drawer) ---
     let swipeState = null;
     const SWIPE_GUARD_SELECTOR =
-      ".code-block pre, .md-table-wrap, .photo-strip, .usage-daily-chart, .m3-segmented, .composer-tools-left, .attach-tray, .swarm-team-strip, input, textarea, select, [contenteditable]";
+      ".code-block pre, .md-table-wrap, .photo-strip, .usage-daily-chart, .m3-segmented, .composer-tools-left, .attach-tray, .swarm-team-strip, .interaction-card, input, textarea, select, [contenteditable]";
     const isAnyBlockingOverlayOpen = () => {
       if (!$("welcome-view")?.classList.contains("hidden")) return true;
       if (!$("pair-confirm-dialog")?.classList.contains("hidden")) return true;
@@ -7860,8 +8497,44 @@
       }
     }, { passive: false });
 
-    // --- Message Actions (Copy code, Copy reply, Preview file:///, Open Swarm, Revert, Retry) ---
+    // --- Message Actions (Copy code, Copy reply, Preview file:///, Open Swarm, Revert, Retry, Interactions) ---
     $("messages-list").addEventListener("click", (e) => {
+      const ixOptBtn = e.target.closest(".ix-opt-btn[data-ix-id]");
+      if (ixOptBtn) {
+        const ixId = String(ixOptBtn.dataset.ixId || "");
+        const qIdx = Number(ixOptBtn.dataset.qIdx || 0);
+        const oIdx = Number(ixOptBtn.dataset.optIdx || 0);
+        const ix = findInteractionById(ixId);
+        if (!ix || ix.status !== "pending") return;
+        const draft = getInteractionDraft(ixId);
+        if (draft.submitting) return;
+        const q = Array.isArray(ix.questions) ? ix.questions[qIdx] : null;
+        if (!q) return;
+        if (!draft.questions[qIdx]) draft.questions[qIdx] = { selected: [], otherText: "" };
+        const qd = draft.questions[qIdx];
+        const curSel = Array.isArray(qd.selected) ? qd.selected.slice() : [];
+        if (q.is_multi_select) {
+          const pos = curSel.indexOf(oIdx);
+          if (pos >= 0) curSel.splice(pos, 1);
+          else curSel.push(oIdx);
+          curSel.sort((a, b) => a - b);
+          qd.selected = curSel;
+        } else {
+          qd.selected = curSel.includes(oIdx) ? [] : [oIdx];
+        }
+        haptic("light");
+        refreshInteractionCardDom(ix);
+        return;
+      }
+
+      const ixActBtn = e.target.closest(".ix-action-btn[data-ix-act]");
+      if (ixActBtn) {
+        const ixId = String(ixActBtn.dataset.ixId || "");
+        const act = String(ixActBtn.dataset.ixAct || "");
+        handleInteractionAction(ixId, act, ixActBtn);
+        return;
+      }
+
       const swarmStrip = e.target.closest(".swarm-live-strip[data-open-swarm], .md-swarm-link[data-open-swarm]");
       if (swarmStrip) {
         openSwarmDrawer();
@@ -8363,6 +9036,37 @@
       });
     });
 
+    document.querySelectorAll(".perm-mode-opt[data-perm-mode]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const nextMode = String(btn.dataset.permMode || "auto").toLowerCase();
+        if (nextMode !== "auto" && nextMode !== "ask" && nextMode !== "bypass") return;
+        haptic("light");
+        setPermissionMode(nextMode);
+      });
+    });
+
+    $("messages-list").addEventListener("input", (e) => {
+      const inp = e.target.closest(".ix-other-input[data-ix-id]");
+      if (!inp) return;
+      const ixId = String(inp.dataset.ixId || "");
+      const qIdx = Number(inp.dataset.qIdx || 0);
+      const ix = findInteractionById(ixId);
+      if (!ix || ix.status !== "pending") return;
+      const draft = getInteractionDraft(ixId);
+      if (!draft.questions[qIdx]) draft.questions[qIdx] = { selected: [], otherText: "" };
+      draft.questions[qIdx].otherText = String(inp.value || "");
+      const cardEl = inp.closest(".interaction-card");
+      const confirmBtn = cardEl ? cardEl.querySelector('.ix-action-btn[data-ix-act="confirm"]') : null;
+      if (confirmBtn && !draft.submitting) {
+        const qs = Array.isArray(ix.questions) ? ix.questions : [];
+        const hasAny = qs.some((_q, idx) => {
+          const qd = (draft.questions && draft.questions[idx]) || {};
+          return (Array.isArray(qd.selected) && qd.selected.length > 0) || Boolean(String(qd.otherText || "").trim());
+        });
+        confirmBtn.disabled = !hasAny;
+      }
+    });
+
     document.querySelectorAll("[data-add-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const tab = btn.dataset.addTab;
@@ -8550,6 +9254,7 @@
     applyLanguage(state.langPref, { persist: false, notify: false, rerender: false });
     applyTheme(state.themePref, false);
     syncFilterUi();
+    syncPermissionModeUi();
     updateModelPill();
     bindEvents();
     updateSidecarHeaderActions();

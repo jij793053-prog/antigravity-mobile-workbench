@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.7.2" />
+  <link rel="stylesheet" href="./app.css?v=1.7.3" />
 </head>
 <body>
   <!-- =========================================================
@@ -865,6 +865,18 @@
         </div>
         <p class="info-text" style="margin-top:8px;" data-i18n="settings.filterDesc">默认仅显示桌面端与手机/工作台会话；开启后侧栏将多出「外部/QQ」栏位，用于查看终端或 QQ 机器人产生的独立对话。</p>
       </div>
+      <div class="m3-card">
+        <div class="section-heading-row">
+          <span class="section-heading" data-i18n="settings.permTitle">执行审批模式</span>
+          <span id="settings-perm-badge" class="section-meta" data-i18n="settings.permBadgeAuto">智能审批</span>
+        </div>
+        <div class="m3-segmented sm perm-mode-group" id="perm-mode-group" role="radiogroup" aria-label="Execution permission mode">
+          <button type="button" class="seg-btn perm-mode-opt active" data-perm-mode="auto" role="radio" aria-checked="true" data-i18n="settings.permAuto">智能审批</button>
+          <button type="button" class="seg-btn perm-mode-opt" data-perm-mode="ask" role="radio" aria-checked="false" data-i18n="settings.permAsk">逐步询问</button>
+          <button type="button" class="seg-btn perm-mode-opt" data-perm-mode="bypass" role="radio" aria-checked="false" data-i18n="settings.permBypass">全自动放行</button>
+        </div>
+        <p class="info-text" id="settings-perm-desc" style="margin-top:8px;" data-i18n="settings.permDescAuto">按电脑端默认策略运行；当 AI 发起方案选择（ask_question）或高危操作需确认时，将自动在手机端与工作台弹出交互卡片。</p>
+      </div>
 
       <!-- Saved Hosts List (Phone Client Only) -->
       <div class="m3-card phone-only">
@@ -1073,7 +1085,7 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./i18n.js?v=1.7.2"></script>
-  <script src="./app.js?v=1.7.2"></script>
+  <script src="./i18n.js?v=1.7.3"></script>
+  <script src="./app.js?v=1.7.3"></script>
 </body>
 </html>
