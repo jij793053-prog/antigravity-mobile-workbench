@@ -1,7 +1,7 @@
 {
   "name": "antigravity-sync",
   "displayName": "Mobile Sync",
-  "version": "1.7.4",
+  "version": "1.7.5",
   "description": "Live two-way Mobile & Desktop Sync Workbench inside Antigravity's side pane and sidebar: unified conversation timeline, real-time WebSocket streaming, model/Swarm controls, Usage Dashboard, and Phone QR Pairing.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

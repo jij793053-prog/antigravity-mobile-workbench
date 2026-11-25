@@ -3151,7 +3151,6 @@ body.desktop-host-mode .phone-only {
   body.welcome-active .m3-drawer {
     display: none !important;
   }
-  #btn-close-drawer,
   #btn-drawer {
     display: none !important;
   }
@@ -3429,7 +3428,6 @@ body.agy-sidecar-mode ::-webkit-scrollbar-thumb:hover {
   body.agy-sidecar-sidebar.welcome-active .m3-drawer {
     display: none !important;
   }
-  body.agy-sidecar-sidebar #btn-close-drawer,
   body.agy-sidecar-sidebar #btn-drawer {
     display: none !important;
   }
@@ -3467,8 +3465,7 @@ body.agy-sidecar-auxpane .m3-drawer {
 body.agy-sidecar-auxpane .m3-drawer.open {
   transform: translateX(0) !important;
 }
-body.agy-sidecar-auxpane #btn-drawer,
-body.agy-sidecar-auxpane #btn-close-drawer {
+body.agy-sidecar-auxpane #btn-drawer {
   display: inline-flex !important;
 }
 body.agy-sidecar-auxpane .app-shell {

@@ -198,6 +198,11 @@
     permissionMode: "auto",
     pendingInteractions: [],
     interactionDrafts: {},
+
+    // v1.7.5: Send idempotency & double-submit protection
+    normalSendInFlight: false,
+    lastClientMsgKey: "",
+    lastClientMsgId: "",
   };
 
   const darkMedia = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -2677,7 +2682,7 @@
     return s;
   }
 
-  const MAX_MD_CACHE_ENTRIES = 320;
+  const MAX_MD_CACHE_ENTRIES = 1000;
   const MAX_MD_CACHE_INPUT_LEN = 120000;
   const mdHtmlCache = new Map();
 
@@ -7491,6 +7496,12 @@
     const sendDraftKey = currentDraftKey();
     const prevAttachments = state.attachments.slice();
     const attPaths = prevAttachments.map((a) => a.path);
+    const msgKey = `${state.currentCid || "__new__"}|${normalizedMode}|${text}|${attPaths.join(",")}`;
+    const clientMsgId = (state.lastClientMsgKey === msgKey && state.lastClientMsgId)
+      ? state.lastClientMsgId
+      : `cm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    state.lastClientMsgKey = msgKey;
+    state.lastClientMsgId = clientMsgId;
     clearConvError(sendDraftKey);
 
     // Queue or Cut-in while streaming on an active conversation
@@ -7525,8 +7536,11 @@
             permission_mode: state.permissionMode,
             mode: normalizedMode,
             priority: normalizedMode === "interrupt" ? "urgent" : "normal",
+            client_msg_id: clientMsgId,
           }),
         });
+        state.lastClientMsgKey = "";
+        state.lastClientMsgId = "";
 
         if (state.currentCid === targetCid) {
           if (Array.isArray(res.queue)) {
@@ -7602,6 +7616,9 @@
       return;
     }
 
+    if (state.normalSendInFlight) return;
+    state.normalSendInFlight = true;
+    const prevActiveRunId = state.activeRunId;
     const createdNewConv = !state.currentConv;
     if (createdNewConv) {
       state.sidecarUserPicked = true;
@@ -7649,10 +7666,13 @@
           permission_mode: state.permissionMode,
           mode: "normal",
           priority: "normal",
+          client_msg_id: clientMsgId,
         }),
       });
+      state.lastClientMsgKey = "";
+      state.lastClientMsgId = "";
       if (sendSeq === state.openConvSeq) {
-        if (res.queued === true) {
+        if (res.queued === true && !res.deduplicated) {
           // Race condition: another device started streaming right before our normal send
           const msgIdx = targetConv.messages.lastIndexOf(optimisticMsg);
           if (msgIdx !== -1) {
@@ -7676,12 +7696,28 @@
           if (state.currentConv) state.currentConv.id = nextCid;
           updateSidecarHeaderActions();
         }
+        if (res.run_id && !state.activeRunId) {
+          state.activeRunId = String(res.run_id);
+        }
         if (Array.isArray(res.queue)) {
           setCurrentQueue(res.queue);
         }
       }
       refreshConversations();
     } catch (e) {
+      // If WS already confirmed the run started (e.g. HTTP response dropped on 5G/Cloudflare after server accepted it),
+      // do NOT roll back streaming or restore draft (which causes user to resend a duplicate into the queue!).
+      const wsAlreadyStarted = Boolean(
+        sendSeq === state.openConvSeq &&
+        state.streaming &&
+        state.activeRunId &&
+        state.activeRunId !== prevActiveRunId
+      );
+      if (wsAlreadyStarted) {
+        state.lastClientMsgKey = "";
+        state.lastClientMsgId = "";
+        return;
+      }
       const msgIdx = targetConv.messages.lastIndexOf(optimisticMsg);
       if (msgIdx !== -1) {
         targetConv.messages.splice(msgIdx, 1);
@@ -7725,6 +7761,8 @@
         updateSendButton();
       }
       showToast(t("toast.sendFail", { err: e.message }));
+    } finally {
+      state.normalSendInFlight = false;
     }
   }
 
@@ -9795,7 +9833,7 @@
 
     // --- Top Bar & Drawer ---
     $("btn-drawer").addEventListener("click", openDrawer);
-    $("btn-close-drawer").addEventListener("click", closeDrawer);
+    $("btn-close-drawer")?.addEventListener("click", closeDrawer);
     $("drawer-backdrop").addEventListener("click", closeDrawer);
     $("btn-new-top").addEventListener("click", startNewChat);
     $("btn-new-chat").addEventListener("click", startNewChat);

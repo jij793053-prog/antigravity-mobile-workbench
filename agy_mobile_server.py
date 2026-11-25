@@ -43,7 +43,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.7.4"
+APP_VERSION = "1.7.5"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -194,8 +194,11 @@ _CONV_QUEUES_LOCK = threading.Lock()
 _CONV_QUEUES: dict[str, list[dict[str, Any]]] = {}
 _CONV_QUEUE_MAX = 20
 _DRAINING_CIDS: set[str] = set()
+_STARTING_CIDS: dict[str, dict[str, Any]] = {}
 _RECENT_STARTED_QIDS: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
 _RECENT_STARTED_QIDS_MAX = 128
+_RECENT_CLIENT_MSG_IDS: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
+_RECENT_CLIENT_MSG_IDS_MAX = 128
 _PENDING_SPAWNS: int = 0
 _MAX_CONCURRENT_RUNS = 4
 _WS_CLIENTS: set[web.WebSocketResponse] = set()
@@ -3630,7 +3633,7 @@ def load_conversation_detail(
                 "pendingInteractions": live_pending_ix,
             }
 
-    out_slice = messages[-120:] if _apply_revert_filter else messages
+    out_slice = messages[-2000:] if _apply_revert_filter else messages
     out_msgs = [dict(m) for m in out_slice] if _keep_internal_src else [{k: v for k, v in m.items() if k != "_src"} for m in out_slice]
 
     detail_out: dict[str, Any] = {
@@ -5951,6 +5954,7 @@ async def handle_chat_send(request: web.Request) -> web.Response:
     if cid and cid != "__new__" and not _is_valid_cid(cid):
         return web.json_response({"ok": False, "error": "invalid conversation_id"}, status=400)
     prompt = str(body.get("prompt") or "")
+    client_msg_id = str(body.get("client_msg_id") or "").strip()[:64]
     model = str(body.get("model") or "").strip()
     if model and not _is_valid_model_id(model):
         return web.json_response({"ok": False, "error": "invalid model"}, status=400)
@@ -5983,22 +5987,122 @@ async def handle_chat_send(request: web.Request) -> web.Response:
         canon, _, cands = _get_cid_alias_candidates(cid)
         active_rec = _find_active_run(canon or cid)
 
+    now_send_ts = time.time()
+    norm_prompt_key = prompt.strip()
+    norm_atts_tuple = tuple(norm_atts)
+
+    # Idempotency guard: deduplicate identical client_msg_id retries (e.g. mobile 5G / tunnel HTTP drops)
+    if client_msg_id:
+        prev_cm_hit: dict[str, Any] | None = None
+        with _CONV_QUEUES_LOCK:
+            prev_cm = _RECENT_CLIENT_MSG_IDS.get(client_msg_id)
+            if prev_cm and (now_send_ts - float(prev_cm.get("ts") or 0.0)) < 120.0:
+                prev_cm_hit = dict(prev_cm)
+        if prev_cm_hit is not None:
+            prev_cid = str(prev_cm_hit.get("cid") or canon or cid)
+            prev_run_id = str(prev_cm_hit.get("run_id") or "")
+            prev_queued = bool(prev_cm_hit.get("queued", False))
+            dup_snap = get_conv_queue_snapshot(prev_cid) if prev_cid else []
+            return web.json_response({
+                "ok": True,
+                "queued": prev_queued and any(str(x.get("id") or "") == str(prev_cm_hit.get("queue_id") or "") for x in dup_snap),
+                "deduplicated": True,
+                "conversation_id": prev_cid,
+                "run_id": prev_run_id,
+                "queue": dup_snap,
+            })
+
+    # Per-conversation startup guard: if an idle run is already mid-spawn (3-8s ACP init), avoid duplicate spawn/queue
+    start_key = canon or cid
+    starting_hit: dict[str, Any] | None = None
+    if active_rec is None and not is_new and start_key:
+        with _ACTIVE_RUNS_LOCK:
+            for k in cands:
+                st_rec = _STARTING_CIDS.get(k)
+                if st_rec and (now_send_ts - float(st_rec.get("started_at") or 0.0)) < 60.0:
+                    starting_hit = dict(st_rec)
+                    break
+            if starting_hit is None:
+                _STARTING_CIDS[start_key] = {
+                    "prompt": norm_prompt_key,
+                    "attachments": norm_atts_tuple,
+                    "client_msg_id": client_msg_id,
+                    "started_at": now_send_ts,
+                }
+
+    if starting_hit is not None:
+        if mode == "normal" and (
+            (client_msg_id and client_msg_id == str(starting_hit.get("client_msg_id") or ""))
+            or (
+                norm_prompt_key == str(starting_hit.get("prompt") or "")
+                and norm_atts_tuple == tuple(starting_hit.get("attachments") or ())
+            )
+        ):
+            return web.json_response({
+                "ok": True,
+                "queued": False,
+                "deduplicated": True,
+                "conversation_id": start_key,
+                "run_id": "",
+                "queue": get_conv_queue_snapshot(start_key),
+            })
+        # Different prompt arrived while another run is mid-spawn -> treat as active so it queues cleanly
+        active_rec = {"running": True, "starting": True, "cancel_reason": ""}
+
     # Idle conversation (or new chat): execute immediately
     if active_rec is None:
-        res = await asyncio.to_thread(
-            start_cli_chat_run,
-            canon or cid,
-            prompt,
-            eff_model,
-            norm_atts,
-            swarm_mode,
-            raw_pm or None,
-        )
+        try:
+            res = await asyncio.to_thread(
+                start_cli_chat_run,
+                canon or cid,
+                prompt,
+                eff_model,
+                norm_atts,
+                swarm_mode,
+                raw_pm or None,
+            )
+        finally:
+            if not is_new and start_key:
+                with _ACTIVE_RUNS_LOCK:
+                    cur_st = _STARTING_CIDS.get(start_key)
+                    if cur_st and cur_st.get("started_at") == now_send_ts:
+                        _STARTING_CIDS.pop(start_key, None)
         if res.get("ok"):
             res["queued"] = False
+            if client_msg_id:
+                with _CONV_QUEUES_LOCK:
+                    _RECENT_CLIENT_MSG_IDS[client_msg_id] = {
+                        "cid": str(res.get("conversation_id") or start_key),
+                        "run_id": str(res.get("run_id") or ""),
+                        "queue_id": "",
+                        "queued": False,
+                        "ts": time.time(),
+                    }
+                    _RECENT_CLIENT_MSG_IDS.move_to_end(client_msg_id)
+                    while len(_RECENT_CLIENT_MSG_IDS) > _RECENT_CLIENT_MSG_IDS_MAX:
+                        _RECENT_CLIENT_MSG_IDS.popitem(last=False)
         return web.json_response(res, status=200 if res.get("ok") else 400)
 
     target_cid = canon or cid
+    # Normal-send duplicate guard: if the exact same prompt just started running (<45s ago), never enqueue a ghost duplicate
+    if mode == "normal" and not active_rec.get("starting"):
+        ar_prompt = str(active_rec.get("prompt") or "").strip()
+        ar_atts = tuple(
+            str(a.get("path") or "")
+            for a in (active_rec.get("attachments") or [])
+            if isinstance(a, dict) and a.get("path")
+        )
+        ar_age = now_send_ts - float(active_rec.get("started_at") or 0.0)
+        if ar_age < 45.0 and norm_prompt_key == ar_prompt and norm_atts_tuple == ar_atts:
+            dup_snap = get_conv_queue_snapshot(target_cid)
+            return web.json_response({
+                "ok": True,
+                "queued": False,
+                "deduplicated": True,
+                "conversation_id": target_cid,
+                "run_id": str(active_rec.get("run_id") or ""),
+                "queue": dup_snap,
+            })
     is_interrupt = mode == "interrupt"
     item_priority = "urgent" if (is_interrupt or priority == "urgent") else "normal"
     att_metas_q = [_build_attachment_meta(ap) for ap in valid_att_paths]
@@ -6092,22 +6196,34 @@ async def handle_chat_send(request: web.Request) -> web.Response:
         })
 
     _broadcast_queue_updated(target_cid, snap)
-    # Race guard: if the active run finished just before enqueue landed (and wasn't user-canceled), drain now
+    # Race guard: if the active run finished just before enqueue landed (and wasn't user-canceled), drain synchronously before responding
+    started_res: dict[str, Any] | None = None
     if (
         not active_rec.get("running")
         and str(active_rec.get("cancel_reason") or "") != "user"
         and _find_active_run(target_cid) is None
     ):
-        threading.Thread(
-            target=_drain_next_queued_run,
-            args=(target_cid,),
-            name=f"queue-drain-{target_cid[:8]}",
-            daemon=True,
-        ).start()
+        started_res = await asyncio.to_thread(_drain_next_queued_run, target_cid)
     fresh_snap = get_conv_queue_snapshot(target_cid)
+    still_queued = any(str(x.get("id") or "") == item_id for x in fresh_snap)
+    started_ok = bool(started_res and started_res.get("ok")) and not still_queued
+    if client_msg_id:
+        with _CONV_QUEUES_LOCK:
+            _RECENT_CLIENT_MSG_IDS[client_msg_id] = {
+                "cid": target_cid,
+                "run_id": str((started_res or {}).get("run_id") or ""),
+                "queue_id": item_id,
+                "queued": still_queued,
+                "ts": time.time(),
+            }
+            _RECENT_CLIENT_MSG_IDS.move_to_end(client_msg_id)
+            while len(_RECENT_CLIENT_MSG_IDS) > _RECENT_CLIENT_MSG_IDS_MAX:
+                _RECENT_CLIENT_MSG_IDS.popitem(last=False)
     return web.json_response({
         "ok": True,
-        "queued": any(str(x.get("id") or "") == item_id for x in fresh_snap),
+        "queued": still_queued,
+        "started": started_ok,
+        "run_id": str((started_res or {}).get("run_id") or ""),
         "conversation_id": target_cid,
         "item": item_snap,
         "queue": fresh_snap,
