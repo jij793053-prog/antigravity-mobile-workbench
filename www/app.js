@@ -153,6 +153,13 @@
     lastConvListFp: "",
     lastCanRevert: null,
     apiEtags: {},
+    etagHeaderUnsupported: false,
+    openConvAbort: null,
+    openConvInFlightCid: "",
+    openConvInFlightSilent: false,
+    openConvQueuedRefresh: null,
+    openConvLoadingCid: "",
+    openConvLoadError: null,
 
     // v1.7.0: Prompt queue & Context window state
     currentQueue: [],
@@ -1196,43 +1203,108 @@
     const host = getActiveHost();
     if (!host || (!SIDECAR && !host.url)) throw new Error(t("err.noHost"));
     const etagKey = opts && typeof opts.etagKey === "string" ? opts.etagKey : "";
+    const sendIfNoneMatch = opts.sendIfNoneMatch !== undefined ? Boolean(opts.sendIfNoneMatch) : Boolean(etagKey);
+    const storeEtag = opts.storeEtag !== false;
     const headers = Object.assign({}, opts.headers || {});
     if (host.token) headers["Authorization"] = `Bearer ${host.token}`;
     if (opts.body && !(opts.body instanceof FormData) && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    if (etagKey && state.apiEtags[etagKey] && !headers["If-None-Match"]) {
+    let attachedIfNoneMatch = false;
+    if (
+      etagKey &&
+      sendIfNoneMatch &&
+      !state.etagHeaderUnsupported &&
+      state.apiEtags[etagKey] &&
+      !headers["If-None-Match"]
+    ) {
       headers["If-None-Match"] = state.apiEtags[etagKey];
+      attachedIfNoneMatch = true;
     }
+    const extSignal = opts.signal || null;
     const fetchOpts = Object.assign({}, opts, { headers });
     delete fetchOpts.timeoutMs;
     delete fetchOpts.etagKey;
+    delete fetchOpts.sendIfNoneMatch;
+    delete fetchOpts.storeEtag;
+    delete fetchOpts.signal;
+    if (!fetchOpts.cache) {
+      fetchOpts.cache = "no-store";
+    }
     const isLongOp = opts.body instanceof FormData || path === "/api/chat/send";
     const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : (isLongOp ? 120000 : 15000);
-    let ctrl = null;
-    let timer = null;
-    if (!fetchOpts.signal && typeof AbortController !== "undefined") {
-      ctrl = new AbortController();
-      fetchOpts.signal = ctrl.signal;
-      timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    }
+    const runSingleFetch = async (reqHeaders) => {
+      const reqOpts = Object.assign({}, fetchOpts, { headers: reqHeaders });
+      let ctrl = null;
+      let timer = null;
+      let timedOut = false;
+      let externalAborted = false;
+      const onExtAbort = () => {
+        externalAborted = true;
+        if (ctrl) {
+          try { ctrl.abort(); } catch (_) {}
+        }
+      };
+      if (typeof AbortController !== "undefined") {
+        ctrl = new AbortController();
+        reqOpts.signal = ctrl.signal;
+        if (extSignal) {
+          if (extSignal.aborted) {
+            externalAborted = true;
+            ctrl.abort();
+          } else {
+            extSignal.addEventListener("abort", onExtAbort, { once: true });
+          }
+        }
+        timer = setTimeout(() => {
+          timedOut = true;
+          ctrl.abort();
+        }, timeoutMs);
+      } else if (extSignal) {
+        reqOpts.signal = extSignal;
+      }
+      try {
+        return await fetch(`${getApiBase(host)}${path}`, reqOpts);
+      } catch (err) {
+        if (externalAborted || (extSignal && extSignal.aborted)) {
+          const abErr = new Error("Request aborted");
+          abErr.name = "AbortError";
+          abErr.isExternalAbort = true;
+          throw abErr;
+        }
+        if (timedOut || (err && err.name === "AbortError" && ctrl)) {
+          throw new Error(t("err.reqTimeout"));
+        }
+        throw err;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (extSignal) {
+          try { extSignal.removeEventListener("abort", onExtAbort); } catch (_) {}
+        }
+      }
+    };
+
     let resp;
     try {
-      resp = await fetch(`${getApiBase(host)}${path}`, fetchOpts);
+      resp = await runSingleFetch(headers);
     } catch (err) {
-      if (err && err.name === "AbortError" && ctrl) {
-        throw new Error(t("err.reqTimeout"));
+      // Backward-compat CORS fallback: older servers (< v1.7.4) did not allow If-None-Match in CORS preflight
+      if (attachedIfNoneMatch && !(err && (err.name === "AbortError" || err.isExternalAbort))) {
+        const retryHeaders = Object.assign({}, headers);
+        delete retryHeaders["If-None-Match"];
+        attachedIfNoneMatch = false;
+        resp = await runSingleFetch(retryHeaders);
+        state.etagHeaderUnsupported = true;
+      } else {
+        throw err;
       }
-      throw err;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
     if (resp.status === 401) {
       setConnState("offline", t("conn.tokenInvalid"));
       throw new Error(t("err.auth401"));
     }
     if (resp.status === 304) {
-      if (etagKey) {
+      if (etagKey && storeEtag && !(extSignal && extSignal.aborted)) {
         const nextTag = resp.headers.get("etag") || "";
         if (nextTag) state.apiEtags[etagKey] = nextTag;
       }
@@ -1248,7 +1320,7 @@
         err.code = data && data.code ? String(data.code) : "";
         throw err;
       }
-      if (etagKey) {
+      if (etagKey && storeEtag && !(extSignal && extSignal.aborted)) {
         const hdrTag = resp.headers.get("etag") || "";
         const revTag = data && typeof data.revision === "string" && data.revision ? `W/"${data.revision}"` : "";
         const nextTag = hdrTag || revTag;
@@ -1305,6 +1377,8 @@
   let _refreshConvsTimer = null;
   let _lastRefreshConvsAt = 0;
   let _lastResumeSyncAt = 0;
+  let _desktopUpdateRefreshTimer = null;
+  let _lastDesktopUpdateFetchAt = 0;
 
   function disconnectWs(opts = {}) {
     const { preservePollCursor = false } = opts || {};
@@ -1317,6 +1391,8 @@
     state.sidecarPollTimer = null;
     clearTimeout(_refreshConvsTimer);
     _refreshConvsTimer = null;
+    clearTimeout(_desktopUpdateRefreshTimer);
+    _desktopUpdateRefreshTimer = null;
     if (state.sidecarPollAbort) {
       try {
         state.sidecarPollAbort.abort();
@@ -1562,6 +1638,7 @@
     closeImageLightbox();
     destroyPreviewZoom();
     disarmBottomAnchor();
+    cancelOpenConvInFlight();
     state.openConvSeq += 1;
     state.lastRenderedConvFp = "";
     state.renderedConvCid = "";
@@ -1569,6 +1646,9 @@
     state.lastConvListFp = "";
     state.lastCanRevert = null;
     state.apiEtags = {};
+    state.etagHeaderUnsupported = false;
+    state.openConvLoadingCid = "";
+    state.openConvLoadError = null;
     state.currentCid = "";
     state.currentConv = null;
     state.currentQueue = [];
@@ -2206,14 +2286,19 @@
       }
       if (!state.currentConv) {
         const pTxt = String((promptInfo && (promptInfo.displayText || promptInfo.prompt)) || "").trim();
+        const cidTarget = state.currentCid || cid;
+        const listedConv = (state.conversations || []).find((c) => c && c.id === cidTarget);
         state.currentConv = {
-          id: state.currentCid || cid,
-          title: pTxt.slice(0, 36) || t("chat.newConvTitle"),
-          source: "mobile",
+          id: cidTarget,
+          title: (listedConv && listedConv.title) || pTxt.slice(0, 36) || t("chat.newConvTitle"),
+          source: (listedConv && listedConv.source) || "mobile",
           messages: [],
           deliverables: [],
+          _isStreamStub: true,
         };
       }
+      state.openConvLoadingCid = "";
+      state.openConvLoadError = null;
       const insertedUser = promptInfo ? ensureActiveRunUserMessage(state.currentConv, promptInfo) : false;
       const prevRunId = state.activeRunId;
       const nextRunId = String(runId || "");
@@ -2415,7 +2500,7 @@
       );
       if (matchesCurrent) {
         if (!state.streaming || !$("streaming-row")) {
-          ensurePeerStreamAttached("", [], ev.model);
+          ensurePeerStreamAttached(null, ev.model);
         }
         const curList = Array.isArray(state.pendingInteractions) ? state.pendingInteractions.slice() : [];
         const prevIdx = curList.findIndex((x) => x && x.id === ix.id);
@@ -2470,7 +2555,7 @@
           setCurrentContext(ev.context_window);
         }
         if (!state.streaming) {
-          openConversation(state.currentCid, { silent: true });
+          scheduleDesktopUpdateRefresh(state.currentCid);
         }
       }
       refreshConversationsThrottled();
@@ -6005,10 +6090,12 @@
       return true;
     }
 
+    state.openConvLoadingCid = "";
+    state.openConvLoadError = null;
     if (!state.currentConv) {
       state.sidecarUserPicked = true;
       state.currentConv = {
-        id: "",
+        id: state.currentCid || "",
         title: text.slice(0, 36),
         source: "mobile",
         messages: [],
@@ -6564,15 +6651,70 @@
       state.lastDelivsFp = "";
       state.lastCanRevert = null;
       state.isPinnedToBottom = true;
-      if (activeErrRec) {
+
+      const isLoadingConv = Boolean(state.openConvLoadingCid && state.openConvLoadingCid === state.currentCid);
+      const loadErr = (state.openConvLoadError && state.openConvLoadError.cid === state.currentCid)
+        ? state.openConvLoadError
+        : null;
+      const isEmptyExistingConv = Boolean(
+        !isLoadingConv &&
+        !loadErr &&
+        !activeErrRec &&
+        state.currentCid &&
+        !String(state.currentCid).startsWith("pending-")
+      );
+
+      if (isLoadingConv) {
+        $("empty-state").classList.add("hidden");
+        list.innerHTML = `
+          <div id="conv-loading-row" class="conv-state-wrap" role="status" aria-live="polite">
+            <div class="conv-loading-pill">
+              <span class="conv-loading-spinner" aria-hidden="true"></span>
+              <span>${escHtml(t("chat.loadingConv"))}</span>
+            </div>
+          </div>`;
+        $("conv-title").textContent = getConversationTitleHint(state.currentCid);
+      } else if (loadErr) {
+        $("empty-state").classList.add("hidden");
+        list.innerHTML = `
+          <div class="conv-state-wrap">
+            <div class="msg-error-card conv-load-error-card" data-load-err-cid="${escHtml(loadErr.cid)}">
+              <div class="msg-error-head">
+                <span class="msg-error-badge">${ERROR_ICON_SVG}</span>
+                <div class="msg-error-titles">
+                  <div class="msg-error-title">${escHtml(t("chat.loadConvErrTitle"))}</div>
+                  <div class="msg-error-hint">${escHtml(t("chat.loadConvErrHint"))}</div>
+                </div>
+              </div>
+              ${loadErr.message ? `<pre class="msg-error-raw">${escHtml(loadErr.message)}</pre>` : ""}
+              <div class="msg-error-actions">
+                <button class="msg-error-btn primary btn-retry-open-conv" type="button" data-retry-cid="${escHtml(loadErr.cid)}">${RETRY_ICON_SVG}<span>${escHtml(t("chat.loadConvRetry"))}</span></button>
+                <button class="msg-error-btn btn-load-err-home" type="button"><span>${escHtml(t("chat.loadConvHome"))}</span></button>
+              </div>
+            </div>
+          </div>`;
+        $("conv-title").textContent = loadErr.title || getConversationTitleHint(state.currentCid);
+      } else if (activeErrRec) {
         $("empty-state").classList.add("hidden");
         list.innerHTML = `<div class="msg-row error-row">${renderErrorCardHtml(activeErrRec)}</div>`;
+        $("conv-title").textContent = (conv && conv.title) ? conv.title : (state.currentCid ? getConversationTitleHint(state.currentCid) : "Antigravity");
+      } else if (isEmptyExistingConv) {
+        $("empty-state").classList.add("hidden");
+        list.innerHTML = `
+          <div class="conv-state-wrap">
+            <div class="conv-empty-card" data-empty-cid="${escHtml(state.currentCid)}">
+              <div class="conv-empty-title">${escHtml(t("chat.emptyConvTitle"))}</div>
+              <p class="conv-empty-desc">${escHtml(t("chat.emptyConvDesc"))}</p>
+              <button class="m3-btn tonal sm btn-retry-open-conv" type="button" data-retry-cid="${escHtml(state.currentCid)}">${RETRY_ICON_SVG}<span>${escHtml(t("chat.refreshConv"))}</span></button>
+            </div>
+          </div>`;
+        $("conv-title").textContent = (conv && conv.title) ? conv.title : getConversationTitleHint(state.currentCid);
       } else {
         $("empty-state").classList.remove("hidden");
         list.innerHTML = "";
+        $("conv-title").textContent = (conv && conv.title) ? conv.title : "Antigravity";
       }
       $("deliverables-box").classList.add("hidden");
-      $("conv-title").textContent = (conv && conv.title) ? conv.title : "Antigravity";
       updateTurnTriggerUi();
       updateHostDisplays();
       updateSidecarHeaderActions();
@@ -7261,21 +7403,116 @@
       .join("");
   }
 
+  function getConversationTitleHint(cid) {
+    if (!cid) return "Antigravity";
+    if (state.currentConv && state.currentConv.id === cid && state.currentConv.title) {
+      return state.currentConv.title;
+    }
+    const found = (state.conversations || []).find((c) => c && c.id === cid);
+    if (found && found.title) return found.title;
+    return `对话 ${String(cid).slice(0, 8)}`;
+  }
+
+  function isConvRenderedInDom(cid) {
+    if (!cid) return false;
+    const emptyEl = $("empty-state");
+    const emptyHidden = Boolean(emptyEl && emptyEl.classList.contains("hidden"));
+    const conv = state.currentConv;
+    const hasMessages = Boolean(
+      conv &&
+      conv.id === cid &&
+      !conv._isStreamStub &&
+      Array.isArray(conv.messages) &&
+      conv.messages.length > 0
+    );
+    return Boolean(
+      hasMessages &&
+      state.renderedConvCid === cid &&
+      emptyHidden &&
+      !state.openConvLoadingCid &&
+      !state.openConvLoadError
+    );
+  }
+
+  function cancelOpenConvInFlight() {
+    if (_desktopUpdateRefreshTimer) {
+      clearTimeout(_desktopUpdateRefreshTimer);
+      _desktopUpdateRefreshTimer = null;
+    }
+    state.openConvQueuedRefresh = null;
+    if (state.openConvAbort) {
+      try {
+        state.openConvAbort.abort();
+      } catch (_) {}
+      state.openConvAbort = null;
+    }
+    state.openConvInFlightCid = "";
+    state.openConvInFlightSilent = false;
+  }
+
+  function scheduleDesktopUpdateRefresh(cid) {
+    if (!cid || cid !== state.currentCid || state.streaming) return;
+    if (state.openConvInFlightCid === cid) {
+      state.openConvQueuedRefresh = {
+        cid,
+        bypassEtag: Boolean(state.openConvQueuedRefresh && state.openConvQueuedRefresh.bypassEtag),
+      };
+      return;
+    }
+    const now = Date.now();
+    const minGap = 900;
+    const elapsed = now - _lastDesktopUpdateFetchAt;
+    if (elapsed >= minGap && !_desktopUpdateRefreshTimer) {
+      _lastDesktopUpdateFetchAt = now;
+      openConversation(cid, { silent: true });
+      return;
+    }
+    if (_desktopUpdateRefreshTimer) return;
+    const wait = Math.max(300, minGap - elapsed);
+    _desktopUpdateRefreshTimer = setTimeout(() => {
+      _desktopUpdateRefreshTimer = null;
+      if (state.currentCid === cid && !state.streaming) {
+        _lastDesktopUpdateFetchAt = Date.now();
+        openConversation(cid, { silent: true });
+      }
+    }, wait);
+  }
+
   async function openConversation(cid, opts = {}) {
     const { silent = false, autoFollow = false, userPicked = false, bypassEtag = false } = opts || {};
     if (!cid) return;
     if (userPicked) {
       state.sidecarUserPicked = true;
     }
-    const prevKey = currentDraftKey();
+
     const switching = cid !== state.currentCid;
+
+    // Never let a background silent refresh preempt or abort an already in-flight load for the same conversation.
+    if (!switching && silent && !userPicked && state.openConvInFlightCid === cid) {
+      state.openConvQueuedRefresh = {
+        cid,
+        bypassEtag: Boolean(bypassEtag || (state.openConvQueuedRefresh && state.openConvQueuedRefresh.bypassEtag)),
+      };
+      return;
+    }
+
+    const prevKey = currentDraftKey();
+    const alreadyRendered = !switching && isConvRenderedInDom(cid);
+    const hadExplicitLoadError = Boolean(!switching && state.openConvLoadError && state.openConvLoadError.cid === cid);
+
     if (switching) {
+      cancelOpenConvInFlight();
+      cancelScheduledStreamingRowUpdate();
       closeTurnNavigator();
       closeContextPopover();
       closeSwarmDrawer();
       stopSwarmPolling();
       saveCurrentDraft(prevKey);
       state.currentCid = cid;
+      state.currentConv = null;
+      state.streaming = false;
+      state.streamBuffer = "";
+      state.streamTools = [];
       state.lastRenderedConvFp = "";
       state.renderedConvCid = "";
       state.lastDelivsFp = "";
@@ -7287,6 +7524,7 @@
       state.steeringQueueIds.clear();
       state.steeringInFlightIds.clear();
       state.activeRunId = "";
+      state.interruptPendingUntil = 0;
       state.currentContext = null;
       state.ctxBreakdownOpen = false;
       state.ctxFetchSeq += 1;
@@ -7297,40 +7535,104 @@
       state.swarmLastRenderFp = "";
       state.swarmLastError = "";
       state.swarmFetchSeq += 1;
+      state.openConvLoadError = null;
+      state.openConvLoadingCid = (!silent || userPicked) ? cid : "";
       renderQueueTray();
       updateContextPill();
       updateSwarmTopbarPill();
       restoreDraftFor(cid);
       renderConvList();
       updateSidecarHeaderActions();
+      if (state.openConvLoadingCid) {
+        renderConversation({ preserveScroll: false });
+      }
+    } else if (userPicked || !alreadyRendered) {
+      if (state.openConvAbort) {
+        try {
+          state.openConvAbort.abort();
+        } catch (_) {}
+        state.openConvAbort = null;
+      }
+      state.openConvQueuedRefresh = null;
+      state.openConvLoadError = null;
+      if (!alreadyRendered && (!silent || userPicked)) {
+        state.openConvLoadingCid = cid;
+        renderConversation({ preserveScroll: false });
+      }
     }
+
     if (!silent) {
       closeDrawer();
     }
+
     const reqSeq = ++state.openConvSeq;
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    state.openConvAbort = ctrl;
+    state.openConvInFlightCid = cid;
+    state.openConvInFlightSilent = Boolean(silent);
+
     const convEtagKey = `conv:${cid}`;
+    // CRITICAL ETAG RULE: ONLY send If-None-Match when silently refreshing
+    // an ALREADY-RENDERED conversation that has real messages visible on screen!
     const useConditionalEtag = Boolean(
       !switching &&
       silent &&
+      !userPicked &&
       !bypassEtag &&
       !state.streaming &&
-      state.currentConv &&
-      state.currentConv.id === cid
+      alreadyRendered
     );
     if (!useConditionalEtag) {
       delete state.apiEtags[convEtagKey];
     }
+
+    const fetchTimeoutMs = (!silent || userPicked || switching || !alreadyRendered) ? 45000 : 25000;
+
     try {
-      const data = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}`, { etagKey: convEtagKey });
-      if (reqSeq !== state.openConvSeq || state.currentCid !== cid) return;
-      if (data && data._notModified) {
-        updateSidecarHeaderActions();
-        updateSendButton();
-        return;
+      const fetchDetail = (allowCond) =>
+        apiFetch(`/api/conversations/${encodeURIComponent(cid)}`, {
+          etagKey: convEtagKey,
+          sendIfNoneMatch: allowCond,
+          timeoutMs: fetchTimeoutMs,
+          signal: ctrl ? ctrl.signal : undefined,
+        });
+      let data;
+      try {
+        data = await fetchDetail(useConditionalEtag);
+      } catch (firstErr) {
+        if (firstErr && firstErr.status === 503 && !(ctrl && ctrl.signal && ctrl.signal.aborted)) {
+          await new Promise((r) => setTimeout(r, 350));
+          if (reqSeq !== state.openConvSeq || state.currentCid !== cid) return;
+          data = await fetchDetail(false);
+        } else {
+          throw firstErr;
+        }
       }
-      const nextConv = data.conversation;
-      const nextRunning = Boolean(nextConv && nextConv.activeRun && nextConv.activeRun.running);
-      if (nextRunning && nextConv && nextConv.activeRun) {
+      if (reqSeq !== state.openConvSeq || state.currentCid !== cid) return;
+
+      // Defensive 304 guard: NEVER accept 304 if the conversation is not rendered with real messages on screen
+      if (data && data._notModified) {
+        if (isConvRenderedInDom(cid)) {
+          state.openConvLoadingCid = "";
+          state.openConvLoadError = null;
+          updateSidecarHeaderActions();
+          updateSendButton();
+          return;
+        }
+        delete state.apiEtags[convEtagKey];
+        data = await fetchDetail(false);
+        if (reqSeq !== state.openConvSeq || state.currentCid !== cid) return;
+      }
+
+      const nextConv = data && data.conversation;
+      if (!nextConv || typeof nextConv !== "object") {
+        throw new Error(t("err.invalidConvResp"));
+      }
+      if (!nextConv.id) nextConv.id = cid;
+      if (!Array.isArray(nextConv.messages)) nextConv.messages = [];
+
+      const nextRunning = Boolean(nextConv.activeRun && nextConv.activeRun.running);
+      if (nextRunning && nextConv.activeRun) {
         const ar = nextConv.activeRun;
         ensureActiveRunUserMessage(nextConv, {
           prompt: ar.prompt,
@@ -7342,22 +7644,40 @@
           runId: ar.runId || ar.run_id,
         });
       }
-      state.pendingInteractions = Array.isArray(nextConv && nextConv.pendingInteractions) ? nextConv.pendingInteractions : [];
+
+      state.openConvLoadingCid = "";
+      state.openConvLoadError = null;
+      state.pendingInteractions = Array.isArray(nextConv.pendingInteractions) ? nextConv.pendingInteractions : [];
       const nextFp = computeConvFingerprint(nextConv, nextRunning);
+
+      const prevStreamRunId = state.activeRunId;
+      const prevStreamBuf = state.streaming ? state.streamBuffer : "";
+      const prevStreamTools = state.streaming ? state.streamTools : [];
 
       state.currentConv = nextConv;
       if (autoFollow || (SIDECAR && cid === getSidecarConversationId())) {
         state.sidecarAutoFollowed = true;
       }
-      if ((!silent || switching) && nextConv && nextConv.model) {
+      if ((!silent || switching || userPicked) && nextConv.model) {
         state.selectedModel = nextConv.model;
         updateModelPill();
       }
       if (nextRunning) {
+        const nextRunId = String(nextConv.activeRun.runId || nextConv.activeRun.run_id || "");
+        const serverBuf = String(nextConv.activeRun.streamText || "");
+        const serverTools = Array.isArray(nextConv.activeRun.tools) ? nextConv.activeRun.tools : [];
         state.streaming = true;
-        state.activeRunId = String(nextConv.activeRun.runId || nextConv.activeRun.run_id || "");
-        state.streamBuffer = nextConv.activeRun.streamText || "";
-        state.streamTools = nextConv.activeRun.tools || [];
+        state.activeRunId = nextRunId;
+        if (prevStreamRunId && nextRunId && prevStreamRunId === nextRunId && prevStreamBuf.length > serverBuf.length) {
+          state.streamBuffer = prevStreamBuf;
+        } else {
+          state.streamBuffer = serverBuf;
+        }
+        if (prevStreamRunId && nextRunId && prevStreamRunId === nextRunId && prevStreamTools.length > serverTools.length) {
+          state.streamTools = prevStreamTools;
+        } else {
+          state.streamTools = serverTools;
+        }
       } else {
         state.streaming = false;
         state.activeRunId = "";
@@ -7365,9 +7685,9 @@
         state.streamTools = [];
       }
 
-      setCurrentQueue(Array.isArray(nextConv && nextConv.queue) ? nextConv.queue : []);
-      setCurrentContext((nextConv && nextConv.context_window) || null);
-      if (nextConv && nextConv.swarm_summary && typeof nextConv.swarm_summary === "object") {
+      setCurrentQueue(Array.isArray(nextConv.queue) ? nextConv.queue : []);
+      setCurrentContext(nextConv.context_window || null);
+      if (nextConv.swarm_summary && typeof nextConv.swarm_summary === "object") {
         state.currentSwarmSummary = nextConv.swarm_summary;
       } else if (switching) {
         state.currentSwarmSummary = null;
@@ -7375,7 +7695,14 @@
       updateSwarmTopbarPill();
       syncSwarmPolling();
 
-      if (!switching && nextFp && nextFp === state.lastRenderedConvFp) {
+      if (
+        !switching &&
+        !userPicked &&
+        alreadyRendered &&
+        nextFp &&
+        nextFp === state.lastRenderedConvFp &&
+        isConvRenderedInDom(cid)
+      ) {
         if (nextRunning) {
           updateStreamingRow();
         }
@@ -7384,31 +7711,64 @@
         return;
       }
 
-      renderConversation({ preserveScroll: silent && !switching });
-      if (!silent || switching) {
+      renderConversation({ preserveScroll: silent && !switching && !userPicked && alreadyRendered });
+      if (!silent || switching || userPicked) {
         renderConvList();
       }
     } catch (e) {
       if (reqSeq !== state.openConvSeq) return;
-      if (state.currentCid === cid && (autoFollow || (SIDECAR && cid === getSidecarConversationId()))) {
-        if (!state.currentConv) {
+      if (e && e.isExternalAbort) return;
+
+      state.openConvLoadingCid = "";
+      const stillEmpty = !isConvRenderedInDom(cid);
+      if (state.currentCid === cid && stillEmpty && !state.streaming) {
+        if (silent && !userPicked && !hadExplicitLoadError) {
           state.currentCid = "";
-          state.sidecarAutoFollowed = false;
+          state.currentConv = null;
+          state.openConvLoadError = null;
+          if (autoFollow || (SIDECAR && cid === getSidecarConversationId())) {
+            state.sidecarAutoFollowed = false;
+          }
           restoreDraftFor(NEW_DRAFT_KEY);
-        } else if (state.currentConv.id && state.currentConv.id !== cid) {
-          state.currentCid = state.currentConv.id;
-          state.sidecarAutoFollowed = false;
-          restoreDraftFor(state.currentCid);
+          renderConvList();
+          renderConversation({ preserveScroll: false });
+          updateSidecarHeaderActions();
+        } else {
+          state.currentConv = null;
+          state.openConvLoadError = {
+            cid,
+            title: getConversationTitleHint(cid),
+            message: (e && e.message) ? String(e.message) : t("err.unknown"),
+          };
+          renderConvList();
+          renderConversation({ preserveScroll: false });
+          updateSidecarHeaderActions();
         }
-        renderConvList();
-        updateSidecarHeaderActions();
       }
       if (!silent) {
-        showToast(t("toast.loadConvFail", { err: e.message }));
+        showToast(t("toast.loadConvFail", { err: (e && e.message) || t("err.unknown") }));
       }
     } finally {
-      if (autoFollow && reqSeq === state.openConvSeq) {
-        state.sidecarAutoFollowInFlight = false;
+      if (state.openConvAbort === ctrl) {
+        state.openConvAbort = null;
+      }
+      if (reqSeq === state.openConvSeq) {
+        if (state.openConvInFlightCid === cid) {
+          state.openConvInFlightCid = "";
+          state.openConvInFlightSilent = false;
+        }
+        if (autoFollow) {
+          state.sidecarAutoFollowInFlight = false;
+        }
+        const queued = state.openConvQueuedRefresh;
+        state.openConvQueuedRefresh = null;
+        if (queued && queued.cid === cid && state.currentCid === cid && !state.openConvLoadError && (!state.streaming || queued.bypassEtag)) {
+          setTimeout(() => {
+            if (state.currentCid === cid && state.openConvInFlightCid !== cid && (!state.streaming || queued.bypassEtag)) {
+              openConversation(cid, { silent: true, bypassEtag: Boolean(queued.bypassEtag) });
+            }
+          }, queued.bypassEtag ? 60 : 350);
+        }
       }
     }
   }
@@ -7417,6 +7777,9 @@
     haptic("light");
     state.sidecarUserPicked = true;
     const prevKey = currentDraftKey();
+    cancelOpenConvInFlight();
+    state.openConvLoadingCid = "";
+    state.openConvLoadError = null;
     closeTurnNavigator();
     closeContextPopover();
     closeSwarmDrawer();
@@ -7475,6 +7838,7 @@
       renderQueueTray();
       updateContextPill();
       updateSwarmTopbarPill();
+      renderConversation();
       updateSidecarHeaderActions();
     }
     $("prompt-input").focus();
@@ -7618,12 +7982,14 @@
 
     if (state.normalSendInFlight) return;
     state.normalSendInFlight = true;
+    state.openConvLoadingCid = "";
+    state.openConvLoadError = null;
     const prevActiveRunId = state.activeRunId;
     const createdNewConv = !state.currentConv;
     if (createdNewConv) {
       state.sidecarUserPicked = true;
       state.currentConv = {
-        id: "",
+        id: state.currentCid || "",
         title: text.slice(0, 36) || (prevAttachments[0]?.name || t("chat.newConvTitle")),
         source: "mobile",
         messages: [],
@@ -9845,11 +10211,16 @@
       if (!hostCid) return;
       if (state.currentCid === hostCid) {
         if (!state.streaming) {
-          openConversation(hostCid, { silent: true });
+          const alreadyUp = isConvRenderedInDom(hostCid);
+          openConversation(hostCid, {
+            silent: alreadyUp,
+            userPicked: !alreadyUp,
+            bypassEtag: !alreadyUp,
+          });
         }
         return;
       }
-      openConversation(hostCid, { userPicked: true });
+      openConversation(hostCid, { userPicked: true, bypassEtag: true });
     });
 
     $("sidecar-open-main-btn")?.addEventListener("click", () => {
@@ -9982,7 +10353,9 @@
 
     $("conv-list").addEventListener("click", (e) => {
       const item = e.target.closest(".conv-item");
-      if (item && item.dataset.cid) openConversation(item.dataset.cid, { userPicked: true });
+      if (item && item.dataset.cid) {
+        openConversation(item.dataset.cid, { userPicked: true, bypassEtag: true });
+      }
     });
 
     // --- Quick Suggestion Cards ---
@@ -10418,6 +10791,22 @@
       const swarmStrip = e.target.closest(".swarm-live-strip[data-open-swarm], .md-swarm-link[data-open-swarm]");
       if (swarmStrip) {
         openSwarmDrawer();
+        return;
+      }
+
+      const retryOpenBtn = e.target.closest(".btn-retry-open-conv[data-retry-cid]");
+      if (retryOpenBtn) {
+        const retryCid = String(retryOpenBtn.dataset.retryCid || "").trim();
+        if (retryCid) {
+          haptic("light");
+          openConversation(retryCid, { userPicked: true, bypassEtag: true });
+        }
+        return;
+      }
+
+      const loadErrHomeBtn = e.target.closest(".btn-load-err-home");
+      if (loadErrHomeBtn) {
+        startNewChat();
         return;
       }
 

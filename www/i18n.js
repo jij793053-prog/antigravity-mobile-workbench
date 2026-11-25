@@ -683,6 +683,15 @@
       "ix.pickOptionFirst": "请先至少选择一项或填写自定义内容",
       "ix.otherConvWaiting": "「{title}」正在等待你的确认：{summary}",
       "ix.permResolvedToast": "已响应审批请求：{decision}",
+      "chat.loadingConv": "正在加载对话...",
+      "chat.loadConvErrTitle": "加载会话失败",
+      "chat.loadConvErrHint": "无法获取该对话的历史消息，请检查主机连接或网络后重试。",
+      "chat.loadConvRetry": "重新加载",
+      "chat.loadConvHome": "返回首页",
+      "chat.emptyConvTitle": "该对话暂无可显示消息",
+      "chat.emptyConvDesc": "当前未读取到该会话的历史记录，可点击刷新重试，或直接在下方发消息继续。",
+      "chat.refreshConv": "刷新对话",
+      "err.invalidConvResp": "服务端返回的会话数据异常",
     },
 
     en: {
@@ -1364,6 +1373,15 @@
       "ix.pickOptionFirst": "Select at least one option or enter custom text",
       "ix.otherConvWaiting": "\"{title}\" is waiting for your confirmation: {summary}",
       "ix.permResolvedToast": "Approval sent: {decision}",
+      "chat.loadingConv": "Loading conversation...",
+      "chat.loadConvErrTitle": "Failed to Load Conversation",
+      "chat.loadConvErrHint": "Unable to fetch conversation history from the host. Check connection and retry.",
+      "chat.loadConvRetry": "Retry",
+      "chat.loadConvHome": "Back Home",
+      "chat.emptyConvTitle": "No messages yet",
+      "chat.emptyConvDesc": "No history messages were returned by the host for this chat. Refresh to check again or send a message below.",
+      "chat.refreshConv": "Refresh",
+      "err.invalidConvResp": "Invalid conversation payload from server",
     },
   };
 

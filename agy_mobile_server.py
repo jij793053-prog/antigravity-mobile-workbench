@@ -43,7 +43,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.7.5"
+APP_VERSION = "1.7.6"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -2463,22 +2463,42 @@ def _locate_transcript(cid: str) -> tuple[pathlib.Path | None, str]:
     return None, "mobile"
 
 
+class _TransientTranscriptReadError(OSError):
+    """Raised when a non-empty transcript file transiently fails to open/read (e.g. Windows atomic replace)."""
+
+
+def _parse_jsonl_checked(p: pathlib.Path, *, retries: int = 3) -> tuple[list[dict[str, Any]], bool]:
+    """Read and parse JSONL steps with short retry on transient OSError; returns (steps, read_ok)."""
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        steps: list[dict[str, Any]] = []
+        try:
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    try:
+                        o = json.loads(s)
+                        if isinstance(o, dict):
+                            steps.append(o)
+                    except Exception:
+                        continue
+            return steps, True
+        except FileNotFoundError:
+            return [], True
+        except OSError:
+            if attempt + 1 < attempts:
+                time.sleep(0.025 * (attempt + 1))
+                continue
+            return [], False
+        except Exception:
+            return [], False
+    return [], False
+
+
 def _parse_jsonl(p: pathlib.Path) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = []
-    try:
-        with p.open("r", encoding="utf-8", errors="replace") as fh:
-            for ln in fh:
-                s = ln.strip()
-                if not s:
-                    continue
-                try:
-                    o = json.loads(s)
-                    if isinstance(o, dict):
-                        steps.append(o)
-                except Exception:
-                    continue
-    except Exception:
-        pass
+    steps, _ = _parse_jsonl_checked(p)
     return steps
 
 
@@ -3186,6 +3206,8 @@ def _parse_single_transcript_cached(
     cid: str,
     tf: pathlib.Path | None,
     source: str,
+    *,
+    raise_on_read_error: bool = False,
 ) -> dict[str, Any]:
     """LRU cache (mtime_ns + size + full_sig + pbtxt_sig) for single-transcript message/deliverable parsing."""
     pbtxt_sig, pbtxt_title = _get_pbtxt_sig_and_title(cid)
@@ -3197,9 +3219,24 @@ def _parse_single_transcript_cached(
             "deliverable_cands": [],
             "last_model": "",
         }
+    cache_key = (tf.as_posix(), source)
     try:
         st_tf = tf.stat()
-    except OSError:
+    except FileNotFoundError:
+        return {
+            "pbtxt_title": pbtxt_title,
+            "first_user_title": "",
+            "own_messages": [],
+            "deliverable_cands": [],
+            "last_model": "",
+        }
+    except OSError as exc:
+        with _TRANSCRIPT_DETAIL_CACHE_LOCK:
+            stale = _TRANSCRIPT_DETAIL_CACHE.get(cache_key)
+        if stale is not None:
+            return stale[1]
+        if raise_on_read_error:
+            raise _TransientTranscriptReadError(str(exc)) from exc
         return {
             "pbtxt_title": pbtxt_title,
             "first_user_title": "",
@@ -3215,15 +3252,31 @@ def _parse_single_transcript_cached(
     except OSError:
         full_sig = (0, 0)
 
-    cache_key = (tf.as_posix(), source)
     sig = (st_tf.st_mtime_ns, st_tf.st_size, full_sig[0], full_sig[1], pbtxt_sig)
+    stale_entry: dict[str, Any] | None = None
     with _TRANSCRIPT_DETAIL_CACHE_LOCK:
         cached = _TRANSCRIPT_DETAIL_CACHE.get(cache_key)
-        if cached is not None and cached[0] == sig:
-            _TRANSCRIPT_DETAIL_CACHE.move_to_end(cache_key)
-            return cached[1]
+        if cached is not None:
+            if cached[0] == sig:
+                _TRANSCRIPT_DETAIL_CACHE.move_to_end(cache_key)
+                return cached[1]
+            stale_entry = cached[1]
 
-    steps = _parse_jsonl(tf)
+    steps, read_ok = _parse_jsonl_checked(tf)
+    if (not read_ok) and st_tf.st_size > 0:
+        if stale_entry is not None:
+            return stale_entry
+        if raise_on_read_error:
+            raise _TransientTranscriptReadError(f"transient read failure for {tf.name}")
+        return {
+            "pbtxt_title": pbtxt_title,
+            "first_user_title": "",
+            "own_messages": [],
+            "deliverable_cands": [],
+            "last_model": "",
+        }
+    if st_tf.st_size > 0 and not steps and stale_entry is not None:
+        return stale_entry
     if steps:
         needed: set[int] = set()
         watch_generic_until = -1
@@ -3483,11 +3536,13 @@ def _parse_single_transcript_cached(
         "deliverable_cands": dedup_rev,
         "last_model": last_model,
     }
-    with _TRANSCRIPT_DETAIL_CACHE_LOCK:
-        _TRANSCRIPT_DETAIL_CACHE[cache_key] = (sig, parsed_entry)
-        _TRANSCRIPT_DETAIL_CACHE.move_to_end(cache_key)
-        while len(_TRANSCRIPT_DETAIL_CACHE) > _TRANSCRIPT_DETAIL_CACHE_MAX:
-            _TRANSCRIPT_DETAIL_CACHE.popitem(last=False)
+    # Never poison the cache with an empty parse of a non-empty file (e.g. concurrent write/truncate)
+    if read_ok and (steps or st_tf.st_size == 0):
+        with _TRANSCRIPT_DETAIL_CACHE_LOCK:
+            _TRANSCRIPT_DETAIL_CACHE[cache_key] = (sig, parsed_entry)
+            _TRANSCRIPT_DETAIL_CACHE.move_to_end(cache_key)
+            while len(_TRANSCRIPT_DETAIL_CACHE) > _TRANSCRIPT_DETAIL_CACHE_MAX:
+                _TRANSCRIPT_DETAIL_CACHE.popitem(last=False)
     return parsed_entry
 
 
@@ -3497,9 +3552,10 @@ def load_conversation_detail(
     _include_cli_alias: bool = True,
     _keep_internal_src: bool = False,
     _apply_revert_filter: bool = True,
+    _raise_on_read_error: bool = False,
 ) -> dict[str, Any]:
     tf, source = _locate_transcript(cid)
-    parsed = _parse_single_transcript_cached(cid, tf, source)
+    parsed = _parse_single_transcript_cached(cid, tf, source, raise_on_read_error=_raise_on_read_error)
     title = str(parsed.get("pbtxt_title") or "")
 
     parent_msgs: list[dict[str, Any]] = []
@@ -3513,6 +3569,7 @@ def load_conversation_detail(
                 _include_cli_alias=False,
                 _keep_internal_src=True,
                 _apply_revert_filter=False,
+                _raise_on_read_error=_raise_on_read_error,
             )
             p_msgs = parent_detail.get("messages") or []
             if p_msgs:
@@ -3528,7 +3585,7 @@ def load_conversation_detail(
 
     # If opening a Desktop conversation that also has mobile CLI continuation turns, merge them chronologically
     child_msgs: list[dict[str, Any]] = []
-    aliased_cli = get_desktop_cli_alias(cid) if (_include_cli_alias and source == "desktop") else ""
+    aliased_cli = get_desktop_cli_alias(cid) if (_include_cli_alias and (source == "desktop" or tf is None)) else ""
     if aliased_cli and aliased_cli != cid:
         child_detail = load_conversation_detail(
             aliased_cli,
@@ -3536,6 +3593,7 @@ def load_conversation_detail(
             _include_cli_alias=False,
             _keep_internal_src=True,
             _apply_revert_filter=False,
+            _raise_on_read_error=_raise_on_read_error,
         )
         c_msgs = child_detail.get("messages") or []
         if c_msgs:
@@ -5474,6 +5532,7 @@ def _json_response_with_etag(
     headers: dict[str, str] | None = None,
     compress: bool = True,
     inject_revision: bool = True,
+    allow_304: bool = True,
 ) -> web.Response:
     raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     rev = hashlib.blake2b(raw_bytes, digest_size=8).hexdigest()
@@ -5481,11 +5540,12 @@ def _json_response_with_etag(
     out_headers: dict[str, str] = {
         "ETag": etag,
         "X-Revision": rev,
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store",
+        "Vary": "Accept-Encoding",
     }
     if headers:
         out_headers.update(headers)
-    if status == 200 and _etag_matches(request.headers.get("If-None-Match", ""), rev):
+    if allow_304 and status == 200 and _etag_matches(request.headers.get("If-None-Match", ""), rev):
         return web.Response(status=304, headers=out_headers)
 
     if inject_revision and raw_bytes.endswith(b"}"):
@@ -5512,7 +5572,6 @@ def _json_response_with_etag(
                 while len(_GZIP_CACHE) > _GZIP_CACHE_MAX:
                     _GZIP_CACHE.popitem(last=False)
         out_headers["Content-Encoding"] = "gzip"
-        out_headers["Vary"] = "Accept-Encoding"
         return web.Response(
             body=gz_bytes,
             status=status,
@@ -5570,6 +5629,15 @@ async def cors_and_auth_middleware(request: web.Request, handler):
         resp = await handler(request)
     except web.HTTPException as ex:
         resp = ex
+    except Exception:
+        if path.startswith("/api/"):
+            resp = web.json_response(
+                {"ok": False, "error": "服务端处理异常，请稍后重试", "retryable": True},
+                status=500,
+                headers={"Cache-Control": "no-store"},
+            )
+        else:
+            raise
     _apply_common_sec_headers(resp)
     if not resp.prepared and not is_no_cors:
         resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -5872,15 +5940,23 @@ async def handle_conversations(request: web.Request) -> web.Response:
     inc_ext_raw = str(request.query.get("include_external_cli") or "").strip().lower()
     include_external_cli = inc_ext_raw in ("1", "true", "yes", "on")
     items = await asyncio.to_thread(list_all_conversations, limit, source_filter, include_external_cli)
-    return _json_response_with_etag(request, {"ok": True, "conversations": items})
+    return _json_response_with_etag(request, {"ok": True, "conversations": items}, allow_304=bool(items))
 
 
 async def handle_conversation_detail(request: web.Request) -> web.Response:
     cid = str(request.match_info.get("cid") or "").strip()
     if not _is_valid_cid(cid):
         return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
-    detail = await asyncio.to_thread(load_conversation_detail, cid)
-    return _json_response_with_etag(request, {"ok": True, "conversation": detail})
+    try:
+        detail = await asyncio.to_thread(load_conversation_detail, cid, _raise_on_read_error=True)
+    except _TransientTranscriptReadError:
+        return web.json_response(
+            {"ok": False, "error": "会话记录正在同步写入，请稍后重试", "retryable": True},
+            status=503,
+            headers={"Cache-Control": "no-store", "Retry-After": "1"},
+        )
+    has_content = bool((detail.get("messages") or []) or detail.get("activeRun"))
+    return _json_response_with_etag(request, {"ok": True, "conversation": detail}, allow_304=has_content)
 
 
 async def handle_conversation_context(request: web.Request) -> web.Response:
