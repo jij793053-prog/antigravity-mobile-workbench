@@ -199,6 +199,11 @@
       "preview.resetZoom": "重置",
       "preview.zoomReset": "{pct}% · 重置",
       "preview.zoomResetAria": "重置图片缩放到 100%",
+      "lightbox.aria": "图片全屏预览",
+      "lightbox.closeAria": "关闭图片预览",
+      "lightbox.loading": "正在加载原图...",
+      "lightbox.downloadUnavailable": "该图片暂不支持下载",
+      "chat.tapToPreviewAria": "点击查看大图：{name}",
 
       // Prompt Queue & Cut-in
       "queue.trayAria": "排队消息列表",
@@ -219,6 +224,7 @@
       "queue.attachOnly": "[仅附件]",
       "queue.attCount": "{count} 个附件",
       "queue.urgentTag": "插队",
+      "queue.steeringTag": "正在插队...",
 
       // Context Window Ring & Popover
       "ctx.aria": "上下文窗口详情",
@@ -304,6 +310,12 @@
       "swarm.boardOldest": "最早优先 ↑",
       "swarm.boardEmpty": "留言板暂无消息",
       "swarm.boardExpand": "展开全文",
+      "swarm.boardCollapse": "收起",
+      "swarm.collapse": "收起",
+      "swarm.taskBriefLabel": "任务详情",
+      "swarm.taskThreadLabel": "线索",
+      "swarm.taskLastPostLabel": "最近发言",
+      "swarm.taskExpandAria": "展开或收起任务详情",
       "swarm.membersActiveHeading": "当前活跃成员 ({count})",
       "swarm.membersArchivedHeading": "已结束成员 ({count})",
       "swarm.membersEmpty": "暂无成员信息",
@@ -556,6 +568,7 @@
       "toast.queueFail": "排队失败：{err}",
       "toast.cutinSent": "正在插队执行新指令...",
       "toast.cutinFail": "插队失败：{err}",
+      "toast.queueAlreadyStarted": "该排队消息已开始执行",
       "toast.queueSaved": "已保存排队内容",
       "toast.queueSaveFail": "保存失败：{err}",
       "toast.queueEmptyEdit": "排队内容不能为空",
@@ -867,6 +880,11 @@
       "preview.resetZoom": "Reset",
       "preview.zoomReset": "{pct}% · Reset",
       "preview.zoomResetAria": "Reset image zoom to 100%",
+      "lightbox.aria": "Fullscreen image viewer",
+      "lightbox.closeAria": "Close image viewer",
+      "lightbox.loading": "Loading full-resolution image...",
+      "lightbox.downloadUnavailable": "Download unavailable for this image",
+      "chat.tapToPreviewAria": "Tap to view fullscreen: {name}",
 
       // Prompt Queue & Cut-in
       "queue.trayAria": "Queued prompts",
@@ -887,6 +905,7 @@
       "queue.attachOnly": "[Attachments only]",
       "queue.attCount": "{count} file(s)",
       "queue.urgentTag": "Urgent",
+      "queue.steeringTag": "Steering...",
 
       // Context Window Ring & Popover
       "ctx.aria": "Context window details",
@@ -972,6 +991,12 @@
       "swarm.boardOldest": "Oldest ↑",
       "swarm.boardEmpty": "No board messages yet",
       "swarm.boardExpand": "Show full message",
+      "swarm.boardCollapse": "Collapse",
+      "swarm.collapse": "Collapse",
+      "swarm.taskBriefLabel": "Task details",
+      "swarm.taskThreadLabel": "Thread",
+      "swarm.taskLastPostLabel": "Latest post",
+      "swarm.taskExpandAria": "Toggle task details",
       "swarm.membersActiveHeading": "Active Members ({count})",
       "swarm.membersArchivedHeading": "Archived ({count})",
       "swarm.membersEmpty": "No members recorded",
@@ -1224,6 +1249,7 @@
       "toast.queueFail": "Queue failed: {err}",
       "toast.cutinSent": "Cutting in with new prompt...",
       "toast.cutinFail": "Cut-in failed: {err}",
+      "toast.queueAlreadyStarted": "Queued prompt already started",
       "toast.queueSaved": "Queued prompt updated",
       "toast.queueSaveFail": "Update failed: {err}",
       "toast.queueEmptyEdit": "Queued prompt cannot be empty",

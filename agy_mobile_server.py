@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import atexit
 import collections
+import copy
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import html as html_lib
 import ipaddress
@@ -41,7 +43,7 @@ from typing import Any
 from aiohttp import WSMsgType, web
 
 APP_NAME = "Antigravity Link Server"
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 APK_FILENAME = "Antigravity-Mobile-Universal-v1.7.apk"
 
 PROJECT_DIR = pathlib.Path(__file__).resolve().parent
@@ -192,6 +194,8 @@ _CONV_QUEUES_LOCK = threading.Lock()
 _CONV_QUEUES: dict[str, list[dict[str, Any]]] = {}
 _CONV_QUEUE_MAX = 20
 _DRAINING_CIDS: set[str] = set()
+_RECENT_STARTED_QIDS: collections.OrderedDict[str, dict[str, Any]] = collections.OrderedDict()
+_RECENT_STARTED_QIDS_MAX = 128
 _PENDING_SPAWNS: int = 0
 _MAX_CONCURRENT_RUNS = 4
 _WS_CLIENTS: set[web.WebSocketResponse] = set()
@@ -261,6 +265,38 @@ _LIVE_CTX_CACHE_MAX = 128
 _SWARM_ACTION_CACHE_LOCK = threading.Lock()
 _SWARM_ACTION_CACHE: dict[str, tuple[int, int, str]] = {}
 _SWARM_ACTION_CACHE_MAX = 256
+
+_CONFIG_CACHE: tuple[str, int, int, dict[str, Any]] | None = None
+
+_PBTXT_TITLE_CACHE_LOCK = threading.Lock()
+_PBTXT_TITLE_CACHE: dict[str, tuple[int, int, str]] = {}
+_PBTXT_TITLE_CACHE_MAX = 1024
+
+_TRANSCRIPT_DETAIL_CACHE_LOCK = threading.Lock()
+# (tf_posix, source) -> (sig_tuple, parsed_dict)
+_TRANSCRIPT_DETAIL_CACHE: collections.OrderedDict[tuple[str, str], tuple[tuple[Any, ...], dict[str, Any]]] = collections.OrderedDict()
+_TRANSCRIPT_DETAIL_CACHE_MAX = 64
+
+_JSON_FILE_CACHE_LOCK = threading.Lock()
+_JSON_FILE_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
+_JSON_FILE_CACHE_MAX = 256
+
+_SWARM_BOARD_CACHE_LOCK = threading.Lock()
+_SWARM_BOARD_CACHE: collections.OrderedDict[
+    str,
+    tuple[int, int, int, list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]],
+] = collections.OrderedDict()
+_SWARM_BOARD_CACHE_MAX = 64
+
+_GZIP_CACHE_LOCK = threading.Lock()
+_GZIP_CACHE: collections.OrderedDict[tuple[str, bool], bytes] = collections.OrderedDict()
+_GZIP_CACHE_MAX = 24
+
+_DELIV_CACHE_LOCK = threading.Lock()
+# key -> (monotonic_ts, deliverables_list)
+_DELIV_CACHE: collections.OrderedDict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = collections.OrderedDict()
+_DELIV_CACHE_MAX = 64
+_DELIV_CACHE_TTL_SEC = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -683,8 +719,24 @@ def render_qr_svg(text: str, dark_color: str = "#1F1F1F", light_color: str = "#F
 # ---------------------------------------------------------------------------
 
 def _load_config_unlocked() -> dict[str, Any]:
+    global _CONFIG_CACHE
+    cfg_path_key = str(CONFIG_FILE)
+    st_hit: os.stat_result | None = None
+    try:
+        st_hit = CONFIG_FILE.stat()
+    except OSError:
+        st_hit = None
+    if (
+        st_hit is not None
+        and _CONFIG_CACHE is not None
+        and _CONFIG_CACHE[0] == cfg_path_key
+        and _CONFIG_CACHE[1] == st_hit.st_mtime_ns
+        and _CONFIG_CACHE[2] == st_hit.st_size
+    ):
+        return _CONFIG_CACHE[3]
+
     cfg: dict[str, Any] = {}
-    if CONFIG_FILE.is_file():
+    if st_hit is not None:
         try:
             raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8", errors="replace"))
             if isinstance(raw, dict):
@@ -715,6 +767,11 @@ def _load_config_unlocked() -> dict[str, Any]:
         changed = True
     if changed:
         _save_config_unlocked(cfg)
+    else:
+        if st_hit is not None:
+            _CONFIG_CACHE = (cfg_path_key, st_hit.st_mtime_ns, st_hit.st_size, cfg)
+        else:
+            _CONFIG_CACHE = None
     return cfg
 
 
@@ -740,6 +797,7 @@ def _ensure_mobile_ask_profile() -> str:
 
 
 def _save_config_unlocked(cfg: dict[str, Any]) -> None:
+    global _CONFIG_CACHE
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -749,19 +807,24 @@ def _save_config_unlocked(cfg: dict[str, Any]) -> None:
         except OSError:
             pass
     os.replace(tmp, CONFIG_FILE)
+    try:
+        st_new = CONFIG_FILE.stat()
+        _CONFIG_CACHE = (str(CONFIG_FILE), st_new.st_mtime_ns, st_new.st_size, copy.deepcopy(cfg))
+    except OSError:
+        _CONFIG_CACHE = None
 
 
 def load_or_create_config() -> dict[str, Any]:
     with _CONFIG_LOCK:
-        return _load_config_unlocked()
+        return dict(_load_config_unlocked())
 
 
 def _update_config(mutator) -> dict[str, Any]:
     with _CONFIG_LOCK:
-        cfg = _load_config_unlocked()
+        cfg = copy.deepcopy(_load_config_unlocked())
         mutator(cfg)
         _save_config_unlocked(cfg)
-        return cfg
+        return dict(cfg)
 
 
 def init_or_rotate_pair_pin() -> str:
@@ -2181,25 +2244,81 @@ def _mask_token(token: str) -> str:
 # Transcripts & Conversations
 # ---------------------------------------------------------------------------
 
-def _read_pbtxt_title(cid: str) -> str:
+def _get_pbtxt_sig_and_title(cid: str) -> tuple[tuple[str, int, int], str]:
     if not _is_valid_cid(cid):
-        return ""
+        return ("", 0, 0), ""
     for ann_dir in (CLI_ANN, DESKTOP_ANN):
         p = ann_dir / f"{cid}.pbtxt"
-        if p.is_file():
-            try:
-                raw = p.read_text(encoding="utf-8", errors="replace")
-                m = re.search(r'title:\s*"((?:[^"\\]|\\.)*)"', raw)
-                if m:
-                    t = m.group(1).replace('\\"', '"').replace("\\\\", "\\").replace("\\n", " ").strip()
-                    if t:
-                        return t[:64]
-            except Exception:
-                pass
-    return ""
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        ps = p.as_posix()
+        sig = (ps, st.st_mtime_ns, st.st_size)
+        with _PBTXT_TITLE_CACHE_LOCK:
+            cached = _PBTXT_TITLE_CACHE.get(ps)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                if cached[2]:
+                    return sig, cached[2]
+                continue
+        title = ""
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r'title:\s*"((?:[^"\\]|\\.)*)"', raw)
+            if m:
+                t = m.group(1).replace('\\"', '"').replace("\\\\", "\\").replace("\\n", " ").strip()
+                if t:
+                    title = t[:64]
+        except Exception:
+            title = ""
+        with _PBTXT_TITLE_CACHE_LOCK:
+            if len(_PBTXT_TITLE_CACHE) >= _PBTXT_TITLE_CACHE_MAX:
+                for drop_k in list(_PBTXT_TITLE_CACHE.keys())[: _PBTXT_TITLE_CACHE_MAX // 4]:
+                    _PBTXT_TITLE_CACHE.pop(drop_k, None)
+            _PBTXT_TITLE_CACHE[ps] = (st.st_mtime_ns, st.st_size, title)
+        if title:
+            return sig, title
+    return ("", 0, 0), ""
 
 
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+def _read_pbtxt_title(cid: str) -> str:
+    _, title = _get_pbtxt_sig_and_title(cid)
+    return title
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif", ".jfif", ".heic", ".heif"}
+
+
+def _build_attachment_meta(
+    p: pathlib.Path,
+    mime_hint: str = "",
+    orig_name: str = "",
+) -> dict[str, Any]:
+    ps = p.as_posix()
+    raw_name = orig_name.strip() if orig_name else p.name
+    pretty_name = re.sub(r"^\d{13}_", "", raw_name) if not orig_name else raw_name
+    ext = p.suffix.lower()
+    mime_low = str(mime_hint or "").strip().lower()
+    is_img = (ext in _IMAGE_EXTS) or (mime_low.startswith("image/") and "svg" not in mime_low)
+    mime_str = (
+        mime_low
+        if mime_low and "svg" not in mime_low
+        else (_PREVIEW_IMAGE_MIMES.get(ext) or (mimetypes.guess_type(ps)[0] or "application/octet-stream"))
+    )
+    try:
+        fsize = int(p.stat().st_size)
+    except OSError:
+        fsize = 0
+    q_path = urllib.parse.quote(ps)
+    return {
+        "name": pretty_name,
+        "path": ps,
+        "size": fsize,
+        "mime": mime_str,
+        "is_image": is_img,
+        "preview_url": f"/api/files/preview?path={q_path}",
+        "download_url": f"/api/files/download?path={q_path}",
+    }
 
 
 def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> list[dict[str, Any]]:
@@ -2230,20 +2349,11 @@ def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> 
         if ps in seen:
             return
         seen.add(ps)
-        pretty_name = re.sub(r"^\d{13}_", "", p.name)
-        ext = p.suffix.lower()
-        mime_low = str(mime_hint or "").lower()
-        is_img = (ext in _IMAGE_EXTS) or (mime_low.startswith("image/") and "svg" not in mime_low)
-        out.append({
-            "name": pretty_name,
-            "path": ps,
-            "is_image": is_img,
-            "preview_url": f"/api/files/preview?path={urllib.parse.quote(ps)}",
-        })
+        out.append(_build_attachment_meta(p, mime_hint=mime_hint))
 
     txt = str(raw or "")
     for att_block in re.finditer(
-        r"【用户从手机上传的(?:无损原始文件/原图|本地文件/图片路径)[^】]*】\n((?:- [^\n]+\n?)+)",
+        r"【用户从手机上传的(?:无损原始文件/原图|本地文件/图片路径)[^】]*】\r?\n((?:- [^\r\n]+\r?\n?)+)",
         txt,
     ):
         for ln in att_block.group(1).splitlines():
@@ -2253,8 +2363,10 @@ def _extract_user_attachments(raw: str, media_list: list[Any] | None = None) -> 
 
     if isinstance(media_list, list):
         for item in media_list:
-            if isinstance(item, dict) and item.get("uri"):
-                _add_path(str(item.get("uri")), str(item.get("mime_type") or ""))
+            if isinstance(item, dict):
+                cand_uri = item.get("uri") or item.get("path") or item.get("file_path") or ""
+                if cand_uri:
+                    _add_path(str(cand_uri), str(item.get("mime_type") or item.get("mime") or ""))
 
     return out
 
@@ -2691,54 +2803,119 @@ def _summarize_tool(tc: dict[str, Any]) -> dict[str, str]:
 
 
 _CONV_META_CACHE_LOCK = threading.Lock()
-# (source, cid) -> (mtime_ns, size, meta_dict_or_None)
-_CONV_META_CACHE: dict[tuple[str, str], tuple[int, int, dict[str, Any] | None]] = {}
+# (source, cid) -> (mtime_ns, size, pbtxt_sig, meta_dict_or_None)
+_CONV_META_CACHE: dict[tuple[str, str], tuple[int, int, tuple[str, int, int], dict[str, Any] | None]] = {}
 
 
 def _extract_conv_meta(cid: str, tf: pathlib.Path, source: str, mtime: float, mtime_ns: int, size: int, is_active: bool) -> dict[str, Any] | None:
     cache_key = (source, cid)
-    if not is_active:
-        with _CONV_META_CACHE_LOCK:
-            cached = _CONV_META_CACHE.get(cache_key)
-            if cached is not None and cached[0] == mtime_ns and cached[1] == size:
-                return dict(cached[2]) if cached[2] is not None else None
-        if _is_swarm_worker_file(tf):
+    pbtxt_sig, pbtxt_title = _get_pbtxt_sig_and_title(cid)
+    with _CONV_META_CACHE_LOCK:
+        cached = _CONV_META_CACHE.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns and cached[1] == size and cached[2] == pbtxt_sig:
+            if cached[3] is not None:
+                return dict(cached[3])
+            if not is_active:
+                return None
+
+    step_count = 0
+    has_explicit_user = False
+    first_u = ""
+    planner_tail: collections.deque[str] = collections.deque(maxlen=32)
+    last_content_planner_ln = ""
+    last_model_planner_ln = ""
+    non_ephemeral_tail: collections.deque[str] = collections.deque(maxlen=16)
+    raw_tail: collections.deque[str] = collections.deque(maxlen=16)
+
+    try:
+        with tf.open("r", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                s = ln.strip()
+                if not s or not s.startswith("{"):
+                    continue
+                step_count += 1
+                if not has_explicit_user and '"USER_EXPLICIT"' in s and '"USER_INPUT"' in s:
+                    try:
+                        o_u = json.loads(s)
+                        if isinstance(o_u, dict) and o_u.get("type") == "USER_INPUT" and o_u.get("source") == "USER_EXPLICIT":
+                            has_explicit_user = True
+                            first_u = _clean_user_text(str(o_u.get("content") or ""))
+                    except Exception:
+                        pass
+                if '"PLANNER_RESPONSE"' in s:
+                    planner_tail.append(s)
+                    if '"model"' in s:
+                        last_model_planner_ln = s
+                    if '"content"' in s and '"content":""' not in s and '"content": ""' not in s:
+                        last_content_planner_ln = s
+                if '"EPHEMERAL_MESSAGE"' not in s and '"CHECKPOINT"' not in s:
+                    non_ephemeral_tail.append(s)
+                raw_tail.append(s)
+    except OSError:
+        return None
+
+    if step_count == 0:
+        if not is_active:
             with _CONV_META_CACHE_LOCK:
                 if len(_CONV_META_CACHE) > 2000:
                     _CONV_META_CACHE.clear()
-                _CONV_META_CACHE[cache_key] = (mtime_ns, size, None)
-            return None
-
-    steps = _parse_jsonl(tf)
-    if not steps:
-        if not is_active:
-            with _CONV_META_CACHE_LOCK:
-                _CONV_META_CACHE[cache_key] = (mtime_ns, size, None)
+                _CONV_META_CACHE[cache_key] = (mtime_ns, size, pbtxt_sig, None)
         return None
 
-    if not is_active and _is_swarm_worker_quick(steps):
+    if not is_active and not has_explicit_user:
         with _CONV_META_CACHE_LOCK:
-            _CONV_META_CACHE[cache_key] = (mtime_ns, size, None)
+            if len(_CONV_META_CACHE) > 2000:
+                _CONV_META_CACHE.clear()
+            _CONV_META_CACHE[cache_key] = (mtime_ns, size, pbtxt_sig, None)
         return None
 
-    title = _read_pbtxt_title(cid)
-    first_u = ""
-    last_preview = ""
     model_id = ""
-    tail_step = None
-    for s in steps:
-        st_t = str(s.get("type") or "")
-        if st_t == "USER_INPUT" and s.get("source") == "USER_EXPLICIT" and not first_u:
-            first_u = _clean_user_text(str(s.get("content") or ""))
-        if st_t == "PLANNER_RESPONSE":
-            if s.get("model"):
-                model_id = str(s["model"])
-            c_txt = _clean_assistant_text(str(s.get("content") or ""))
+    last_preview = ""
+    seen_cand_ids: set[int] = set()
+    for cand_s in (*reversed(planner_tail), last_content_planner_ln, last_model_planner_ln):
+        if not cand_s:
+            continue
+        cid_obj = id(cand_s)
+        if cid_obj in seen_cand_ids:
+            continue
+        seen_cand_ids.add(cid_obj)
+        try:
+            o_p = json.loads(cand_s)
+        except Exception:
+            continue
+        if not isinstance(o_p, dict) or str(o_p.get("type") or "") != "PLANNER_RESPONSE":
+            continue
+        if not model_id and o_p.get("model"):
+            model_id = str(o_p["model"])
+        if not last_preview:
+            c_txt = _clean_assistant_text(str(o_p.get("content") or ""))
             if c_txt:
                 last_preview = re.sub(r"\s+", " ", c_txt)[:90]
-        if st_t not in ("EPHEMERAL_MESSAGE", "CHECKPOINT"):
-            tail_step = s
+        if model_id and last_preview:
+            break
 
+    tail_step = None
+    any_valid_json = bool(has_explicit_user or model_id or last_preview)
+    for cand_s in (*reversed(non_ephemeral_tail), *reversed(raw_tail)):
+        try:
+            o_t = json.loads(cand_s)
+        except Exception:
+            continue
+        if isinstance(o_t, dict):
+            any_valid_json = True
+            if str(o_t.get("type") or "") not in ("EPHEMERAL_MESSAGE", "CHECKPOINT"):
+                tail_step = o_t
+                break
+
+    if not any_valid_json:
+        if not is_active:
+            with _CONV_META_CACHE_LOCK:
+                if len(_CONV_META_CACHE) > 2000:
+                    _CONV_META_CACHE.clear()
+                _CONV_META_CACHE[cache_key] = (mtime_ns, size, pbtxt_sig, None)
+        return None
+
+    title = pbtxt_title
     if not title:
         parent_desk = get_desktop_parent_for_cli(cid) if source == "mobile" else ""
         if parent_desk:
@@ -2772,15 +2949,14 @@ def _extract_conv_meta(cid: str, tf: pathlib.Path, source: str, mtime: float, mt
         "model": model_id or "gemini-4-neon-medium",
         "preview": last_preview or first_u[:80],
         "updatedAt": mtime,
-        "stepCount": len(steps),
+        "stepCount": step_count,
         "_tailRunning": tail_looks_running,
         "_tailWaiting": tail_looks_waiting,
     }
-    if not is_active:
-        with _CONV_META_CACHE_LOCK:
-            if len(_CONV_META_CACHE) > 2000:
-                _CONV_META_CACHE.clear()
-            _CONV_META_CACHE[cache_key] = (mtime_ns, size, dict(meta))
+    with _CONV_META_CACHE_LOCK:
+        if len(_CONV_META_CACHE) > 2000:
+            _CONV_META_CACHE.clear()
+        _CONV_META_CACHE[cache_key] = (mtime_ns, size, pbtxt_sig, dict(meta))
     return meta
 
 
@@ -2793,17 +2969,17 @@ def _scan_source_conversations(
 ) -> list[dict[str, Any]]:
     if not root.is_dir() or limit <= 0:
         return []
-    raw_entries: list[tuple[float, int, int, str, pathlib.Path]] = []
+    raw_entries: list[tuple[float, int, int, str, str]] = []
     try:
         with os.scandir(root) as it:
             for entry in it:
                 if not entry.is_dir(follow_symlinks=False) or len(entry.name) < 16 or entry.name in exclude_ids:
                     continue
-                tf = pathlib.Path(entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                tf_str = os.path.join(entry.path, ".system_generated", "logs", "transcript.jsonl")
                 try:
-                    st = tf.stat()
+                    st = os.stat(tf_str)
                     if st.st_size > 0:
-                        raw_entries.append((st.st_mtime, st.st_mtime_ns, st.st_size, entry.name, tf))
+                        raw_entries.append((st.st_mtime, st.st_mtime_ns, st.st_size, entry.name, tf_str))
                 except OSError:
                     continue
     except Exception:
@@ -2813,11 +2989,11 @@ def _scan_source_conversations(
     bucket: list[dict[str, Any]] = []
     now_ts = time.time()
     # Scan past swarm workers without artificially capping before reaching `limit` valid items
-    for mtime, mtime_ns, size, cid, tf in raw_entries[: max(600, limit * 8)]:
+    for mtime, mtime_ns, size, cid, tf_str in raw_entries[: max(600, limit * 8)]:
         if len(bucket) >= limit:
             break
         is_act = cid in active_ids
-        meta = _extract_conv_meta(cid, tf, source, mtime, mtime_ns, size, is_act)
+        meta = _extract_conv_meta(cid, pathlib.Path(tf_str), source, mtime, mtime_ns, size, is_act)
         if meta is None:
             continue
         tail_running = bool(meta.pop("_tailRunning", False))
@@ -3003,18 +3179,49 @@ def list_all_conversations(
     return result[:limit]
 
 
-def load_conversation_detail(
+def _parse_single_transcript_cached(
     cid: str,
-    _include_parent: bool = True,
-    _include_cli_alias: bool = True,
-    _keep_internal_src: bool = False,
-    _apply_revert_filter: bool = True,
+    tf: pathlib.Path | None,
+    source: str,
 ) -> dict[str, Any]:
-    tf, source = _locate_transcript(cid)
-    title = _read_pbtxt_title(cid)
-    steps = _parse_jsonl(tf) if tf is not None else []
+    """LRU cache (mtime_ns + size + full_sig + pbtxt_sig) for single-transcript message/deliverable parsing."""
+    pbtxt_sig, pbtxt_title = _get_pbtxt_sig_and_title(cid)
+    if tf is None:
+        return {
+            "pbtxt_title": pbtxt_title,
+            "first_user_title": "",
+            "own_messages": [],
+            "deliverable_cands": [],
+            "last_model": "",
+        }
+    try:
+        st_tf = tf.stat()
+    except OSError:
+        return {
+            "pbtxt_title": pbtxt_title,
+            "first_user_title": "",
+            "own_messages": [],
+            "deliverable_cands": [],
+            "last_model": "",
+        }
 
-    if tf is not None and steps:
+    tfull = tf.with_name("transcript_full.jsonl")
+    try:
+        st_full = tfull.stat()
+        full_sig = (st_full.st_mtime_ns, st_full.st_size)
+    except OSError:
+        full_sig = (0, 0)
+
+    cache_key = (tf.as_posix(), source)
+    sig = (st_tf.st_mtime_ns, st_tf.st_size, full_sig[0], full_sig[1], pbtxt_sig)
+    with _TRANSCRIPT_DETAIL_CACHE_LOCK:
+        cached = _TRANSCRIPT_DETAIL_CACHE.get(cache_key)
+        if cached is not None and cached[0] == sig:
+            _TRANSCRIPT_DETAIL_CACHE.move_to_end(cache_key)
+            return cached[1]
+
+    steps = _parse_jsonl(tf)
+    if steps:
         needed: set[int] = set()
         watch_generic_until = -1
         for s_idx, s in enumerate(steps):
@@ -3042,28 +3249,11 @@ def load_conversation_detail(
             if full_map:
                 steps = [full_map.get(s.get("step_index"), s) if isinstance(s.get("step_index"), int) else s for s in steps]
 
-    parent_msgs: list[dict[str, Any]] = []
-    # If this mobile CLI session branched off a Desktop conversation, load pure Desktop-only history
-    if _include_parent and source == "mobile":
-        parent_desk = get_desktop_parent_for_cli(cid)
-        if parent_desk and parent_desk != cid:
-            parent_detail = load_conversation_detail(
-                parent_desk,
-                _include_parent=False,
-                _include_cli_alias=False,
-                _keep_internal_src=True,
-                _apply_revert_filter=False,
-            )
-            p_msgs = parent_detail.get("messages") or []
-            if p_msgs:
-                parent_msgs = list(p_msgs)
-            if not title and parent_detail.get("title"):
-                title = str(parent_detail["title"])
-
     own_src = "desktop" if source == "desktop" else "cli"
     own_messages: list[dict[str, Any]] = []
     deliverable_cands: list[str] = []
     last_model = ""
+    first_user_title = ""
     pending_tools: list[dict[str, str]] = []
     pending_thinking: list[str] = []
     last_step_time = ""
@@ -3095,10 +3285,10 @@ def load_conversation_detail(
             raw_u_content = str(s.get("content") or "")
             u_atts = _extract_user_attachments(raw_u_content, s.get("media"))
             u_txt = _clean_user_text(raw_u_content, strip_att_note=bool(u_atts))
-            if not title and u_txt:
+            if not first_user_title and u_txt:
                 for ln in u_txt.splitlines():
                     if ln.strip() and not ln.strip().startswith(("【", "<")):
-                        title = ln.strip()[:48]
+                        first_user_title = ln.strip()[:48]
                         break
             u_msg: dict[str, Any] = {
                 "role": "user",
@@ -3274,6 +3464,65 @@ def load_conversation_detail(
             "_src": own_src,
         })
 
+    # Deduplicate candidate paths keeping last-occurrence order so reversed() returns newest first
+    dedup_rev: list[str] = []
+    seen_dc: set[str] = set()
+    for c_fp in reversed(deliverable_cands):
+        if c_fp not in seen_dc:
+            seen_dc.add(c_fp)
+            dedup_rev.append(c_fp)
+    dedup_rev.reverse()
+
+    parsed_entry: dict[str, Any] = {
+        "pbtxt_title": pbtxt_title,
+        "first_user_title": first_user_title,
+        "own_messages": own_messages,
+        "deliverable_cands": dedup_rev,
+        "last_model": last_model,
+    }
+    with _TRANSCRIPT_DETAIL_CACHE_LOCK:
+        _TRANSCRIPT_DETAIL_CACHE[cache_key] = (sig, parsed_entry)
+        _TRANSCRIPT_DETAIL_CACHE.move_to_end(cache_key)
+        while len(_TRANSCRIPT_DETAIL_CACHE) > _TRANSCRIPT_DETAIL_CACHE_MAX:
+            _TRANSCRIPT_DETAIL_CACHE.popitem(last=False)
+    return parsed_entry
+
+
+def load_conversation_detail(
+    cid: str,
+    _include_parent: bool = True,
+    _include_cli_alias: bool = True,
+    _keep_internal_src: bool = False,
+    _apply_revert_filter: bool = True,
+) -> dict[str, Any]:
+    tf, source = _locate_transcript(cid)
+    parsed = _parse_single_transcript_cached(cid, tf, source)
+    title = str(parsed.get("pbtxt_title") or "")
+
+    parent_msgs: list[dict[str, Any]] = []
+    # If this mobile CLI session branched off a Desktop conversation, load pure Desktop-only history
+    if _include_parent and source == "mobile":
+        parent_desk = get_desktop_parent_for_cli(cid)
+        if parent_desk and parent_desk != cid:
+            parent_detail = load_conversation_detail(
+                parent_desk,
+                _include_parent=False,
+                _include_cli_alias=False,
+                _keep_internal_src=True,
+                _apply_revert_filter=False,
+            )
+            p_msgs = parent_detail.get("messages") or []
+            if p_msgs:
+                parent_msgs = list(p_msgs)
+            if not title and parent_detail.get("title"):
+                title = str(parent_detail["title"])
+
+    if not title:
+        title = str(parsed.get("first_user_title") or "")
+
+    own_messages: list[dict[str, Any]] = parsed.get("own_messages") or []
+    deliverable_cands: list[str] = list(parsed.get("deliverable_cands") or [])
+
     # If opening a Desktop conversation that also has mobile CLI continuation turns, merge them chronologically
     child_msgs: list[dict[str, Any]] = []
     aliased_cli = get_desktop_cli_alias(cid) if (_include_cli_alias and source == "desktop") else ""
@@ -3299,7 +3548,7 @@ def load_conversation_detail(
     elif child_msgs:
         messages = _merge_messages_chronologically(own_messages, child_msgs)
     else:
-        messages = own_messages
+        messages = list(own_messages)
 
     if _apply_revert_filter:
         messages = _filter_reverted_messages(messages, get_conv_revert_cutoff(cid))
@@ -3311,46 +3560,78 @@ def load_conversation_detail(
             break
 
     deliverables: list[dict[str, Any]] = []
-    seen_p: set[str] = set()
     allowed_roots = _get_allowed_file_roots()
-    for cand in reversed(deliverable_cands):
-        try:
-            if _has_unsafe_raw_path(cand, allow_absolute=True):
+    deliv_cache_key = (tuple(deliverable_cands), allowed_roots)
+    now_mono = time.monotonic()
+    deliv_hit: list[dict[str, Any]] | None = None
+    with _DELIV_CACHE_LOCK:
+        dc_entry = _DELIV_CACHE.get(deliv_cache_key)
+        if dc_entry is not None and (now_mono - dc_entry[0]) < _DELIV_CACHE_TTL_SEC:
+            _DELIV_CACHE.move_to_end(deliv_cache_key)
+            deliv_hit = [dict(x) for x in dc_entry[1]]
+    if deliv_hit is not None:
+        deliverables = deliv_hit
+    else:
+        seen_p: set[str] = set()
+        for cand in reversed(deliverable_cands):
+            try:
+                if ".system_generated" in cand or ".user_uploaded" in cand:
+                    continue
+                if _has_unsafe_raw_path(cand, allow_absolute=True):
+                    continue
+                p = pathlib.Path(cand).resolve()
+                ps = p.as_posix()
+                if ps in seen_p or ".system_generated" in ps or ".user_uploaded" in ps:
+                    continue
+                if not _is_within_allowed_roots(p, allowed_roots) or _is_sensitive_path(p):
+                    continue
+                st_d = p.stat()
+                if not os.path.isfile(ps):
+                    continue
+                seen_p.add(ps)
+                deliverables.append({
+                    "name": p.name,
+                    "path": ps,
+                    "size": st_d.st_size,
+                    "ext": p.suffix.lower(),
+                })
+                if len(deliverables) >= 16:
+                    break
+            except Exception:
                 continue
-            p = pathlib.Path(cand).resolve()
-            ps = p.as_posix()
-            if ps in seen_p or not p.is_file() or not _is_within_allowed_roots(p, allowed_roots) or _is_sensitive_path(p):
-                continue
-            if ".system_generated" in ps or ".user_uploaded" in ps:
-                continue
-            seen_p.add(ps)
-            deliverables.append({
-                "name": p.name,
-                "path": ps,
-                "size": p.stat().st_size,
-                "ext": p.suffix.lower(),
-            })
-            if len(deliverables) >= 16:
-                break
-        except Exception:
-            continue
+        with _DELIV_CACHE_LOCK:
+            _DELIV_CACHE[deliv_cache_key] = (now_mono, [dict(x) for x in deliverables])
+            _DELIV_CACHE.move_to_end(deliv_cache_key)
+            while len(_DELIV_CACHE) > _DELIV_CACHE_MAX:
+                _DELIV_CACHE.popitem(last=False)
 
     live_pending_ix = get_pending_interactions_for_cid(cid, aliased_cli)
     active_run_snap = None
     with _ACTIVE_RUNS_LOCK:
         ar = _ACTIVE_RUNS.get(cid) or (aliased_cli and _ACTIVE_RUNS.get(aliased_cli)) or None
         if ar and ar.get("running"):
+            ar_atts = [dict(a) for a in (ar.get("attachments") or []) if isinstance(a, dict)]
+            ar_imgs = [dict(a) for a in (ar.get("images") or [x for x in ar_atts if x.get("is_image")]) if isinstance(a, dict)]
             active_run_snap = {
                 "running": True,
+                "runId": str(ar.get("run_id") or ""),
+                "queueId": str(ar.get("queue_id") or ""),
+                "mode": str(ar.get("trigger_mode") or "normal"),
                 "model": ar.get("model"),
+                "prompt": str(ar.get("prompt") or ""),
+                "displayText": str(ar.get("display_text") or ar.get("prompt") or ""),
+                "attachments": ar_atts,
+                "images": ar_imgs,
+                "swarmMode": bool(ar.get("swarm_mode", False)),
                 "tools": list(ar.get("tools") or []),
                 "streamText": "".join(ar.get("chunks") or []),
                 "startedAt": ar.get("started_at"),
+                "timestamp": str(ar.get("started_at_iso") or ""),
                 "pendingInteractions": live_pending_ix,
             }
 
     out_slice = messages[-120:] if _apply_revert_filter else messages
-    out_msgs = out_slice if _keep_internal_src else [{k: v for k, v in m.items() if k != "_src"} for m in out_slice]
+    out_msgs = [dict(m) for m in out_slice] if _keep_internal_src else [{k: v for k, v in m.items() if k != "_src"} for m in out_slice]
 
     detail_out: dict[str, Any] = {
         "id": cid,
@@ -3501,25 +3782,98 @@ def _extract_desktop_delta_context(
 def _broadcast_ws(payload: dict[str, Any]) -> None:
     if _LOOP is None or not _WS_CLIENTS:
         return
-    raw = json.dumps(payload, ensure_ascii=False)
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    async def _send_one(ws: web.WebSocketResponse) -> web.WebSocketResponse | None:
+        if ws.closed:
+            return ws
+        try:
+            await asyncio.wait_for(ws.send_str(raw), timeout=3.0)
+            return None
+        except Exception:
+            return ws
 
     async def _send_all() -> None:
-        dead: list[web.WebSocketResponse] = []
-        for ws in list(_WS_CLIENTS):
-            if ws.closed:
-                dead.append(ws)
-                continue
-            try:
-                await ws.send_str(raw)
-            except Exception:
-                dead.append(ws)
-        for d in dead:
-            _WS_CLIENTS.discard(d)
+        clients = list(_WS_CLIENTS)
+        if not clients:
+            return
+        if len(clients) == 1:
+            dead_ws = await _send_one(clients[0])
+            if dead_ws is not None:
+                _WS_CLIENTS.discard(dead_ws)
+            return
+        results = await asyncio.gather(*(_send_one(w) for w in clients), return_exceptions=True)
+        for w, res in zip(clients, results):
+            if res is not None:
+                _WS_CLIENTS.discard(w)
 
     try:
         asyncio.run_coroutine_threadsafe(_send_all(), _LOOP)
     except Exception:
         pass
+
+
+class _DeltaCoalescer:
+    """Coalesce rapid run_delta WS frames (~45ms) with 0ms first-chunk latency and strict event ordering."""
+
+    def __init__(self, run_id: str, interval_sec: float = 0.045) -> None:
+        self._run_id = run_id
+        self._interval = interval_sec
+        self._lock = threading.Lock()
+        self._cid = ""
+        self._buf: list[str] = []
+        self._last_emit = 0.0
+        self._timer: threading.Timer | None = None
+        self._closed = False
+
+    def _emit_locked(self, cid: str, text: str) -> None:
+        if not text:
+            return
+        self._last_emit = time.monotonic()
+        _broadcast_ws({
+            "type": "run_delta",
+            "conversation_id": cid,
+            "run_id": self._run_id,
+            "delta": text,
+        })
+
+    def push(self, cid: str, delta: str) -> None:
+        if not delta:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            if self._buf and self._cid and cid and self._cid != cid:
+                if self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+                prev_text = "".join(self._buf)
+                self._buf.clear()
+                self._emit_locked(self._cid, prev_text)
+            self._cid = cid or self._cid
+            now = time.monotonic()
+            if not self._buf and (now - self._last_emit) >= self._interval:
+                self._emit_locked(self._cid, delta)
+                return
+            self._buf.append(delta)
+            if self._timer is None:
+                delay = max(0.005, self._interval - (now - self._last_emit))
+                t = threading.Timer(delay, self.flush)
+                t.daemon = True
+                self._timer = t
+                t.start()
+
+    def flush(self, *, close: bool = False) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if self._buf:
+                text = "".join(self._buf)
+                self._buf.clear()
+                self._emit_locked(self._cid, text)
+            if close:
+                self._closed = True
 
 
 def _resolve_queue_canonical_cid(cid: str) -> tuple[str, str]:
@@ -3566,16 +3920,61 @@ def _find_active_run(cid: str) -> dict[str, Any] | None:
 
 def _clone_queue_item(item: dict[str, Any]) -> dict[str, Any]:
     pm = str(item.get("permission_mode") or "").strip().lower()
+    is_steering = bool(item.get("steering", False)) or str(item.get("status") or "").strip().lower() == "steering"
+    st_val = "steering" if is_steering else "queued"
+    mode_val = "interrupt" if (is_steering or str(item.get("mode") or "").strip().lower() == "interrupt") else "queue"
+    raw_metas = item.get("attachment_metas")
+    att_metas = [dict(m) for m in raw_metas if isinstance(m, dict)] if isinstance(raw_metas, list) else []
     return {
         "id": str(item.get("id") or ""),
         "prompt": str(item.get("prompt") or ""),
         "model": str(item.get("model") or ""),
         "attachments": list(item.get("attachments") or []),
+        "attachment_metas": att_metas,
         "swarm_mode": bool(item.get("swarm_mode", False)),
-        "priority": "urgent" if str(item.get("priority") or "") == "urgent" else "normal",
+        "priority": "urgent" if (is_steering or str(item.get("priority") or "") == "urgent") else "normal",
+        "status": st_val,
+        "steering": is_steering,
+        "mode": mode_val,
         "permission_mode": pm if pm in _VALID_PERMISSION_MODES else "",
         "created_at": str(item.get("created_at") or ""),
     }
+
+
+def _record_started_qid_unlocked(item_id: str, cid: str, run_id: str = "", status: str = "starting") -> None:
+    if not item_id:
+        return
+    _RECENT_STARTED_QIDS[item_id] = {
+        "cid": cid,
+        "run_id": run_id,
+        "status": status,
+        "started_at": time.time(),
+    }
+    _RECENT_STARTED_QIDS.move_to_end(item_id)
+    while len(_RECENT_STARTED_QIDS) > _RECENT_STARTED_QIDS_MAX:
+        _RECENT_STARTED_QIDS.popitem(last=False)
+
+
+def _lookup_started_qid(item_id: str, cands: list[str]) -> dict[str, Any] | None:
+    if not item_id:
+        return None
+    cand_set = {c for c in cands if c}
+    with _ACTIVE_RUNS_LOCK:
+        for k in cand_set:
+            rec = _ACTIVE_RUNS.get(k)
+            if rec and rec.get("running") and str(rec.get("queue_id") or "") == item_id:
+                return {
+                    "cid": str(rec.get("display_cid") or rec.get("cid") or k),
+                    "run_id": str(rec.get("run_id") or ""),
+                    "status": "running",
+                }
+    with _CONV_QUEUES_LOCK:
+        entry = _RECENT_STARTED_QIDS.get(item_id)
+        if entry is not None:
+            e_cid = str(entry.get("cid") or "")
+            if (not cand_set or e_cid in cand_set) and (time.time() - float(entry.get("started_at") or 0.0)) < 300.0:
+                return dict(entry)
+    return None
 
 
 def _consolidate_queue_unlocked(canon: str, cands: list[str]) -> list[dict[str, Any]]:
@@ -3804,15 +4203,24 @@ def _build_queue_item(
     swarm_mode: bool = False,
     priority: str = "normal",
     permission_mode: str = "",
+    steering: bool = False,
+    mode: str = "queue",
+    attachment_metas: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     pm = str(permission_mode or "").strip().lower()
+    is_steering = bool(steering)
+    eff_mode = "interrupt" if (is_steering or str(mode or "").strip().lower() == "interrupt") else "queue"
     return {
         "id": f"q_{secrets.token_hex(5)}",
         "prompt": str(prompt or "").strip(),
         "model": str(model or "").strip(),
         "attachments": list(attachments),
+        "attachment_metas": [dict(m) for m in (attachment_metas or []) if isinstance(m, dict)],
         "swarm_mode": bool(swarm_mode),
-        "priority": "urgent" if priority == "urgent" else "normal",
+        "priority": "urgent" if (is_steering or priority == "urgent") else "normal",
+        "status": "steering" if is_steering else "queued",
+        "steering": is_steering,
+        "mode": eff_mode,
         "permission_mode": pm if pm in _VALID_PERMISSION_MODES else "",
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -3835,10 +4243,13 @@ def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
             if not q:
                 return None
             item = q.pop(0)
+            item_id = str(item.get("id") or "")
             if not q:
                 _CONV_QUEUES.pop(canon, None)
+            _record_started_qid_unlocked(item_id, canon, run_id="", status="starting")
             snap = [_clone_queue_item(x) for x in q]
         _broadcast_queue_updated(canon, snap)
+        trig_mode = "interrupt" if (item.get("steering") or str(item.get("mode") or "") == "interrupt") else "queue"
         res = start_cli_chat_run(
             canon,
             str(item.get("prompt") or ""),
@@ -3846,10 +4257,18 @@ def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
             list(item.get("attachments") or []),
             bool(item.get("swarm_mode", False)),
             permission_mode=str(item.get("permission_mode") or "") or None,
+            queue_id=item_id,
+            trigger_mode=trig_mode,
         )
-        if not res.get("ok"):
-            # Re-insert at index 0 so the user's queued message is never silently lost
+        if res.get("ok"):
             with _CONV_QUEUES_LOCK:
+                _record_started_qid_unlocked(item_id, canon, run_id=str(res.get("run_id") or ""), status="running")
+        else:
+            # Re-insert at index 0 so the user's queued message is never silently lost
+            item["steering"] = False
+            item["status"] = "queued"
+            with _CONV_QUEUES_LOCK:
+                _RECENT_STARTED_QIDS.pop(item_id, None)
                 q_re = _CONV_QUEUES.setdefault(canon, [])
                 if len(q_re) < _CONV_QUEUE_MAX:
                     q_re.insert(0, item)
@@ -3861,12 +4280,14 @@ def _drain_next_queued_run(cid: str) -> dict[str, Any] | None:
                 "type": "run_error",
                 "conversation_id": canon,
                 "run_id": "",
+                "queue_id": item_id,
                 "error": err_clean,
                 "error_category": err_cat,
                 "prompt": str(item.get("prompt") or ""),
                 "attachments": list(item.get("attachments") or []),
                 "model": str(item.get("model") or ""),
                 "swarm_mode": bool(item.get("swarm_mode", False)),
+                "queue": re_snap,
             })
         return res
     finally:
@@ -3931,6 +4352,8 @@ def _start_acp_chat_run(
     pending_watermark: str,
     is_new: bool,
     swarm_mode: bool,
+    queue_id: str = "",
+    trigger_mode: str = "normal",
 ) -> dict[str, Any] | None:
     """Launch a live interactive ACP session supporting real-time tool permissions and ask_question turns.
 
@@ -3966,18 +4389,27 @@ def _start_acp_chat_run(
     rpc_seq = 0
     rpc_pending: dict[int, _q.Queue[dict[str, Any]]] = {}
     run_id = uuid.uuid4().hex[:10]
+    delta_coalescer = _DeltaCoalescer(run_id)
     pending_key = f"pending-{run_id}"
     canonical_disp = source_desktop_cid or resume_cli_cid
     stderr_lines: collections.deque[str] = collections.deque(maxlen=40)
     tool_idx_by_id: dict[str, int] = {}
 
+    started_ts = time.time()
+    started_iso = datetime.fromtimestamp(started_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    display_text = prompt.strip()
+    img_metas = [dict(a) for a in att_metas if isinstance(a, dict) and a.get("is_image")]
     run_rec: dict[str, Any] = {
         "run_id": run_id,
+        "queue_id": str(queue_id or ""),
+        "trigger_mode": str(trigger_mode or "normal"),
         "cid": resume_cli_cid,
         "display_cid": canonical_disp,
         "proc": proc,
         "prompt": prompt,
+        "display_text": display_text,
         "attachments": att_metas,
+        "images": img_metas,
         "model": eff_model,
         "permission_mode": eff_perm_mode,
         "swarm_mode": bool(swarm_mode),
@@ -3986,7 +4418,8 @@ def _start_acp_chat_run(
         "running": True,
         "canceled": False,
         "cancel_reason": "",
-        "started_at": time.time(),
+        "started_at": started_ts,
+        "started_at_iso": started_iso,
         "stderr": "",
         "ended_with_question": False,
         "acp": True,
@@ -4112,6 +4545,7 @@ def _start_acp_chat_run(
             }
             with _PENDING_INTERACTIONS_LOCK:
                 _PENDING_INTERACTIONS[ix_id] = ix_rec
+            delta_coalescer.flush()
             _broadcast_ws({
                 "type": "run_interaction",
                 "conversation_id": cur_disp,
@@ -4180,12 +4614,7 @@ def _start_acp_chat_run(
                         delta = str(content.get("text") or "")
                         if delta:
                             run_rec["chunks"].append(delta)
-                            _broadcast_ws({
-                                "type": "run_delta",
-                                "conversation_id": cur_disp,
-                                "run_id": run_id,
-                                "delta": delta,
-                            })
+                            delta_coalescer.push(cur_disp, delta)
                     elif ukind in ("tool_call", "tool_call_update"):
                         tname = str(upd.get("name") or "").strip()
                         raw_st = str(upd.get("status") or "").lower()
@@ -4213,23 +4642,33 @@ def _start_acp_chat_run(
                         if tname:
                             tool_item = {"name": tname, "target": target, "state": tstate}
                             tc_id = str(upd.get("toolCallId") or "").strip()
+                            changed_tool = True
                             if tc_id and tc_id in tool_idx_by_id:
-                                run_rec["tools"][tool_idx_by_id[tc_id]] = tool_item
+                                idx_t = tool_idx_by_id[tc_id]
+                                if run_rec["tools"][idx_t] == tool_item:
+                                    changed_tool = False
+                                else:
+                                    run_rec["tools"][idx_t] = tool_item
                             else:
                                 if tstate != "ACTIVE" and run_rec["tools"] and run_rec["tools"][-1]["name"] == tname and run_rec["tools"][-1].get("state") == "ACTIVE":
                                     idx_t = len(run_rec["tools"]) - 1
                                     run_rec["tools"][idx_t] = tool_item
+                                elif run_rec["tools"] and run_rec["tools"][-1] == tool_item:
+                                    idx_t = len(run_rec["tools"]) - 1
+                                    changed_tool = False
                                 else:
                                     idx_t = len(run_rec["tools"])
                                     run_rec["tools"].append(tool_item)
                                 if tc_id:
                                     tool_idx_by_id[tc_id] = idx_t
-                            _broadcast_ws({
-                                "type": "run_tool",
-                                "conversation_id": cur_disp,
-                                "run_id": run_id,
-                                "tool": tool_item,
-                            })
+                            if changed_tool:
+                                delta_coalescer.flush()
+                                _broadcast_ws({
+                                    "type": "run_tool",
+                                    "conversation_id": cur_disp,
+                                    "run_id": run_id,
+                                    "tool": tool_item,
+                                })
         except Exception:
             pass
         finally:
@@ -4318,14 +4757,25 @@ def _start_acp_chat_run(
         _ACTIVE_RUNS[disp_cid] = run_rec
     _migrate_conv_queue(pending_key, disp_cid)
 
-    _broadcast_ws({
+    start_q_snap = get_conv_queue_snapshot(disp_cid)
+    start_ev: dict[str, Any] = {
         "type": "run_init" if is_new else "run_start",
         "conversation_id": disp_cid,
         "run_id": run_id,
+        "queue_id": str(queue_id or ""),
+        "mode": str(trigger_mode or "normal"),
         "prompt": prompt,
+        "display_text": display_text,
         "attachments": att_metas,
+        "images": img_metas,
+        "swarm_mode": bool(swarm_mode),
         "model": eff_model,
-    })
+        "timestamp": started_iso,
+        "queue": start_q_snap,
+    }
+    if bound_cid and bound_cid != disp_cid:
+        start_ev["aliased_cid"] = bound_cid
+    _broadcast_ws(start_ev)
 
     def _acp_prompt_worker() -> None:
         final_resp = ""
@@ -4374,25 +4824,35 @@ def _start_acp_chat_run(
                     if k_rm and _ACTIVE_RUNS.get(k_rm) is run_rec:
                         _ACTIVE_RUNS.pop(k_rm, None)
 
+            delta_coalescer.flush(close=True)
             cancel_reason = str(run_rec.get("cancel_reason") or ("user" if run_rec.get("canceled") else ""))
+            end_q_snap = get_conv_queue_snapshot(cid_end)
+            alias_end = bound_cid if (bound_cid and bound_cid != cid_end) else ""
             should_drain = False
             if run_rec.get("canceled"):
-                _broadcast_ws({
+                ev_c: dict[str, Any] = {
                     "type": "run_canceled",
                     "conversation_id": cid_end,
                     "run_id": run_id,
+                    "queue_id": str(queue_id or ""),
                     "reason": cancel_reason or "user",
-                })
+                    "interrupted": (cancel_reason == "interrupt"),
+                    "queue": end_q_snap,
+                }
+                if alias_end:
+                    ev_c["aliased_cid"] = alias_end
+                _broadcast_ws(ev_c)
                 if cancel_reason == "interrupt":
                     should_drain = True
             elif (prompt_err or (proc.returncode not in (0, None))) and not final_resp and not run_rec.get("ended_with_question"):
                 err_src = prompt_err or "\n".join(stderr_lines) or f"exit code {proc.returncode}"
                 err_clean = _sanitize_error_text(err_src)
                 err_cat = _classify_run_error(err_clean)
-                _broadcast_ws({
+                ev_e: dict[str, Any] = {
                     "type": "run_error",
                     "conversation_id": cid_end,
                     "run_id": run_id,
+                    "queue_id": str(queue_id or ""),
                     "error": err_clean,
                     "error_category": err_cat,
                     "prompt": str(run_rec.get("prompt") or ""),
@@ -4403,21 +4863,30 @@ def _start_acp_chat_run(
                     ],
                     "model": eff_model,
                     "swarm_mode": bool(run_rec.get("swarm_mode", False)),
-                })
+                    "queue": end_q_snap,
+                }
+                if alias_end:
+                    ev_e["aliased_cid"] = alias_end
+                _broadcast_ws(ev_e)
                 should_drain = err_cat not in ("quota", "rate_limit", "auth")
             else:
                 cw = compute_conversation_context_window(cid_end)
-                _broadcast_ws({
+                ev_d: dict[str, Any] = {
                     "type": "run_done",
                     "conversation_id": cid_end,
                     "run_id": run_id,
+                    "queue_id": str(queue_id or ""),
                     "response": final_resp,
                     "tools": run_rec["tools"],
                     "usage": usage,
                     "model": eff_model,
                     "context_window": cw,
                     "has_pending_question": bool(run_rec.get("ended_with_question")),
-                })
+                    "queue": end_q_snap,
+                }
+                if alias_end:
+                    ev_d["aliased_cid"] = alias_end
+                _broadcast_ws(ev_d)
                 should_drain = True
 
             if should_drain and get_conv_queue_snapshot(cid_end):
@@ -4433,9 +4902,12 @@ def _start_acp_chat_run(
         "ok": True,
         "conversation_id": disp_cid,
         "run_id": run_id,
+        "queue_id": str(queue_id or ""),
+        "mode": str(trigger_mode or "normal"),
         "created_new": bool(is_new),
         "model": eff_model,
         "permission_mode": eff_perm_mode,
+        "queue": start_q_snap,
     }
 
 
@@ -4446,6 +4918,8 @@ def start_cli_chat_run(
     attachments: list[str] | None = None,
     swarm_mode: bool = False,
     permission_mode: str | None = None,
+    queue_id: str = "",
+    trigger_mode: str = "normal",
 ) -> dict[str, Any]:
     global _PENDING_SPAWNS
     agy_bin = _find_agy_bin()
@@ -4517,17 +4991,7 @@ def start_cli_chat_run(
     if len(full_prompt) > 24000:
         full_prompt = full_prompt[-24000:]
 
-    att_metas_acp: list[dict[str, Any]] = []
-    for ap in valid_att_paths:
-        ext = ap.suffix.lower()
-        is_img = ext in _IMAGE_EXTS
-        norm_p = ap.as_posix()
-        att_metas_acp.append({
-            "name": ap.name,
-            "path": norm_p,
-            "is_image": is_img,
-            "preview_url": f"/api/files/preview?path={urllib.parse.quote(norm_p)}",
-        })
+    att_metas_acp: list[dict[str, Any]] = [_build_attachment_meta(ap) for ap in valid_att_paths]
 
     # For standard interactive chat (non-swarm), prefer live ACP driver (real permissions & ask_question)
     if not swarm_mode:
@@ -4549,6 +5013,8 @@ def start_cli_chat_run(
                 pending_watermark=pending_watermark,
                 is_new=is_new,
                 swarm_mode=swarm_mode,
+                queue_id=queue_id,
+                trigger_mode=trigger_mode,
             )
             if acp_res is not None:
                 return acp_res
@@ -4595,27 +5061,26 @@ def start_cli_chat_run(
         watermark_saved = True
 
     run_id = uuid.uuid4().hex[:10]
+    delta_coalescer = _DeltaCoalescer(run_id)
     pending_key = f"pending-{run_id}"
     init_evt = threading.Event()
     canonical_disp = source_desktop_cid or resume_cli_cid
-    att_metas: list[dict[str, Any]] = []
-    for ap in valid_att_paths:
-        ext = ap.suffix.lower()
-        is_img = ext in _IMAGE_EXTS
-        norm_p = ap.as_posix()
-        att_metas.append({
-            "name": ap.name,
-            "path": norm_p,
-            "is_image": is_img,
-            "preview_url": f"/api/files/preview?path={urllib.parse.quote(norm_p)}",
-        })
+    att_metas: list[dict[str, Any]] = [dict(a) for a in att_metas_acp]
+    img_metas: list[dict[str, Any]] = [dict(a) for a in att_metas if a.get("is_image")]
+    started_ts = time.time()
+    started_iso = datetime.fromtimestamp(started_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    display_text = prompt.strip()
     run_rec: dict[str, Any] = {
         "run_id": run_id,
+        "queue_id": str(queue_id or ""),
+        "trigger_mode": str(trigger_mode or "normal"),
         "cid": resume_cli_cid,
         "display_cid": canonical_disp,
         "proc": proc,
         "prompt": prompt,
+        "display_text": display_text,
         "attachments": att_metas,
+        "images": img_metas,
         "model": eff_model,
         "swarm_mode": bool(swarm_mode),
         "tools": [],
@@ -4623,7 +5088,8 @@ def start_cli_chat_run(
         "running": True,
         "canceled": False,
         "cancel_reason": "",
-        "started_at": time.time(),
+        "started_at": started_ts,
+        "started_at_iso": started_iso,
         "stderr": "",
     }
     with _ACTIVE_RUNS_LOCK:
@@ -4634,14 +5100,24 @@ def start_cli_chat_run(
         if canonical_disp:
             _ACTIVE_RUNS[canonical_disp] = run_rec
     if canonical_disp:
-        _broadcast_ws({
+        cli_start_ev: dict[str, Any] = {
             "type": "run_start",
             "conversation_id": canonical_disp,
             "run_id": run_id,
+            "queue_id": str(queue_id or ""),
+            "mode": str(trigger_mode or "normal"),
             "prompt": prompt,
+            "display_text": display_text,
             "attachments": att_metas,
+            "images": img_metas,
+            "swarm_mode": bool(swarm_mode),
             "model": eff_model,
-        })
+            "timestamp": started_iso,
+            "queue": get_conv_queue_snapshot(canonical_disp),
+        }
+        if resume_cli_cid and resume_cli_cid != canonical_disp:
+            cli_start_ev["aliased_cid"] = resume_cli_cid
+        _broadcast_ws(cli_start_ev)
 
     def _drain_stderr() -> None:
         try:
@@ -4697,14 +5173,24 @@ def start_cli_chat_run(
                                 _ACTIVE_RUNS[disp_cid] = run_rec
                             _persist_binding(cid_i)
                             _migrate_conv_queue(pending_key, disp_cid)
-                            _broadcast_ws({
+                            cli_init_ev: dict[str, Any] = {
                                 "type": "run_init",
                                 "conversation_id": disp_cid,
                                 "run_id": run_id,
+                                "queue_id": str(queue_id or ""),
+                                "mode": str(trigger_mode or "normal"),
                                 "prompt": prompt,
+                                "display_text": display_text,
                                 "attachments": att_metas,
+                                "images": img_metas,
+                                "swarm_mode": bool(swarm_mode),
                                 "model": eff_model,
-                            })
+                                "timestamp": started_iso,
+                                "queue": get_conv_queue_snapshot(disp_cid),
+                            }
+                            if cid_i and cid_i != disp_cid:
+                                cli_init_ev["aliased_cid"] = cid_i
+                            _broadcast_ws(cli_init_ev)
                             init_evt.set()
                     elif ev_t == "step_update":
                         su = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else {}
@@ -4732,26 +5218,29 @@ def start_cli_chat_run(
                                         break
                             if tname:
                                 tool_item = {"name": tname, "target": target, "state": tstate}
+                                changed_tool = True
                                 if tstate == "DONE" and run_rec["tools"] and run_rec["tools"][-1]["name"] == tname:
-                                    run_rec["tools"][-1] = tool_item
+                                    if run_rec["tools"][-1] == tool_item:
+                                        changed_tool = False
+                                    else:
+                                        run_rec["tools"][-1] = tool_item
+                                elif run_rec["tools"] and run_rec["tools"][-1] == tool_item:
+                                    changed_tool = False
                                 else:
                                     run_rec["tools"].append(tool_item)
-                                _broadcast_ws({
-                                    "type": "run_tool",
-                                    "conversation_id": disp_cid or bound_cid or pending_key,
-                                    "run_id": run_id,
-                                    "tool": tool_item,
-                                })
+                                if changed_tool:
+                                    delta_coalescer.flush()
+                                    _broadcast_ws({
+                                        "type": "run_tool",
+                                        "conversation_id": disp_cid or bound_cid or pending_key,
+                                        "run_id": run_id,
+                                        "tool": tool_item,
+                                    })
                         elif st_type == "agent_response":
                             delta = str(su.get("text_delta") or "")
                             if delta:
                                 run_rec["chunks"].append(delta)
-                                _broadcast_ws({
-                                    "type": "run_delta",
-                                    "conversation_id": disp_cid or bound_cid or pending_key,
-                                    "run_id": run_id,
-                                    "delta": delta,
-                                })
+                                delta_coalescer.push(disp_cid or bound_cid or pending_key, delta)
                     elif ev_t == "result":
                         ro = ev.get("result") if isinstance(ev.get("result"), dict) else {}
                         if ro.get("conversation_id") and not bound_cid:
@@ -4783,24 +5272,34 @@ def start_cli_chat_run(
                     if k_rm and _ACTIVE_RUNS.get(k_rm) is run_rec:
                         _ACTIVE_RUNS.pop(k_rm, None)
             init_evt.set()
+            delta_coalescer.flush(close=True)
             cancel_reason = str(run_rec.get("cancel_reason") or ("user" if run_rec.get("canceled") else ""))
+            end_q_snap = get_conv_queue_snapshot(cid_end)
+            alias_end = bound_cid if (bound_cid and bound_cid != cid_end) else ""
             should_drain = False
             if run_rec.get("canceled"):
-                _broadcast_ws({
+                ev_c: dict[str, Any] = {
                     "type": "run_canceled",
                     "conversation_id": cid_end,
                     "run_id": run_id,
+                    "queue_id": str(queue_id or ""),
                     "reason": cancel_reason or "user",
-                })
+                    "interrupted": (cancel_reason == "interrupt"),
+                    "queue": end_q_snap,
+                }
+                if alias_end:
+                    ev_c["aliased_cid"] = alias_end
+                _broadcast_ws(ev_c)
                 if cancel_reason == "interrupt":
                     should_drain = True
             elif proc.returncode not in (0, None) and not final_resp:
                 err_clean = _sanitize_error_text(run_rec.get("stderr") or f"exit code {proc.returncode}")
                 err_cat = _classify_run_error(err_clean)
-                _broadcast_ws({
+                ev_e: dict[str, Any] = {
                     "type": "run_error",
                     "conversation_id": cid_end,
                     "run_id": run_id,
+                    "queue_id": str(queue_id or ""),
                     "error": err_clean,
                     "error_category": err_cat,
                     "prompt": str(run_rec.get("prompt") or ""),
@@ -4811,18 +5310,27 @@ def start_cli_chat_run(
                     ],
                     "model": eff_model,
                     "swarm_mode": bool(run_rec.get("swarm_mode", False)),
-                })
+                    "queue": end_q_snap,
+                }
+                if alias_end:
+                    ev_e["aliased_cid"] = alias_end
+                _broadcast_ws(ev_e)
                 should_drain = err_cat not in ("quota", "rate_limit", "auth")
             else:
-                _broadcast_ws({
+                ev_d: dict[str, Any] = {
                     "type": "run_done",
                     "conversation_id": cid_end,
                     "run_id": run_id,
+                    "queue_id": str(queue_id or ""),
                     "response": final_resp,
                     "tools": run_rec["tools"],
                     "usage": usage,
                     "model": eff_model,
-                })
+                    "queue": end_q_snap,
+                }
+                if alias_end:
+                    ev_d["aliased_cid"] = alias_end
+                _broadcast_ws(ev_d)
                 should_drain = True
 
             if should_drain and get_conv_queue_snapshot(cid_end):
@@ -4851,8 +5359,11 @@ def start_cli_chat_run(
         "ok": True,
         "conversation_id": final_cid,
         "run_id": run_id,
+        "queue_id": str(queue_id or ""),
+        "mode": str(trigger_mode or "normal"),
         "created_new": bool(is_new),
         "model": eff_model,
+        "queue": get_conv_queue_snapshot(final_cid),
     }
 
 
@@ -4880,9 +5391,13 @@ _PREVIEW_IMAGE_MIMES: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".jfif": "image/jpeg",
     ".webp": "image/webp",
     ".gif": "image/gif",
     ".bmp": "image/bmp",
+    ".avif": "image/avif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
 }
 _MAX_IMAGE_PREVIEW_BYTES = 25 * 1024 * 1024
 
@@ -4931,6 +5446,87 @@ def _apply_common_sec_headers(resp: web.StreamResponse) -> None:
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
 
 
+def _etag_matches(if_none_match: str, rev: str) -> bool:
+    raw = str(if_none_match or "").strip()
+    if not raw or not rev:
+        return False
+    if raw == "*":
+        return True
+    for part in raw.split(","):
+        tok = part.strip()
+        if tok.startswith(("W/", "w/")):
+            tok = tok[2:].strip()
+        if len(tok) >= 2 and tok[0] == '"' and tok[-1] == '"':
+            tok = tok[1:-1]
+        if tok == rev:
+            return True
+    return False
+
+
+def _json_response_with_etag(
+    request: web.Request,
+    payload: dict[str, Any],
+    *,
+    status: int = 200,
+    headers: dict[str, str] | None = None,
+    compress: bool = True,
+    inject_revision: bool = True,
+) -> web.Response:
+    raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    rev = hashlib.blake2b(raw_bytes, digest_size=8).hexdigest()
+    etag = f'W/"{rev}"'
+    out_headers: dict[str, str] = {
+        "ETag": etag,
+        "X-Revision": rev,
+        "Cache-Control": "no-cache",
+    }
+    if headers:
+        out_headers.update(headers)
+    if status == 200 and _etag_matches(request.headers.get("If-None-Match", ""), rev):
+        return web.Response(status=304, headers=out_headers)
+
+    if inject_revision and raw_bytes.endswith(b"}"):
+        if len(raw_bytes) == 2:
+            body_bytes = f'{{"revision":"{rev}"}}'.encode("ascii")
+        else:
+            body_bytes = raw_bytes[:-1] + f',"revision":"{rev}"}}'.encode("ascii")
+    else:
+        body_bytes = raw_bytes
+
+    accept_enc = str(request.headers.get("Accept-Encoding") or "").lower()
+    if compress and len(body_bytes) >= 1024 and "gzip" in accept_enc:
+        gz_key = (rev, inject_revision)
+        gz_bytes: bytes | None = None
+        with _GZIP_CACHE_LOCK:
+            gz_bytes = _GZIP_CACHE.get(gz_key)
+            if gz_bytes is not None:
+                _GZIP_CACHE.move_to_end(gz_key)
+        if gz_bytes is None:
+            gz_bytes = gzip.compress(body_bytes, compresslevel=5)
+            with _GZIP_CACHE_LOCK:
+                _GZIP_CACHE[gz_key] = gz_bytes
+                _GZIP_CACHE.move_to_end(gz_key)
+                while len(_GZIP_CACHE) > _GZIP_CACHE_MAX:
+                    _GZIP_CACHE.popitem(last=False)
+        out_headers["Content-Encoding"] = "gzip"
+        out_headers["Vary"] = "Accept-Encoding"
+        return web.Response(
+            body=gz_bytes,
+            status=status,
+            content_type="application/json",
+            charset="utf-8",
+            headers=out_headers,
+        )
+
+    return web.Response(
+        body=body_bytes,
+        status=status,
+        content_type="application/json",
+        charset="utf-8",
+        headers=out_headers,
+    )
+
+
 @web.middleware
 async def cors_and_auth_middleware(request: web.Request, handler):
     norm_path = request.path.rstrip("/") or "/"
@@ -4946,7 +5542,8 @@ async def cors_and_auth_middleware(request: web.Request, handler):
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With",
+                "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With, If-None-Match",
+                "Access-Control-Expose-Headers": "ETag, X-Revision",
                 "Access-Control-Max-Age": "86400",
                 "X-Content-Type-Options": "nosniff",
                 "Referrer-Policy": "no-referrer",
@@ -4973,7 +5570,8 @@ async def cors_and_auth_middleware(request: web.Request, handler):
     _apply_common_sec_headers(resp)
     if not resp.prepared and not is_no_cors:
         resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Requested-With"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Requested-With, If-None-Match"
+        resp.headers["Access-Control-Expose-Headers"] = "ETag, X-Revision"
     return resp
 
 
@@ -5271,7 +5869,7 @@ async def handle_conversations(request: web.Request) -> web.Response:
     inc_ext_raw = str(request.query.get("include_external_cli") or "").strip().lower()
     include_external_cli = inc_ext_raw in ("1", "true", "yes", "on")
     items = await asyncio.to_thread(list_all_conversations, limit, source_filter, include_external_cli)
-    return web.json_response({"ok": True, "conversations": items})
+    return _json_response_with_etag(request, {"ok": True, "conversations": items})
 
 
 async def handle_conversation_detail(request: web.Request) -> web.Response:
@@ -5279,7 +5877,7 @@ async def handle_conversation_detail(request: web.Request) -> web.Response:
     if not _is_valid_cid(cid):
         return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
     detail = await asyncio.to_thread(load_conversation_detail, cid)
-    return web.json_response({"ok": True, "conversation": detail})
+    return _json_response_with_etag(request, {"ok": True, "conversation": detail})
 
 
 async def handle_conversation_context(request: web.Request) -> web.Response:
@@ -5287,7 +5885,7 @@ async def handle_conversation_context(request: web.Request) -> web.Response:
     if not _is_valid_cid(cid):
         return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
     cw = await asyncio.to_thread(compute_conversation_context_window, cid)
-    return web.json_response({"ok": True, "conversation_id": cid, "context_window": cw})
+    return _json_response_with_etag(request, {"ok": True, "conversation_id": cid, "context_window": cw})
 
 
 async def handle_conversation_swarm(request: web.Request) -> web.Response:
@@ -5295,7 +5893,7 @@ async def handle_conversation_swarm(request: web.Request) -> web.Response:
     if not _is_valid_cid(cid):
         return web.json_response({"ok": False, "error": "invalid cid"}, status=400)
     swarm = await asyncio.to_thread(load_conversation_swarm_status, cid, include_details=True)
-    return web.json_response({"ok": True, "conversation_id": cid, "swarm": swarm})
+    return _json_response_with_etag(request, {"ok": True, "conversation_id": cid, "swarm": swarm})
 
 
 async def handle_conversation_revert(request: web.Request) -> web.Response:
@@ -5401,7 +5999,9 @@ async def handle_chat_send(request: web.Request) -> web.Response:
         return web.json_response(res, status=200 if res.get("ok") else 400)
 
     target_cid = canon or cid
-    item_priority = "urgent" if (mode == "interrupt" or priority == "urgent") else "normal"
+    is_interrupt = mode == "interrupt"
+    item_priority = "urgent" if (is_interrupt or priority == "urgent") else "normal"
+    att_metas_q = [_build_attachment_meta(ap) for ap in valid_att_paths]
     item = _build_queue_item(
         prompt,
         eff_model,
@@ -5409,6 +6009,9 @@ async def handle_chat_send(request: web.Request) -> web.Response:
         swarm_mode=swarm_mode,
         priority=item_priority,
         permission_mode=raw_pm,
+        steering=is_interrupt,
+        mode=mode,
+        attachment_metas=att_metas_q,
     )
     with _CONV_QUEUES_LOCK:
         q = _consolidate_queue_unlocked(target_cid, cands)
@@ -5419,15 +6022,23 @@ async def handle_chat_send(request: web.Request) -> web.Response:
             )
         if target_cid not in _CONV_QUEUES:
             _CONV_QUEUES[target_cid] = q
-        if item_priority == "urgent":
+        if is_interrupt:
+            for existing in q:
+                if existing.get("steering") or existing.get("status") == "steering":
+                    existing["steering"] = False
+                    existing["status"] = "queued"
             q.insert(0, item)
+        elif item_priority == "urgent":
+            insert_pos = 1 if (q and (q[0].get("steering") or q[0].get("status") == "steering")) else 0
+            q.insert(insert_pos, item)
         else:
             q.append(item)
         snap = [_clone_queue_item(x) for x in q]
 
     item_snap = _clone_queue_item(item)
+    item_id = str(item_snap["id"])
 
-    if mode == "interrupt":
+    if is_interrupt:
         proc = None
         acp_cancel = None
         still_running = False
@@ -5442,27 +6053,42 @@ async def handle_chat_send(request: web.Request) -> web.Response:
                     still_running = True
                     break
         _broadcast_queue_updated(target_cid, snap)
-        if callable(acp_cancel):
-            try:
-                acp_cancel()
-            except Exception:
-                pass
-        if proc is not None:
-            _terminate_proc_safely(proc)
-        elif not still_running:
-            threading.Thread(
-                target=_drain_next_queued_run,
-                args=(target_cid,),
-                name=f"queue-drain-{target_cid[:8]}",
-                daemon=True,
-            ).start()
+        if still_running:
+            if callable(acp_cancel):
+                try:
+                    acp_cancel()
+                except Exception:
+                    pass
+            if proc is not None:
+                _terminate_proc_safely(proc)
+            fresh_snap = get_conv_queue_snapshot(target_cid)
+            started_now = not any(str(x.get("id") or "") == item_id for x in fresh_snap)
+            started_info = _lookup_started_qid(item_id, cands) if started_now else None
+            return web.json_response({
+                "ok": True,
+                "queued": not started_now,
+                "interrupting": True,
+                "steering": not started_now,
+                "started": started_now,
+                "run_id": str((started_info or {}).get("run_id") or ""),
+                "conversation_id": target_cid,
+                "item": item_snap,
+                "queue": fresh_snap,
+            })
+
+        res = await asyncio.to_thread(_drain_next_queued_run, target_cid)
+        fresh_snap = get_conv_queue_snapshot(target_cid)
+        started_ok = bool(res and res.get("ok"))
         return web.json_response({
             "ok": True,
-            "queued": True,
+            "queued": not started_ok and any(str(x.get("id") or "") == item_id for x in fresh_snap),
             "interrupting": True,
+            "steering": False,
+            "started": started_ok,
+            "run_id": str((res or {}).get("run_id") or ""),
             "conversation_id": target_cid,
             "item": item_snap,
-            "queue": snap,
+            "queue": fresh_snap,
         })
 
     _broadcast_queue_updated(target_cid, snap)
@@ -5478,12 +6104,13 @@ async def handle_chat_send(request: web.Request) -> web.Response:
             name=f"queue-drain-{target_cid[:8]}",
             daemon=True,
         ).start()
+    fresh_snap = get_conv_queue_snapshot(target_cid)
     return web.json_response({
         "ok": True,
-        "queued": True,
+        "queued": any(str(x.get("id") or "") == item_id for x in fresh_snap),
         "conversation_id": target_cid,
         "item": item_snap,
-        "queue": snap,
+        "queue": fresh_snap,
     })
 
 
@@ -5520,6 +6147,7 @@ async def handle_chat_queue_update(request: web.Request) -> web.Response:
 
     has_atts = "attachments" in body
     norm_atts: list[str] | None = None
+    norm_att_metas: list[dict[str, Any]] | None = None
     if has_atts:
         if not isinstance(body.get("attachments"), list):
             return web.json_response({"ok": False, "error": "invalid attachments"}, status=400)
@@ -5527,6 +6155,7 @@ async def handle_chat_queue_update(request: web.Request) -> web.Response:
         if valid_att_paths is None:
             return web.json_response({"ok": False, "error": att_err}, status=400)
         norm_atts = [ap.as_posix() for ap in valid_att_paths]
+        norm_att_metas = [_build_attachment_meta(ap) for ap in valid_att_paths]
 
     has_prompt = "prompt" in body
     new_prompt = str(body.get("prompt") or "").strip() if has_prompt else ""
@@ -5561,6 +6190,8 @@ async def handle_chat_queue_update(request: web.Request) -> web.Response:
                     it["prompt"] = eff_prompt
                 if has_atts and norm_atts is not None:
                     it["attachments"] = list(norm_atts)
+                    if norm_att_metas is not None:
+                        it["attachment_metas"] = [dict(m) for m in norm_att_metas]
                 if has_model and new_model:
                     it["model"] = new_model
                 if has_swarm:
@@ -5577,7 +6208,18 @@ async def handle_chat_queue_update(request: web.Request) -> web.Response:
     if empty_err:
         return web.json_response({"ok": False, "error": "消息内容不能为空"}, status=400)
     if item_snap is None:
-        return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
+        fresh_snap = get_conv_queue_snapshot(target_cid)
+        _broadcast_queue_updated(target_cid, fresh_snap)
+        return web.json_response(
+            {
+                "ok": False,
+                "code": "not_in_queue",
+                "error": "排队消息不存在或已开始执行",
+                "conversation_id": target_cid,
+                "queue": fresh_snap,
+            },
+            status=404,
+        )
     _broadcast_queue_updated(target_cid, snap)
     return web.json_response({"ok": True, "conversation_id": target_cid, "item": item_snap, "queue": snap})
 
@@ -5605,7 +6247,18 @@ async def handle_chat_queue_delete(request: web.Request) -> web.Response:
                 _CONV_QUEUES.pop(target_cid, None)
             snap = [_clone_queue_item(x) for x in q]
     if not found:
-        return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
+        fresh_snap = get_conv_queue_snapshot(target_cid)
+        _broadcast_queue_updated(target_cid, fresh_snap)
+        return web.json_response(
+            {
+                "ok": False,
+                "code": "not_in_queue",
+                "error": "排队消息不存在或已开始执行",
+                "conversation_id": target_cid,
+                "queue": fresh_snap,
+            },
+            status=404,
+        )
     _broadcast_queue_updated(target_cid, snap)
     return web.json_response({"ok": True, "conversation_id": target_cid, "deleted": True, "queue": snap})
 
@@ -5620,20 +6273,52 @@ async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
     canon, _, cands = _get_cid_alias_candidates(cid)
     target_cid = canon or cid
     found = False
+    was_steering = False
     snap: list[dict[str, Any]] = []
     with _CONV_QUEUES_LOCK:
         q = _consolidate_queue_unlocked(target_cid, cands)
         for i, it in enumerate(q):
             if str(it.get("id") or "") == item_id:
                 moved = q.pop(i)
+                was_steering = bool(moved.get("steering")) or str(moved.get("status") or "") == "steering"
+                for existing in q:
+                    if existing.get("steering") or existing.get("status") == "steering":
+                        existing["steering"] = False
+                        existing["status"] = "queued"
                 moved["priority"] = "urgent"
+                moved["status"] = "steering"
+                moved["steering"] = True
+                moved["mode"] = "interrupt"
                 q.insert(0, moved)
                 found = True
                 break
         if found:
             snap = [_clone_queue_item(x) for x in q]
     if not found:
-        return web.json_response({"ok": False, "error": "排队消息不存在或已开始执行"}, status=404)
+        fresh_snap = get_conv_queue_snapshot(target_cid)
+        _broadcast_queue_updated(target_cid, fresh_snap)
+        started_info = _lookup_started_qid(item_id, cands)
+        if started_info is not None:
+            return web.json_response({
+                "ok": True,
+                "conversation_id": target_cid,
+                "interrupting": False,
+                "steering": False,
+                "already_started": True,
+                "started": True,
+                "run_id": str(started_info.get("run_id") or ""),
+                "queue": fresh_snap,
+            })
+        return web.json_response(
+            {
+                "ok": False,
+                "code": "not_in_queue",
+                "error": "排队消息不存在或已开始执行",
+                "conversation_id": target_cid,
+                "queue": fresh_snap,
+            },
+            status=404,
+        )
 
     proc = None
     acp_cancel = None
@@ -5658,11 +6343,18 @@ async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
                 pass
         if proc is not None:
             _terminate_proc_safely(proc)
+        fresh_snap = get_conv_queue_snapshot(target_cid)
+        started_now = not any(str(x.get("id") or "") == item_id for x in fresh_snap)
+        started_info = _lookup_started_qid(item_id, cands) if started_now else None
         return web.json_response({
             "ok": True,
             "conversation_id": target_cid,
             "interrupting": True,
-            "queue": snap,
+            "steering": not started_now,
+            "already_steering": was_steering and not started_now,
+            "started": started_now,
+            "run_id": str((started_info or {}).get("run_id") or ""),
+            "queue": fresh_snap,
         })
 
     # Conversation is idle: pop index 0 and launch immediately
@@ -5675,6 +6367,7 @@ async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
                 "error": str(res.get("error") or "插队启动失败"),
                 "conversation_id": target_cid,
                 "interrupting": False,
+                "steering": False,
                 "queue": after_snap,
             },
             status=400,
@@ -5683,6 +6376,7 @@ async def handle_chat_queue_interrupt(request: web.Request) -> web.Response:
         "ok": True,
         "conversation_id": target_cid,
         "interrupting": True,
+        "steering": False,
         "started": bool(res and res.get("ok")),
         "run_id": str((res or {}).get("run_id") or ""),
         "queue": after_snap,
@@ -5755,7 +6449,17 @@ async def handle_chat_cancel(request: web.Request) -> web.Response:
             did_cancel = True
         except Exception:
             pass
-    q_snap = get_conv_queue_snapshot(target_cid)
+    steering_cleared = False
+    with _CONV_QUEUES_LOCK:
+        q_cur = _consolidate_queue_unlocked(target_cid, cands)
+        for it in q_cur:
+            if it.get("steering") or it.get("status") == "steering":
+                it["steering"] = False
+                it["status"] = "queued"
+                steering_cleared = True
+        q_snap = [_clone_queue_item(x) for x in q_cur]
+    if steering_cleared:
+        _broadcast_queue_updated(target_cid, q_snap)
     if proc is not None and proc.poll() is None:
         _terminate_proc_safely(proc)
         did_cancel = True
@@ -5789,16 +6493,9 @@ async def handle_upload(request: web.Request) -> web.Response:
                 dest.unlink(missing_ok=True)
                 return web.json_response({"ok": False, "error": "文件超过 50MB 限制"}, status=413)
             fh.write(chunk)
-    ext = dest.suffix.lower()
-    is_img = ext in _IMAGE_EXTS
-    return web.json_response({
-        "ok": True,
-        "name": orig_name,
-        "path": dest.resolve().as_posix(),
-        "size": size,
-        "is_image": is_img,
-        "preview_url": f"/api/files/preview?path={urllib.parse.quote(dest.resolve().as_posix())}",
-    })
+    meta = _build_attachment_meta(dest.resolve(), orig_name=orig_name)
+    meta["size"] = size
+    return web.json_response({"ok": True, **meta})
 
 
 async def handle_files_list(request: web.Request) -> web.Response:
@@ -5884,7 +6581,8 @@ async def handle_file_preview(request: web.Request) -> web.StreamResponse:
         return web.json_response({"ok": False, "error": "文件不存在"}, status=404)
 
     try:
-        fsize = p.stat().st_size
+        st_p = p.stat()
+        fsize = st_p.st_size
     except OSError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
@@ -5893,11 +6591,22 @@ async def handle_file_preview(request: web.Request) -> web.StreamResponse:
     if ext in _PREVIEW_IMAGE_MIMES:
         if fsize > _MAX_IMAGE_PREVIEW_BYTES:
             return web.json_response({"ok": False, "error": "图片文件超过 25MB 预览限制，请直接下载"}, status=413)
+        img_rev = f"{st_p.st_mtime_ns:x}-{fsize:x}"
+        img_etag = f'"{img_rev}"'
+        img_hdrs = {
+            "ETag": img_etag,
+            "X-Revision": img_rev,
+            "Cache-Control": "private, max-age=3600",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        }
+        if _etag_matches(request.headers.get("If-None-Match", ""), img_rev):
+            return web.Response(status=304, headers=img_hdrs)
         resp = web.FileResponse(p)
         resp.headers["Content-Type"] = _PREVIEW_IMAGE_MIMES[ext]
-        resp.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["Referrer-Policy"] = "no-referrer"
+        for hk, hv in img_hdrs.items():
+            resp.headers[hk] = hv
         return resp
     try:
         with p.open("rb") as fh:
@@ -6763,36 +7472,36 @@ def _read_member_current_action(member_cid: str, primary_root: pathlib.Path) -> 
                 targs = tc.get("args") if isinstance(tc.get("args"), dict) else {}
                 summary = _unquote_arg(targs.get("toolSummary"))
                 if summary:
-                    action = _sanitize_swarm_snippet(summary, 90)
+                    action = _sanitize_swarm_snippet(summary, 240)
                 elif tname in ("read_file", "edit_file", "write_file", "write_to_file", "replace_file_content"):
                     raw_fp = _unquote_arg(targs.get("Path") or targs.get("TargetFile") or targs.get("path"))
                     fname = pathlib.Path(raw_fp).name if raw_fp else ""
-                    action = _sanitize_swarm_snippet(f"{tname} {fname}".strip(), 90)
+                    action = _sanitize_swarm_snippet(f"{tname} {fname}".strip(), 240)
                 elif tname == "run_command":
                     cmd_s = _unquote_arg(targs.get("CommandLine")).splitlines()[0] if targs.get("CommandLine") else ""
-                    action = _sanitize_swarm_snippet(f"run: {cmd_s}" if cmd_s else "run_command", 90)
+                    action = _sanitize_swarm_snippet(f"run: {cmd_s}" if cmd_s else "run_command", 240)
                 elif tname == "swarm":
                     act = _unquote_arg(targs.get("action"))
                     nm = _unquote_arg(targs.get("name"))
-                    action = _sanitize_swarm_snippet(f"swarm {act} {nm}".strip(), 90)
+                    action = _sanitize_swarm_snippet(f"swarm {act} {nm}".strip(), 240)
                 elif tname == "post_message":
                     msg_s = _unquote_arg(targs.get("text")).splitlines()[0] if targs.get("text") else ""
-                    action = _sanitize_swarm_snippet(f"post: {msg_s}" if msg_s else "post_message", 90)
+                    action = _sanitize_swarm_snippet(f"post: {msg_s}" if msg_s else "post_message", 240)
                 elif tname:
                     target = ""
                     for tk in ("query", "Url", "Role", "Action"):
                         if targs.get(tk):
                             target = _unquote_arg(targs.get(tk)).splitlines()[0]
                             break
-                    action = _sanitize_swarm_snippet(f"{tname} {target}".strip(), 90)
+                    action = _sanitize_swarm_snippet(f"{tname} {target}".strip(), 240)
             if not action:
                 c_txt = _clean_assistant_text(str(obj.get("content") or ""))
                 if c_txt:
-                    action = _sanitize_swarm_snippet(c_txt, 90)
+                    action = _sanitize_swarm_snippet(c_txt, 240)
             if not action:
                 th_txt = str(obj.get("thinking") or "").strip()
                 if th_txt:
-                    action = _sanitize_swarm_snippet(th_txt, 90)
+                    action = _sanitize_swarm_snippet(th_txt, 240)
             if action:
                 break
     except OSError:
@@ -6827,13 +7536,100 @@ def _is_active_swarm_cli_run(cid: str) -> dict[str, Any] | None:
 
 
 def _read_json_file_safe(p: pathlib.Path) -> dict[str, Any]:
-    if not p.is_file():
+    try:
+        st = p.stat()
+    except OSError:
         return {}
+    key = p.as_posix()
+    with _JSON_FILE_CACHE_LOCK:
+        cached = _JSON_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
     try:
         data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-        return data if isinstance(data, dict) else {}
+        parsed = data if isinstance(data, dict) else {}
     except Exception:
-        return {}
+        parsed = {}
+    with _JSON_FILE_CACHE_LOCK:
+        if len(_JSON_FILE_CACHE) >= _JSON_FILE_CACHE_MAX:
+            for drop_k in list(_JSON_FILE_CACHE.keys())[: _JSON_FILE_CACHE_MAX // 4]:
+                _JSON_FILE_CACHE.pop(drop_k, None)
+        _JSON_FILE_CACHE[key] = (st.st_mtime_ns, st.st_size, parsed)
+    return parsed
+
+
+def _parse_swarm_board_cached(
+    board_file: pathlib.Path,
+) -> tuple[int, list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]]:
+    try:
+        st = board_file.stat()
+    except OSError:
+        return 0, [], {}, {}
+    key = board_file.as_posix()
+    with _SWARM_BOARD_CACHE_LOCK:
+        cached = _SWARM_BOARD_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            _SWARM_BOARD_CACHE.move_to_end(key)
+            return cached[2], cached[3], cached[4], cached[5]
+
+    board_count = 0
+    board_tail_dq: collections.deque[dict[str, Any]] = collections.deque(maxlen=60)
+    agent_last_post: dict[str, dict[str, Any]] = {}
+    agent_briefs: dict[str, str] = {}
+    try:
+        with board_file.open("r", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                s = ln.strip()
+                if not s:
+                    continue
+                try:
+                    row = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                board_count += 1
+                seq_val = int(row.get("seq") or board_count)
+                agent_nm = str(row.get("agent") or "").strip()
+                kind_str = str(row.get("kind") or "").strip()[:32]
+                raw_txt = str(row.get("text") or "")
+                clean_txt = _EMAIL_RE.sub("[redacted]", raw_txt)
+                if len(clean_txt) > 24000:
+                    clean_txt = clean_txt[:23999] + "…"
+                t_str = str(row.get("time") or "").strip()[:32]
+                entry: dict[str, Any] = {
+                    "seq": seq_val,
+                    "agent": agent_nm,
+                    "text": clean_txt,
+                    "time": t_str,
+                }
+                if kind_str:
+                    entry["kind"] = kind_str
+                board_tail_dq.append(entry)
+                if agent_nm:
+                    agent_last_post[agent_nm] = {
+                        "seq": seq_val,
+                        "preview": _sanitize_swarm_snippet(raw_txt, 300),
+                        "time": t_str,
+                        "has_done": "[done]" in raw_txt[:140].lower(),
+                    }
+                if kind_str == "brief" or (agent_nm == "coordinator" and raw_txt.startswith("@")):
+                    m_b = re.match(r"^@([A-Za-z0-9][A-Za-z0-9_-]{0,31})\b\s*([\s\S]*)", raw_txt)
+                    if m_b:
+                        target_nm = m_b.group(1).strip()
+                        brief_body = _sanitize_swarm_snippet(m_b.group(2), 600)
+                        if target_nm and brief_body and (kind_str == "brief" or target_nm not in agent_briefs):
+                            agent_briefs[target_nm] = brief_body
+    except OSError:
+        pass
+
+    board_tail = list(board_tail_dq)
+    with _SWARM_BOARD_CACHE_LOCK:
+        _SWARM_BOARD_CACHE[key] = (st.st_mtime_ns, st.st_size, board_count, board_tail, agent_last_post, agent_briefs)
+        _SWARM_BOARD_CACHE.move_to_end(key)
+        while len(_SWARM_BOARD_CACHE) > _SWARM_BOARD_CACHE_MAX:
+            _SWARM_BOARD_CACHE.popitem(last=False)
+    return board_count, board_tail, agent_last_post, agent_briefs
 
 
 def load_conversation_swarm_summary(cid: str) -> dict[str, Any]:
@@ -6921,6 +7717,9 @@ def load_conversation_swarm_status(cid: str, *, include_details: bool = True) ->
                     "last_post_time": "",
                     "current_action": "正在启动蜂群协同...",
                     "task": "",
+                    "brief": "",
+                    "thread_title": "",
+                    "workspace_mode": "",
                     "color_idx": 0,
                 }],
                 "archived_members": [],
@@ -6945,58 +7744,34 @@ def load_conversation_swarm_status(cid: str, *, include_details: bool = True) ->
     plan_threads_raw = p_doc.get("threads") if isinstance(p_doc.get("threads"), list) else []
 
     plan_tasks: dict[str, str] = {
-        str(k).strip(): _sanitize_swarm_snippet(str(v or ""), 160)
+        str(k).strip(): _sanitize_swarm_snippet(str(v or ""), 400)
         for k, v in plan_tasks_raw.items()
         if str(k).strip()
     }
-    title = _sanitize_swarm_snippet(str(plan_goal_raw.get("title") or m_doc.get("title") or ""), 100)
+    member_thread_title: dict[str, str] = {}
+    for t_raw in plan_threads_raw:
+        if not isinstance(t_raw, dict):
+            continue
+        t_lbl = _sanitize_swarm_snippet(str(t_raw.get("title") or t_raw.get("id") or ""), 200)
+        if not t_lbl:
+            continue
+        for tn in (t_raw.get("tasks") or []):
+            tn_s = str(tn).strip()
+            if tn_s and tn_s not in member_thread_title:
+                member_thread_title[tn_s] = t_lbl
+    title = _sanitize_swarm_snippet(str(plan_goal_raw.get("title") or m_doc.get("title") or ""), 200)
     goal = {
         "title": title,
-        "line": _sanitize_swarm_snippet(str(plan_goal_raw.get("line") or ""), 240),
+        "line": _sanitize_swarm_snippet(str(plan_goal_raw.get("line") or ""), 500),
     }
 
-    # Parse board.jsonl (track total count, latest post per agent, and last 60 entries)
+    # Parse board.jsonl (mtime+size cached: total count, latest post per agent, briefs, and last 60 entries)
     board_count = 0
-    board_tail_dq: collections.deque[dict[str, Any]] = collections.deque(maxlen=60)
+    board_tail_list: list[dict[str, Any]] = []
     agent_last_post: dict[str, dict[str, Any]] = {}
-    board_file = sdir / "board.jsonl"
-    if include_details and board_file.is_file():
-        try:
-            with board_file.open("r", encoding="utf-8", errors="replace") as fh:
-                for ln in fh:
-                    s = ln.strip()
-                    if not s:
-                        continue
-                    try:
-                        row = json.loads(s)
-                    except Exception:
-                        continue
-                    if not isinstance(row, dict):
-                        continue
-                    board_count += 1
-                    seq_val = int(row.get("seq") or board_count)
-                    agent_nm = str(row.get("agent") or "").strip()
-                    raw_txt = str(row.get("text") or "")
-                    clean_txt = _EMAIL_RE.sub("[redacted]", raw_txt)
-                    if len(clean_txt) > 1200:
-                        clean_txt = clean_txt[:1199] + "…"
-                    t_str = str(row.get("time") or "").strip()[:32]
-                    entry = {
-                        "seq": seq_val,
-                        "agent": agent_nm,
-                        "text": clean_txt,
-                        "time": t_str,
-                    }
-                    board_tail_dq.append(entry)
-                    if agent_nm:
-                        agent_last_post[agent_nm] = {
-                            "seq": seq_val,
-                            "preview": _sanitize_swarm_snippet(raw_txt, 90),
-                            "time": t_str,
-                            "has_done": "[done]" in raw_txt[:140].lower(),
-                        }
-        except OSError:
-            pass
+    agent_briefs: dict[str, str] = {}
+    if include_details:
+        board_count, board_tail_list, agent_last_post, agent_briefs = _parse_swarm_board_cached(sdir / "board.jsonl")
 
     # Deterministic bee palette indices: coordinator=0, active workers=1..5 sequentially, archived=hashed 1..5
     active_non_coord_names = sorted(
@@ -7047,6 +7822,9 @@ def load_conversation_swarm_status(cid: str, *, include_details: bool = True) ->
             "last_post_time": str(lp.get("time") or ""),
             "current_action": cur_action,
             "task": plan_tasks.get(name, ""),
+            "brief": agent_briefs.get(name, ""),
+            "thread_title": member_thread_title.get(name, ""),
+            "workspace_mode": str(m_raw.get("workspace_mode") or "").strip()[:32],
             "color_idx": _get_color_idx(name, role),
         }
         all_member_map[name] = item
@@ -7084,8 +7862,8 @@ def load_conversation_swarm_status(cid: str, *, include_details: bool = True) ->
         if not isinstance(t_raw, dict):
             continue
         tid = str(t_raw.get("id") or "").strip()[:48]
-        t_title = _sanitize_swarm_snippet(str(t_raw.get("title") or tid), 100)
-        t_goal = _sanitize_swarm_snippet(str(t_raw.get("goal") or ""), 220)
+        t_title = _sanitize_swarm_snippet(str(t_raw.get("title") or tid), 200)
+        t_goal = _sanitize_swarm_snippet(str(t_raw.get("goal") or ""), 500)
         t_task_names = [str(x).strip() for x in (t_raw.get("tasks") or []) if str(x).strip()]
         t_members: list[dict[str, Any]] = []
         done_cnt = 0
@@ -7154,7 +7932,7 @@ def load_conversation_swarm_status(cid: str, *, include_details: bool = True) ->
         "threads": threads_out,
         "members": active_members,
         "archived_members": archived_members,
-        "board": list(board_tail_dq),
+        "board": list(board_tail_list),
     }
 
 
@@ -7602,7 +8380,7 @@ async def handle_usage(request: web.Request) -> web.Response:
         cid = ""
     force = str(request.query.get("force") or "").strip().lower() in ("1", "true", "yes")
     summary = await asyncio.to_thread(compute_usage_summary, cid, force)
-    return web.json_response(summary)
+    return _json_response_with_etag(request, summary)
 
 
 async def handle_ws(request: web.Request) -> web.StreamResponse:
@@ -8433,10 +9211,59 @@ async def handle_static_www(request: web.Request) -> web.StreamResponse:
     return resp
 
 
+def _has_visible_transcript_delta(tf_str: str, prev_size: int, cur_size: int) -> bool:
+    """Return False only when newly appended JSONL lines are strictly internal EPHEMERAL_MESSAGE/CHECKPOINT entries."""
+    if prev_size <= 0 or cur_size <= prev_size or (cur_size - prev_size) > 524288:
+        return True
+    try:
+        with open(tf_str, "rb") as fh:
+            fh.seek(prev_size)
+            raw = fh.read(cur_size - prev_size)
+    except OSError:
+        return True
+    text = raw.decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            return True
+        if not isinstance(obj, dict):
+            return True
+        if str(obj.get("type") or "") not in ("EPHEMERAL_MESSAGE", "CHECKPOINT"):
+            return True
+    return False
+
+
+def _slice_has_user_explicit(tf_str: str, offset: int) -> bool:
+    """Check whether bytes from `offset` to EOF contain a USER_EXPLICIT USER_INPUT step."""
+    try:
+        with open(tf_str, "rb") as fh:
+            if offset > 0:
+                fh.seek(offset)
+            raw = fh.read()
+    except OSError:
+        return False
+    if b"USER_EXPLICIT" not in raw or b"USER_INPUT" not in raw:
+        return False
+    for ln in raw.decode("utf-8", errors="replace").splitlines():
+        if "USER_EXPLICIT" in ln and "USER_INPUT" in ln:
+            try:
+                o = json.loads(ln)
+                if isinstance(o, dict) and o.get("type") == "USER_INPUT" and o.get("source") == "USER_EXPLICIT":
+                    return True
+            except Exception:
+                continue
+    return False
+
+
 async def _desktop_transcript_push_loop(_app: web.Application) -> None:
-    """Broadcast real-time update pings whenever any desktop transcript changes."""
+    """Broadcast real-time update pings whenever any desktop transcript changes visibly."""
     last_sigs: dict[str, tuple[int, int]] = {}
     known_real_chats: set[str] = set()
+    known_swarm_workers: dict[str, int] = {}
 
     def _seed_initial_sigs() -> None:
         if not DESKTOP_BRAIN.is_dir():
@@ -8446,9 +9273,9 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
                 for e in it:
                     if not e.is_dir(follow_symlinks=False):
                         continue
-                    tf = pathlib.Path(e.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                    tf_str = os.path.join(e.path, ".system_generated", "logs", "transcript.jsonl")
                     try:
-                        st = tf.stat()
+                        st = os.stat(tf_str)
                         if st.st_size > 0:
                             last_sigs[e.name] = (st.st_mtime_ns, st.st_size)
                     except OSError:
@@ -8465,9 +9292,9 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
                 for e in it:
                     if not e.is_dir(follow_symlinks=False):
                         continue
-                    tf = pathlib.Path(e.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                    tf_str = os.path.join(e.path, ".system_generated", "logs", "transcript.jsonl")
                     try:
-                        st = tf.stat()
+                        st = os.stat(tf_str)
                     except OSError:
                         continue
                     if st.st_size <= 0 or (now_ts - st.st_mtime > 300.0):
@@ -8476,12 +9303,25 @@ async def _desktop_transcript_push_loop(_app: web.Application) -> None:
                     prev = last_sigs.get(e.name)
                     if prev == sig:
                         continue
+                    prev_size = prev[1] if prev is not None else 0
                     last_sigs[e.name] = sig
-                    # Ignore internal swarm worker / subagent transcripts so user chats are never starved
+                    # Ignore internal swarm worker / subagent transcripts (incremental tail check avoids re-reading MBs)
                     if e.name not in known_real_chats:
-                        if _is_swarm_worker_file(tf):
-                            continue
-                        known_real_chats.add(e.name)
+                        sw_off = known_swarm_workers.get(e.name)
+                        if sw_off is not None and st.st_size >= sw_off:
+                            if not _slice_has_user_explicit(tf_str, sw_off):
+                                known_swarm_workers[e.name] = st.st_size
+                                continue
+                            known_swarm_workers.pop(e.name, None)
+                            known_real_chats.add(e.name)
+                        else:
+                            if _is_swarm_worker_file(pathlib.Path(tf_str)):
+                                known_swarm_workers[e.name] = st.st_size
+                                continue
+                            known_swarm_workers.pop(e.name, None)
+                            known_real_chats.add(e.name)
+                    if prev is not None and not _has_visible_transcript_delta(tf_str, prev_size, st.st_size):
+                        continue
                     changed.append((st.st_mtime_ns, e.name))
         except Exception:
             pass

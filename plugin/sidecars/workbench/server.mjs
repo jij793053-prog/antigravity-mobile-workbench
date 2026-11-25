@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const SIDECAR_VERSION = '1.7.3';
+const SIDECAR_VERSION = '1.7.4';
 const BIND_HOST = '127.0.0.1';
 const UPSTREAM_HOST = '127.0.0.1';
 const SIDECAR_TOKEN = String(process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN || '').trim();
@@ -91,6 +91,12 @@ function getUpstreamPort() {
 }
 
 const UPSTREAM_PORT = getUpstreamPort();
+const upstreamAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 16,
+  keepAliveMsecs: 30000,
+});
+const localFileCache = new Map();
 
 function safeTokenEqual(provided, expected) {
   if (!expected) return true;
@@ -246,7 +252,15 @@ function sendText(res, statusCode, text, contentType = 'text/plain; charset=utf-
 
 function serveLocalFile(res, filePath, contentType, method = 'GET') {
   try {
-    const buf = fs.readFileSync(filePath);
+    const stat = fs.statSync(filePath);
+    const cached = localFileCache.get(filePath);
+    let buf;
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      buf = cached.buf;
+    } else {
+      buf = fs.readFileSync(filePath);
+      localFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, buf });
+    }
     res.writeHead(200, {
       'content-type': contentType,
       'content-length': String(buf.length),
@@ -260,6 +274,7 @@ function serveLocalFile(res, filePath, contentType, method = 'GET') {
       res.end(buf);
     }
   } catch {
+    localFileCache.delete(filePath);
     sendText(res, 500, 'Internal sidecar asset missing');
   }
 }
@@ -348,6 +363,7 @@ function probeUpstreamHealth(timeoutMs = 1500) {
       {
         hostname: UPSTREAM_HOST,
         port: UPSTREAM_PORT,
+        agent: upstreamAgent,
         path: '/health',
         method: 'GET',
         timeout: timeoutMs,
@@ -531,6 +547,7 @@ function proxyHtmlWithInjection(req, res, upstreamPath, options) {
     {
       hostname: UPSTREAM_HOST,
       port: UPSTREAM_PORT,
+      agent: upstreamAgent,
       method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       path: upstreamPath,
       headers: cleanHeaders,
@@ -619,6 +636,7 @@ function proxyStreamingHttp(req, res, upstreamPath) {
     {
       hostname: UPSTREAM_HOST,
       port: UPSTREAM_PORT,
+      agent: upstreamAgent,
       method: req.method,
       path: upstreamPath,
       headers: cleanHeaders,
@@ -687,7 +705,7 @@ function buildMaskedClientWsFrame(opcode, payloadBuf) {
   return Buffer.concat([header, masked]);
 }
 
-const MAX_HUB_EVENTS = 500;
+const MAX_HUB_EVENTS = 1000;
 const MAX_SSE_SUBSCRIBERS = 2;
 const SSE_MAX_LIFETIME_MS = 45000;
 const HUB_IDLE_DISCONNECT_MS = 120000;
@@ -766,6 +784,7 @@ function probeUpstreamBearer(bearerToken, timeoutMs = 2000) {
       {
         hostname: UPSTREAM_HOST,
         port: UPSTREAM_PORT,
+        agent: upstreamAgent,
         path: '/api/server-info',
         method: 'GET',
         timeout: timeoutMs,
@@ -1487,6 +1506,7 @@ server.listen(LISTEN_PORT, BIND_HOST, () => {
 
 function shutdown() {
   disconnectUpstreamHub(true);
+  upstreamAgent.destroy();
   server.close(() => process.exit(0));
   if (typeof server.closeAllConnections === 'function') {
     server.closeAllConnections();

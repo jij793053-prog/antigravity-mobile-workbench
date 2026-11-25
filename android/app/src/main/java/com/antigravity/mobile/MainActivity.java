@@ -19,6 +19,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -33,7 +34,10 @@ import android.os.VibratorManager;
 import android.provider.MediaStore;
 import android.util.Size;
 import android.util.TypedValue;
+import android.view.ActionMode;
 import android.view.Gravity;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -71,6 +75,8 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -84,7 +90,7 @@ public class MainActivity extends Activity {
     private static final String LOCAL_ENTRY_URL = VIRTUAL_APP_ORIGIN + "/www/index.html";
     private static final String MEDIA_THUMB_PATH = "/media-thumb";
     private static final String OFFICIAL_WEB_URL = "https://antigravity.google";
-    private static final String APP_VERSION_NAME = "1.7.3";
+    private static final String APP_VERSION_NAME = "1.7.4";
     private static final int FILE_CHOOSER_REQUEST_CODE = 1001;
     private static final int QR_SCAN_REQUEST_CODE = 1002;
     private static final int SAVE_FILE_REQUEST_CODE = 1003;
@@ -113,6 +119,50 @@ public class MainActivity extends Activity {
     private boolean currentIsDark = false;
     private boolean themeSetByWeb = false;
 
+    private static final int MEDIA_THUMB_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+    private final MediaThumbCache mediaThumbCache = new MediaThumbCache(MEDIA_THUMB_CACHE_MAX_BYTES);
+    private Vibrator cachedVibrator = null;
+    private boolean vibratorResolved = false;
+
+    private static final class MediaThumbCache {
+        private final int maxBytes;
+        private int currentBytes = 0;
+        private final LinkedHashMap<Long, byte[]> map = new LinkedHashMap<>(64, 0.75f, true);
+
+        MediaThumbCache(int maxBytes) {
+            this.maxBytes = maxBytes;
+        }
+
+        synchronized byte[] get(long key) {
+            return map.get(key);
+        }
+
+        synchronized void put(long key, byte[] value) {
+            if (value == null || value.length == 0 || value.length > maxBytes / 4) {
+                return;
+            }
+            byte[] prev = map.put(key, value);
+            if (prev != null) {
+                currentBytes -= prev.length;
+            }
+            currentBytes += value.length;
+            Iterator<Map.Entry<Long, byte[]>> it = map.entrySet().iterator();
+            while (currentBytes > maxBytes && it.hasNext()) {
+                Map.Entry<Long, byte[]> oldest = it.next();
+                byte[] v = oldest.getValue();
+                if (v != null) {
+                    currentBytes -= v.length;
+                }
+                it.remove();
+            }
+        }
+
+        synchronized void evictAll() {
+            map.clear();
+            currentBytes = 0;
+        }
+    }
+
     private int lastTopPx = 0;
     private int lastNavBottomPx = 0;
     private int lastImeBottomPx = 0;
@@ -135,7 +185,7 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT));
         rootLayout.setBackgroundColor(currentIsDark ? COLOR_DARK_BG : COLOR_LIGHT_BG);
 
-        webView = new WebView(this);
+        webView = new SafeAreaWebView(this);
         webView.setLayoutParams(new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
@@ -210,7 +260,22 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_RUNNING_LOW) {
+            mediaThumbCache.evictAll();
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        mediaThumbCache.evictAll();
+    }
+
+    @Override
     protected void onDestroy() {
+        mediaThumbCache.evictAll();
         if (filePathCallback != null) {
             filePathCallback.onReceiveValue(null);
             filePathCallback = null;
@@ -359,7 +424,7 @@ public class MainActivity extends Activity {
         private final MainActivity activity;
 
         InsetsAnimationCallback(MainActivity activity) {
-            super(WindowInsetsAnimation.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE);
+            super(WindowInsetsAnimation.Callback.DISPATCH_MODE_STOP);
             this.activity = activity;
         }
 
@@ -367,8 +432,25 @@ public class MainActivity extends Activity {
         public WindowInsets onProgress(
                 WindowInsets insets,
                 List<WindowInsetsAnimation> runningAnimations) {
-            activity.updateInsetsFromWindowInsets(insets);
+            // Avoid per-frame WebView evaluateJavascript / :root CSS layout storms at 120-185Hz.
+            // Target insets are already applied once via OnApplyWindowInsetsListener, and onEnd()
+            // reconciles the final root insets cleanly if an OEM ROM defers reporting them.
             return insets;
+        }
+
+        @Override
+        public void onEnd(WindowInsetsAnimation animation) {
+            activity.syncInsetsFromRoot();
+        }
+    }
+
+    private void syncInsetsFromRoot() {
+        if (rootLayout == null) {
+            return;
+        }
+        WindowInsets rootInsets = rootLayout.getRootWindowInsets();
+        if (rootInsets != null) {
+            updateInsetsFromWindowInsets(rootInsets);
         }
     }
 
@@ -389,7 +471,7 @@ public class MainActivity extends Activity {
 
             topPx = topInsets.top;
             navBottomPx = navInsets.bottom;
-            imeBottomPx = imeInsets.bottom;
+            imeBottomPx = insets.isVisible(WindowInsets.Type.ime()) ? imeInsets.bottom : 0;
         } else {
             topPx = insets.getSystemWindowInsetTop();
             int totalBottom = insets.getSystemWindowInsetBottom();
@@ -482,6 +564,10 @@ public class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setTextZoom(100);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        settings.setNeedInitialFocus(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true);
+        }
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
@@ -535,6 +621,10 @@ public class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setTextZoom(100);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        settings.setNeedInitialFocus(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true);
+        }
 
         String ua = settings.getUserAgentString();
         if (ua != null) {
@@ -1216,6 +1306,14 @@ public class MainActivity extends Activity {
             if (id < 0L) {
                 return makeStatusResponse(404, "Not Found");
             }
+            byte[] cachedBytes = mediaThumbCache.get(id);
+            if (cachedBytes != null) {
+                Map<String, String> headers = new HashMap<>();
+                headers.put("Cache-Control", "private, max-age=60");
+                headers.put("X-Content-Type-Options", "nosniff");
+                return new WebResourceResponse(
+                        "image/jpeg", null, 200, "OK", headers, new ByteArrayInputStream(cachedBytes));
+            }
             Uri contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id);
             Bitmap bmp = null;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -1263,6 +1361,9 @@ public class MainActivity extends Activity {
             bmp.compress(Bitmap.CompressFormat.JPEG, 82, baos);
             bmp.recycle();
             byte[] bytes = baos.toByteArray();
+            if (bytes.length > 0 && bytes.length <= MEDIA_THUMB_CACHE_MAX_BYTES / 4) {
+                mediaThumbCache.put(id, bytes);
+            }
             Map<String, String> headers = new HashMap<>();
             headers.put("Cache-Control", "private, max-age=60");
             headers.put("X-Content-Type-Options", "nosniff");
@@ -1637,14 +1738,19 @@ public class MainActivity extends Activity {
     @SuppressWarnings("deprecation")
     private void performHaptic(String kind) {
         try {
-            Vibrator vibrator;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                VibratorManager vm = (VibratorManager) getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
-                vibrator = vm != null ? vm.getDefaultVibrator() : null;
-            } else {
-                vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (!vibratorResolved) {
+                vibratorResolved = true;
+                Vibrator v;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    VibratorManager vm = (VibratorManager) getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                    v = vm != null ? vm.getDefaultVibrator() : null;
+                } else {
+                    v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                }
+                cachedVibrator = (v != null && v.hasVibrator()) ? v : null;
             }
-            if (vibrator == null || !vibrator.hasVibrator()) {
+            Vibrator vibrator = cachedVibrator;
+            if (vibrator == null) {
                 return;
             }
 
@@ -1948,6 +2054,86 @@ public class MainActivity extends Activity {
                 });
     }
 
+    private void clampFloatingSelectionRect(View view, Rect outRect) {
+        if (view == null || outRect == null || inOfficialWebMode) {
+            return;
+        }
+        int viewH = view.getHeight();
+        if (viewH <= 0) {
+            return;
+        }
+        if (outRect.left == 0 && outRect.top == 0 && outRect.right == 0 && outRect.bottom == 0) {
+            return;
+        }
+        int safeTop = Math.min(viewH / 2, lastTopPx + dpToPx(64));
+        int bottomInset = Math.max(lastNavBottomPx, lastImeBottomPx);
+        int safeBottom = Math.max(safeTop, viewH - bottomInset);
+        if (outRect.top < safeTop) {
+            outRect.top = safeTop;
+        }
+        if (outRect.bottom > safeBottom) {
+            outRect.bottom = safeBottom;
+        }
+        if (outRect.bottom < outRect.top) {
+            outRect.bottom = outRect.top;
+        }
+    }
+
+    private static final class SafeAreaWebView extends WebView {
+        private final MainActivity activity;
+
+        SafeAreaWebView(MainActivity activity) {
+            super(activity);
+            this.activity = activity;
+        }
+
+        @Override
+        public ActionMode startActionMode(ActionMode.Callback callback, int type) {
+            if (type == ActionMode.TYPE_FLOATING && callback instanceof ActionMode.Callback2) {
+                return super.startActionMode(
+                        new SafeAreaActionModeCallback2((ActionMode.Callback2) callback, activity),
+                        type);
+            }
+            return super.startActionMode(callback, type);
+        }
+    }
+
+    private static final class SafeAreaActionModeCallback2 extends ActionMode.Callback2 {
+        private final ActionMode.Callback2 delegate;
+        private final MainActivity activity;
+
+        SafeAreaActionModeCallback2(ActionMode.Callback2 delegate, MainActivity activity) {
+            this.delegate = delegate;
+            this.activity = activity;
+        }
+
+        @Override
+        public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+            return delegate.onCreateActionMode(mode, menu);
+        }
+
+        @Override
+        public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+            return delegate.onPrepareActionMode(mode, menu);
+        }
+
+        @Override
+        public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+            return delegate.onActionItemClicked(mode, item);
+        }
+
+        @Override
+        public void onDestroyActionMode(ActionMode mode) {
+            delegate.onDestroyActionMode(mode);
+        }
+
+        @Override
+        public void onGetContentRect(ActionMode mode, View view, Rect outRect) {
+            delegate.onGetContentRect(mode, view, outRect);
+            activity.clampFloatingSelectionRect(view, outRect);
+        }
+    }
+
     private int dpToPx(int dp) {
         return Math.round(dp * getResources().getDisplayMetrics().density);
     }
@@ -2049,6 +2235,9 @@ public class MainActivity extends Activity {
                 return;
             }
             activity.mainHandler.post(() -> {
+                if (activity.themeSetByWeb && activity.currentIsDark == isDark) {
+                    return;
+                }
                 activity.themeSetByWeb = true;
                 activity.applySystemBarTheme(isDark);
             });

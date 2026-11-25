@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="./logo-app.png" />
   <link rel="manifest" href="./manifest.json" />
   <title>Antigravity 同步工作台</title>
-  <link rel="stylesheet" href="./app.css?v=1.7.3" />
+  <link rel="stylesheet" href="./app.css?v=1.7.4" />
 </head>
 <body>
   <!-- =========================================================
@@ -679,6 +679,33 @@
     <div id="preview-body" class="view-body preview-body"></div>
   </section>
 
+  <!-- Fullscreen Image Lightbox -->
+  <div id="img-lightbox" class="img-lightbox hidden" role="dialog" aria-modal="true" data-i18n-aria="lightbox.aria" aria-label="图片全屏预览">
+    <div id="img-lightbox-backdrop" class="img-lightbox-backdrop"></div>
+    <header class="img-lightbox-bar">
+      <div class="img-lightbox-meta">
+        <div id="img-lightbox-name" class="img-lightbox-name"></div>
+      </div>
+      <div class="img-lightbox-actions">
+        <button id="btn-img-lightbox-download" class="img-lightbox-btn" type="button" data-i18n-aria="preview.download" data-i18n-title="preview.download" aria-label="下载" title="下载">
+          <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+        </button>
+        <button id="btn-img-lightbox-close" class="img-lightbox-btn" type="button" data-i18n-aria="lightbox.closeAria" data-i18n-title="lightbox.closeAria" aria-label="关闭图片预览" title="关闭">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+    </header>
+    <div id="img-lightbox-stage" class="img-lightbox-stage"></div>
+    <button id="img-lightbox-zoom-pill" class="preview-zoom-pill img-lightbox-zoom-pill hidden" type="button" data-i18n-aria="preview.zoomResetAria" aria-label="重置图片缩放到 100%"></button>
+  </div>
+
   <!-- QQ Bot Control (Shown only when server supports it) -->
   <section id="qqbot-modal" class="m3-full-view hidden" data-i18n-aria="qqbot.title" aria-label="QQ Bot 控制台">
     <header class="m3-topbar">
@@ -1015,6 +1042,7 @@
     </header>
     <div class="usage-tabs-bar">
       <div id="usage-window-tabs" class="m3-segmented sm" role="tablist" data-i18n-aria="usage.tabsAria" aria-label="统计周期">
+        <span id="usage-tab-indicator" class="usage-tab-indicator" aria-hidden="true"></span>
         <button type="button" class="seg-btn active" role="tab" aria-selected="true" data-usage-win="5h" data-i18n="usage.tab5h">近5h</button>
         <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="today" data-i18n="usage.tabToday">今日</button>
         <button type="button" class="seg-btn" role="tab" aria-selected="false" data-usage-win="3d" data-i18n="usage.tab3d">近3天</button>
@@ -1085,7 +1113,7 @@
   <!-- M3 Snackbar Toast -->
   <div id="toast" class="m3-snackbar hidden" role="status" aria-live="polite"></div>
 
-  <script src="./i18n.js?v=1.7.3"></script>
-  <script src="./app.js?v=1.7.3"></script>
+  <script src="./i18n.js?v=1.7.4"></script>
+  <script src="./app.js?v=1.7.4"></script>
 </body>
 </html>
